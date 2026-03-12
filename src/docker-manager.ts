@@ -371,6 +371,13 @@ export function generateDockerCompose(
   const environment: Record<string, string> = {
     HTTP_PROXY: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
     HTTPS_PROXY: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
+    // Lowercase https_proxy for tools that only check lowercase (e.g., Yarn 4/undici, Corepack).
+    // NOTE: We intentionally do NOT set lowercase http_proxy. Some curl builds (Ubuntu 22.04)
+    // ignore uppercase HTTP_PROXY for HTTP URLs (httpoxy mitigation), which means HTTP traffic
+    // falls through to iptables DNAT interception — the correct behavior for connection-level
+    // blocking. Setting http_proxy would route HTTP through the forward proxy where Squid's
+    // 403 error page returns exit code 0, breaking security expectations.
+    https_proxy: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
     SQUID_PROXY_HOST: 'squid-proxy',
     SQUID_PROXY_PORT: SQUID_PORT.toString(),
     HOME: homeDir,
@@ -727,6 +734,10 @@ export function generateDockerCompose(
     agentVolumes.push(`${sslConfig.caFiles.certPath}:/usr/local/share/ca-certificates/awf-ca.crt:ro`);
     // Set environment variable to indicate SSL Bump is enabled
     environment.AWF_SSL_BUMP_ENABLED = 'true';
+    // Tell Node.js to trust the AWF session CA certificate.
+    // Without this, Node.js tools (Yarn 4, Corepack, npm) fail with EPROTO
+    // because Node.js uses its own CA bundle, not the system CA store.
+    environment.NODE_EXTRA_CA_CERTS = '/usr/local/share/ca-certificates/awf-ca.crt';
   }
 
   // SECURITY: Selective mounting to prevent credential exfiltration
@@ -1043,6 +1054,10 @@ export function generateDockerCompose(
         // Route through Squid to respect domain whitelisting
         HTTP_PROXY: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
         HTTPS_PROXY: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
+        https_proxy: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
+        // Prevent curl health check from routing localhost through Squid
+        NO_PROXY: `localhost,127.0.0.1,::1`,
+        no_proxy: `localhost,127.0.0.1,::1`,
         // Rate limiting configuration
         ...(config.rateLimitConfig && {
           AWF_RATE_LIMIT_ENABLED: String(config.rateLimitConfig.enabled),
