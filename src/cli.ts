@@ -587,6 +587,26 @@ export function parseDnsServers(input: string): string[] {
   return servers;
 }
 
+const DEFAULT_DOH_RESOLVER = 'https://dns.google/dns-query';
+
+/**
+ * Parses and validates the --dns-over-https option value.
+ * Commander sets the value to `true` when the flag is used without an argument.
+ * Returns the resolved URL, or an error string.
+ */
+export function parseDnsOverHttps(
+  value: boolean | string | undefined
+): { url: string } | { error: string } | undefined {
+  if (value === undefined) {
+    return undefined;
+  }
+  const resolvedUrl: string = value === true ? DEFAULT_DOH_RESOLVER : String(value);
+  if (!resolvedUrl.startsWith('https://')) {
+    return { error: '--dns-over-https resolver URL must start with https://' };
+  }
+  return { url: resolvedUrl };
+}
+
 /**
  * Result of processing the localhost keyword in allowed domains
  */
@@ -1021,6 +1041,10 @@ program
     '8.8.8.8,8.8.4.4'
   )
   .option(
+    '--dns-over-https [resolver-url]',
+    'Enable DNS-over-HTTPS via sidecar proxy (default: https://dns.google/dns-query)'
+  )
+  .option(
     '--enable-host-access',
     'Enable access to host services via host.docker.internal',
     false
@@ -1287,6 +1311,17 @@ program
       process.exit(1);
     }
 
+    // Parse and validate --dns-over-https
+    let dnsOverHttps: string | undefined;
+    const dohResult = parseDnsOverHttps(options.dnsOverHttps);
+    if (dohResult && 'error' in dohResult) {
+      logger.error(dohResult.error);
+      process.exit(1);
+    } else if (dohResult) {
+      dnsOverHttps = dohResult.url;
+      logger.info(`DNS-over-HTTPS enabled: ${dnsOverHttps}`);
+    }
+
     // Parse --allow-urls for SSL Bump mode
     let allowedUrls: string[] | undefined;
     if (options.allowUrls) {
@@ -1381,6 +1416,7 @@ program
       volumeMounts,
       containerWorkDir: options.containerWorkdir,
       dnsServers,
+      dnsOverHttps,
       memoryLimit: memoryLimit.value,
       proxyLogsDir: options.proxyLogsDir,
       enableHostAccess: options.enableHostAccess,
