@@ -1,6 +1,5 @@
 import execa from 'execa';
 import { logger } from './logger';
-import { isIPv6 } from 'net';
 import { API_PROXY_PORTS } from './types';
 
 const NETWORK_NAME = 'awf-net';
@@ -141,68 +140,19 @@ export async function ensureFirewallNetwork(): Promise<{
 }
 
 /**
- * Sets up the IPv6 iptables chain for handling IPv6 DNS servers
- * @param bridgeName - Bridge interface name to filter traffic on
- */
-async function setupIpv6Chain(bridgeName: string): Promise<void> {
-  logger.debug(`Setting up IPv6 chain '${CHAIN_NAME_V6}'...`);
-
-  // Clean up existing IPv6 chain if it exists
-  try {
-    const { exitCode } = await execa('ip6tables', ['-t', 'filter', '-L', CHAIN_NAME_V6, '-n'], { reject: false });
-    if (exitCode === 0) {
-      logger.debug(`IPv6 chain '${CHAIN_NAME_V6}' already exists, cleaning up...`);
-
-      // Remove references from DOCKER-USER
-      const { stdout } = await execa('ip6tables', [
-        '-t', 'filter', '-L', 'DOCKER-USER', '-n', '--line-numbers',
-      ], { reject: false });
-
-      const lines = stdout.split('\n');
-      const lineNumbers: number[] = [];
-      for (const line of lines) {
-        if (line.includes(CHAIN_NAME_V6)) {
-          const match = line.match(/^(\d+)/);
-          if (match) {
-            lineNumbers.push(parseInt(match[1], 10));
-          }
-        }
-      }
-
-      for (const lineNum of lineNumbers.reverse()) {
-        await execa('ip6tables', ['-t', 'filter', '-D', 'DOCKER-USER', lineNum.toString()], { reject: false });
-      }
-
-      await execa('ip6tables', ['-t', 'filter', '-F', CHAIN_NAME_V6], { reject: false });
-      await execa('ip6tables', ['-t', 'filter', '-X', CHAIN_NAME_V6], { reject: false });
-    }
-  } catch (error) {
-    logger.debug('Error during IPv6 chain cleanup:', error);
-  }
-
-  // Create the IPv6 chain
-  await execa('ip6tables', ['-t', 'filter', '-N', CHAIN_NAME_V6]);
-
-  // Insert rule in DOCKER-USER to jump to our IPv6 chain
-  const { stdout: existingRules } = await execa('ip6tables', [
-    '-t', 'filter', '-L', 'DOCKER-USER', '-n', '--line-numbers',
-  ], { reject: false });
-
-  if (!existingRules.includes(CHAIN_NAME_V6)) {
-    await execa('ip6tables', [
-      '-t', 'filter', '-I', 'DOCKER-USER', '1',
-      '-i', bridgeName,
-      '-j', CHAIN_NAME_V6,
-    ]);
-  }
-}
-
-/**
  * Sets up host-level iptables rules using DOCKER-USER chain
- * This ensures ALL containers on the firewall network are subject to egress filtering
+ * This ensures ALL containers on the firewall network are subject to egress filtering.
+ *
+ * Simplified security model: only localhost, Squid proxy, and DNS forwarding are allowed.
+ * Containers use Docker's embedded DNS (127.0.0.11) as their only nameserver.
+ * Docker's DNS proxy forwards queries to upstream servers configured via docker-compose dns: field.
+ * These forwarded queries traverse the Docker bridge and must be allowed in DOCKER-USER.
+ * Squid resolves DNS internally for all HTTP/HTTPS traffic.
+ *
  * @param squidIp - IP address of the Squid proxy
  * @param squidPort - Port number of the Squid proxy
- * @param dnsServers - Array of trusted DNS server IP addresses (DNS traffic is ONLY allowed to these servers)
+ * @param apiProxyIp - Optional IP address of the API proxy sidecar
+ * @param dnsServers - Upstream DNS servers that Docker embedded DNS forwards to
  */
 export async function setupHostIptables(squidIp: string, squidPort: number, dnsServers: string[], apiProxyIp?: string, dohProxyIp?: string): Promise<void> {
   logger.info('Setting up host-level iptables rules...');
@@ -325,172 +275,66 @@ export async function setupHostIptables(squidIp: string, squidPort: number, dnsS
     '-j', 'ACCEPT',
   ]);
 
-  // 4. Allow DNS ONLY to specified trusted DNS servers (prevents DNS exfiltration)
-  // Separate IPv4 and IPv6 DNS servers
-  const ipv4DnsServers = dnsServers.filter(s => !isIPv6(s));
-  const ipv6DnsServers = dnsServers.filter(s => isIPv6(s));
-
-  logger.debug(`Configuring DNS rules for trusted servers: ${dnsServers.join(', ')}`);
-  logger.debug(`  IPv4 DNS servers: ${ipv4DnsServers.join(', ') || '(none)'}`);
-  logger.debug(`  IPv6 DNS servers: ${ipv6DnsServers.join(', ') || '(none)'}`);
-
-  // Add IPv4 DNS server rules using iptables
-  for (const dnsServer of ipv4DnsServers) {
-    // Log DNS queries first (LOG doesn't terminate processing)
-    await execa('iptables', [
-      '-t', 'filter', '-A', CHAIN_NAME,
-      '-p', 'udp', '-d', dnsServer, '--dport', '53',
-      '-j', 'LOG', '--log-prefix', '[FW_DNS_QUERY] ', '--log-level', '4',
-    ]);
-
-    await execa('iptables', [
-      '-t', 'filter', '-A', CHAIN_NAME,
-      '-p', 'udp', '-d', dnsServer, '--dport', '53',
-      '-j', 'ACCEPT',
-    ]);
-
-    await execa('iptables', [
-      '-t', 'filter', '-A', CHAIN_NAME,
-      '-p', 'tcp', '-d', dnsServer, '--dport', '53',
-      '-j', 'LOG', '--log-prefix', '[FW_DNS_QUERY] ', '--log-level', '4',
-    ]);
-
-    await execa('iptables', [
-      '-t', 'filter', '-A', CHAIN_NAME,
-      '-p', 'tcp', '-d', dnsServer, '--dport', '53',
-      '-j', 'ACCEPT',
-    ]);
-  }
-
-  // Check ip6tables availability and disable IPv6 if unavailable
+  // 4. Check ip6tables availability and disable IPv6 if unavailable
   const ip6tablesAvailable = await isIp6tablesAvailable();
   if (!ip6tablesAvailable) {
     logger.warn('ip6tables is not available, disabling IPv6 via sysctl to prevent unfiltered bypass');
     await disableIpv6ViaSysctl();
   }
 
-  // Add IPv6 DNS server rules using ip6tables
-  if (ipv6DnsServers.length > 0) {
-    if (!ip6tablesAvailable) {
-      logger.warn('IPv6 DNS servers configured but ip6tables not available; IPv6 has been disabled');
-    } else {
-      // Set up IPv6 chain if we have IPv6 DNS servers
-      await setupIpv6Chain(bridgeName);
+  // 4b. Allow DNS forwarding to upstream servers
+  // Docker's embedded DNS (127.0.0.11) proxies queries to upstream servers configured
+  // via docker-compose dns: field. These forwarded queries traverse the Docker bridge
+  // and need to be allowed here. Only the configured upstream servers are permitted.
+  const upstreamDns = dnsServers && dnsServers.length > 0 ? dnsServers : ['8.8.8.8', '8.8.4.4'];
+  logger.debug(`Allowing DNS forwarding to upstream servers: ${upstreamDns.join(', ')}`);
 
-      // IPv6 chain needs to mirror IPv4 chain's comprehensive filtering
-      // This prevents IPv6 from becoming an unfiltered bypass path
+  // Create IPv6 chain if needed (only when IPv6 DNS servers are configured)
+  const hasIpv6Dns = upstreamDns.some(s => s.includes(':'));
+  if (hasIpv6Dns && ip6tablesAvailable) {
+    logger.debug(`Creating dedicated IPv6 chain '${CHAIN_NAME_V6}' for IPv6 DNS rules...`);
+    try {
+      const { exitCode: v6ChainExists } = await execa('ip6tables', ['-t', 'filter', '-L', CHAIN_NAME_V6, '-n'], { reject: false });
+      if (v6ChainExists === 0) {
+        logger.debug(`Chain '${CHAIN_NAME_V6}' already exists, cleaning up...`);
+        await execa('ip6tables', ['-t', 'filter', '-F', CHAIN_NAME_V6], { reject: false });
+        await execa('ip6tables', ['-t', 'filter', '-X', CHAIN_NAME_V6], { reject: false });
+      }
+    } catch (error) {
+      logger.debug('Error during IPv6 chain cleanup:', error);
+    }
+    await execa('ip6tables', ['-t', 'filter', '-N', CHAIN_NAME_V6]);
+  }
 
-      // Note: Squid proxy rule is omitted for IPv6 since Squid runs on IPv4 only
-
-      // 1. Allow established and related connections (return traffic)
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-m', 'conntrack', '--ctstate', 'ESTABLISHED,RELATED',
-        '-j', 'ACCEPT',
-      ]);
-
-      // 2. Allow localhost/loopback traffic
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-o', 'lo',
-        '-j', 'ACCEPT',
-      ]);
-
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-d', '::1/128',
-        '-j', 'ACCEPT',
-      ]);
-
-      // 3. Allow essential ICMPv6 (required for IPv6 functionality)
-      // This includes: destination unreachable, packet too big, time exceeded,
-      // echo request/reply, and Neighbor Discovery Protocol (NDP)
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-p', 'ipv6-icmp',
-        '-j', 'ACCEPT',
-      ]);
-
-      // 4. Allow DNS ONLY to specified trusted IPv6 DNS servers
-      for (const dnsServer of ipv6DnsServers) {
-        // Log DNS queries first (LOG doesn't terminate processing)
-        await execa('ip6tables', [
-          '-t', 'filter', '-A', CHAIN_NAME_V6,
-          '-p', 'udp', '-d', dnsServer, '--dport', '53',
-          '-j', 'LOG', '--log-prefix', '[FW_DNS_QUERY] ', '--log-level', '4',
-        ]);
-
+  for (const dnsServer of upstreamDns) {
+    // IPv6 DNS servers must use ip6tables, IPv4 uses iptables
+    const isV6 = dnsServer.includes(':');
+    if (isV6) {
+      if (ip6tablesAvailable) {
         await execa('ip6tables', [
           '-t', 'filter', '-A', CHAIN_NAME_V6,
           '-p', 'udp', '-d', dnsServer, '--dport', '53',
           '-j', 'ACCEPT',
         ]);
-
-        await execa('ip6tables', [
-          '-t', 'filter', '-A', CHAIN_NAME_V6,
-          '-p', 'tcp', '-d', dnsServer, '--dport', '53',
-          '-j', 'LOG', '--log-prefix', '[FW_DNS_QUERY] ', '--log-level', '4',
-        ]);
-
         await execa('ip6tables', [
           '-t', 'filter', '-A', CHAIN_NAME_V6,
           '-p', 'tcp', '-d', dnsServer, '--dport', '53',
           '-j', 'ACCEPT',
         ]);
       }
-
-      // 5. Block IPv6 multicast and link-local traffic
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-d', 'ff00::/8',  // IPv6 multicast range
-        '-j', 'REJECT', '--reject-with', 'icmp6-port-unreachable',
+    } else {
+      await execa('iptables', [
+        '-t', 'filter', '-A', CHAIN_NAME,
+        '-p', 'udp', '-d', dnsServer, '--dport', '53',
+        '-j', 'ACCEPT',
       ]);
-
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-d', 'fe80::/10',  // IPv6 link-local range
-        '-j', 'REJECT', '--reject-with', 'icmp6-port-unreachable',
-      ]);
-
-      // 6. Block all other IPv6 UDP traffic (DNS to whitelisted servers already allowed above)
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-p', 'udp',
-        '-j', 'LOG', '--log-prefix', '[FW_BLOCKED_UDP6] ', '--log-level', '4',
-      ]);
-
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-p', 'udp',
-        '-j', 'REJECT', '--reject-with', 'icmp6-port-unreachable',
-      ]);
-
-      // 7. Default deny all other IPv6 traffic (including TCP)
-      // This prevents IPv6 from being an unfiltered bypass path
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-j', 'LOG', '--log-prefix', '[FW_BLOCKED_OTHER6] ', '--log-level', '4',
-      ]);
-
-      await execa('ip6tables', [
-        '-t', 'filter', '-A', CHAIN_NAME_V6,
-        '-j', 'REJECT', '--reject-with', 'icmp6-port-unreachable',
+      await execa('iptables', [
+        '-t', 'filter', '-A', CHAIN_NAME,
+        '-p', 'tcp', '-d', dnsServer, '--dport', '53',
+        '-j', 'ACCEPT',
       ]);
     }
   }
-
-  // Also allow DNS to Docker's embedded DNS server (127.0.0.11) for container name resolution
-  await execa('iptables', [
-    '-t', 'filter', '-A', CHAIN_NAME,
-    '-p', 'udp', '-d', '127.0.0.11', '--dport', '53',
-    '-j', 'ACCEPT',
-  ]);
-
-  await execa('iptables', [
-    '-t', 'filter', '-A', CHAIN_NAME,
-    '-p', 'tcp', '-d', '127.0.0.11', '--dport', '53',
-    '-j', 'ACCEPT',
-  ]);
 
   // 5. Allow traffic to Squid proxy
   await execa('iptables', [

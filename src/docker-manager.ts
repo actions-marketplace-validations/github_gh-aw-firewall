@@ -508,8 +508,10 @@ export function generateDockerCompose(
     }
   }
 
-  // Pass DNS servers to container for setup-iptables.sh and entrypoint.sh
+  // DNS servers for Docker embedded DNS forwarding (used in docker-compose dns: field)
   const dnsServers = config.dnsServers || ['8.8.8.8', '8.8.4.4'];
+  // Pass DNS servers to container so setup-iptables.sh can allow Docker DNS forwarding
+  // to these upstream servers while blocking direct DNS to all other servers.
   environment.AWF_DNS_SERVERS = dnsServers.join(',');
 
   // When DoH is enabled, tell the agent container to route DNS through the DoH proxy
@@ -1480,6 +1482,7 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
     enableHostAccess: config.enableHostAccess,
     allowHostPorts: config.allowHostPorts,
     enableDlp: config.enableDlp,
+    dnsServers: config.dnsServers,
   });
   const squidConfigPath = path.join(config.workDir, 'squid.conf');
   fs.writeFileSync(squidConfigPath, squidConfig, { mode: 0o644 });
