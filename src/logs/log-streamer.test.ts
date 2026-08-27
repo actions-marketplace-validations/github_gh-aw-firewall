@@ -6,8 +6,9 @@ import * as fs from 'fs';
 import { streamLogs } from './log-streamer';
 import { LogFormatter } from './log-formatter';
 import { LogSource } from '../types';
+import { createRawLogLine } from './log-test-fixtures.test-utils';
 import execa from 'execa';
-import { Readable } from 'stream';
+import { PassThrough, Readable } from 'stream';
 import { trackPidForPortSync, isPidTrackingAvailable } from '../pid-tracker';
 
 // Mock external dependencies
@@ -17,17 +18,20 @@ jest.mock('../pid-tracker', () => ({
   trackPidForPortSync: jest.fn().mockReturnValue({ pid: -1, cmdline: '', comm: '', inode: 0 }),
   isPidTrackingAvailable: jest.fn().mockReturnValue(true),
 }));
-jest.mock('../logger', () => ({
-  logger: {
-    debug: jest.fn(),
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-  },
-}));
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+jest.mock('../logger', () => require('../test-helpers/mock-logger.test-utils').loggerMockFactory());
 
 const mockedExeca = execa as jest.MockedFunction<typeof execa>;
 const mockedFs = fs as jest.Mocked<typeof fs>;
+
+function makeMockExecaProcess(): { stdout: Readable; kill: jest.Mock } {
+  const stdout = new Readable({
+    read() {
+      this.push(null);
+    },
+  });
+  return { stdout, kill: jest.fn() };
+}
 
 describe('log-streamer', () => {
   let stdoutWriteSpy: jest.SpyInstance;
@@ -89,17 +93,7 @@ describe('log-streamer', () => {
       };
       const formatter = new LogFormatter({ format: 'raw' });
 
-      const mockStdout = new Readable({
-        read() {
-          this.push(null);
-        },
-      });
-
-      const mockProcess = {
-        stdout: mockStdout,
-        kill: jest.fn(),
-      };
-
+      const mockProcess = makeMockExecaProcess();
       mockedExeca.mockReturnValue(mockProcess as never);
 
       await streamLogs({
@@ -123,17 +117,7 @@ describe('log-streamer', () => {
       };
       const formatter = new LogFormatter({ format: 'raw' });
 
-      const mockStdout = new Readable({
-        read() {
-          this.push(null);
-        },
-      });
-
-      const mockProcess = {
-        stdout: mockStdout,
-        kill: jest.fn(),
-      };
-
+      const mockProcess = makeMockExecaProcess();
       mockedExeca.mockReturnValue(mockProcess as never);
 
       // Simulate SIGTERM by resolving with signal
@@ -225,17 +209,7 @@ describe('log-streamer', () => {
 
       mockedFs.existsSync.mockReturnValue(true);
 
-      const mockStdout = new Readable({
-        read() {
-          this.push(null);
-        },
-      });
-
-      const mockProcess = {
-        stdout: mockStdout,
-        kill: jest.fn(),
-      };
-
+      const mockProcess = makeMockExecaProcess();
       mockedExeca.mockReturnValue(mockProcess as never);
 
       await streamLogs({
@@ -261,8 +235,7 @@ describe('log-streamer', () => {
       };
       const formatter = new LogFormatter({ format: 'json' });
 
-      const logLine =
-        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"';
+      const logLine = createRawLogLine();
 
       mockedFs.existsSync.mockReturnValue(true);
       mockedFs.readFileSync.mockReturnValue(logLine);
@@ -331,8 +304,7 @@ describe('log-streamer', () => {
       };
       const formatter = new LogFormatter({ format: 'json' });
 
-      const logLine =
-        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"';
+      const logLine = createRawLogLine();
 
       mockedFs.existsSync.mockReturnValue(true);
       mockedFs.readFileSync.mockReturnValue(logLine);
@@ -366,8 +338,7 @@ describe('log-streamer', () => {
       };
       const formatter = new LogFormatter({ format: 'json' });
 
-      const logLine =
-        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"';
+      const logLine = createRawLogLine();
 
       mockedFs.existsSync.mockReturnValue(true);
       mockedFs.readFileSync.mockReturnValue(logLine);
@@ -416,6 +387,119 @@ describe('log-streamer', () => {
       expect(logger.warn).toHaveBeenCalledWith(
         expect.stringContaining('PID tracking not available')
       );
+    });
+  });
+
+  describe('runWithSignalHandling - signal and error handling', () => {
+    it('should return without throwing when process exits with SIGTERM signal error (lines 85-88)', async () => {
+      const sigtermError = Object.assign(new Error('Process killed'), { signal: 'SIGTERM' });
+
+      // Make the mock process a thenable that rejects with SIGTERM error
+      const rejectingProc = Object.assign(Promise.reject(sigtermError), {
+        stdout: new Readable({ read() { this.push(null); } }),
+        kill: jest.fn(),
+      });
+      // Suppress unhandled rejection before test consumes it
+      rejectingProc.catch(() => {});
+
+      mockedExeca.mockReturnValue(rejectingProc as never);
+
+      await expect(
+        streamLogs({
+          follow: false,
+          source: { type: 'running', containerName: 'awf-squid' },
+          formatter: new LogFormatter({ format: 'raw' }),
+          parse: false,
+        })
+      ).resolves.toBeUndefined();
+    });
+
+    it('should re-throw non-SIGTERM errors from the process', async () => {
+      const ioError = new Error('I/O error');
+
+      const rejectingProc = Object.assign(Promise.reject(ioError), {
+        stdout: new Readable({ read() { this.push(null); } }),
+        kill: jest.fn(),
+      });
+      rejectingProc.catch(() => {});
+
+      mockedExeca.mockReturnValue(rejectingProc as never);
+
+      await expect(
+        streamLogs({
+          follow: false,
+          source: { type: 'running', containerName: 'awf-squid' },
+          formatter: new LogFormatter({ format: 'raw' }),
+          parse: false,
+        })
+      ).rejects.toThrow('I/O error');
+    });
+
+    it('should call proc.kill when SIGINT received while streaming (line 66)', async () => {
+      const mockStdout = new PassThrough();
+      const mockKill = jest.fn(() => {
+        // End the stream so the readline loop exits and the test can complete
+        mockStdout.push(null);
+      });
+      const mockProcess = { stdout: mockStdout, kill: mockKill };
+      mockedExeca.mockReturnValue(mockProcess as never);
+
+      const sigintListenersBefore = process.listeners('SIGINT');
+
+      const streamPromise = streamLogs({
+        follow: true,
+        source: { type: 'running', containerName: 'awf-squid' },
+        formatter: new LogFormatter({ format: 'raw' }),
+        parse: false,
+      });
+
+      // Allow the async readline setup and SIGINT handler registration to complete
+      await new Promise<void>(resolve => setImmediate(resolve));
+
+      const sigintListenersAfter = process.listeners('SIGINT');
+      const newSigintListeners = sigintListenersAfter.filter(l => !sigintListenersBefore.includes(l));
+      expect(newSigintListeners).toHaveLength(1);
+
+      // Invoke only the handler registered by streamLogs to avoid triggering unrelated listeners
+      (newSigintListeners[0] as () => void)();
+
+      await streamPromise;
+
+      expect(mockKill).toHaveBeenCalledWith('SIGTERM');
+    });
+  });
+
+  describe('enrichWithPid - invalid port guard (line 189)', () => {
+    it('should skip PID lookup when clientPort is zero', async () => {
+      const logLine = createRawLogLine({ clientPort: '0' });
+      const source: LogSource = { type: 'preserved', path: '/tmp/squid-logs' };
+      const formatter = new LogFormatter({ format: 'json' });
+
+      mockedFs.existsSync.mockReturnValue(true);
+      mockedFs.readFileSync.mockReturnValue(logLine);
+
+      (trackPidForPortSync as jest.Mock).mockReturnValue({ pid: 9999, cmdline: 'curl', comm: 'curl', inode: 1 });
+
+      await streamLogs({ follow: false, source, formatter, parse: true, withPid: true });
+
+      // Port 0 is invalid (≤ 0), so trackPidForPortSync must NOT be called
+      expect(trackPidForPortSync).not.toHaveBeenCalled();
+    });
+
+    it('should skip PID lookup when clientPort exceeds 65535', async () => {
+      const logLine = createRawLogLine({ clientPort: '99999' });
+      const source: LogSource = { type: 'preserved', path: '/tmp/squid-logs' };
+      const formatter = new LogFormatter({ format: 'json' });
+
+      mockedFs.existsSync.mockReturnValue(true);
+      mockedFs.readFileSync.mockReturnValue(logLine);
+
+      (trackPidForPortSync as jest.Mock).mockReturnValue({ pid: 9999, cmdline: 'curl', comm: 'curl', inode: 1 });
+
+      await streamLogs({ follow: false, source, formatter, parse: true, withPid: true });
+
+      // Port > 65535 is invalid, so trackPidForPortSync must NOT be called
+      expect(trackPidForPortSync).not.toHaveBeenCalled();
     });
   });
 });

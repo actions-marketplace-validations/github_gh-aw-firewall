@@ -51,7 +51,7 @@ struct obf_entry {
 
 /* --- BEGIN GENERATED OBFUSCATED DEFAULTS (key=0x5A) --- */
 /* Re-generate with: containers/agent/one-shot-token/encode-tokens.sh */
-#define NUM_DEFAULT_TOKENS 11
+#define NUM_DEFAULT_TOKENS 13
 
 static const unsigned char OBF_0[] = { 0x19, 0x15, 0x0a, 0x13, 0x16, 0x15, 0x0e, 0x05, 0x1d, 0x13, 0x0e, 0x12, 0x0f, 0x18, 0x05, 0x0e, 0x15, 0x11, 0x1f, 0x14 }; /* length=20 */
 static const unsigned char OBF_1[] = { 0x1d, 0x13, 0x0e, 0x12, 0x0f, 0x18, 0x05, 0x0e, 0x15, 0x11, 0x1f, 0x14 }; /* length=12 */
@@ -62,10 +62,12 @@ static const unsigned char OBF_5[] = { 0x1d, 0x12, 0x05, 0x1b, 0x19, 0x19, 0x1f,
 static const unsigned char OBF_6[] = { 0x15, 0x0a, 0x1f, 0x14, 0x1b, 0x13, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=14 */
 static const unsigned char OBF_7[] = { 0x15, 0x0a, 0x1f, 0x14, 0x1b, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=10 */
 static const unsigned char OBF_8[] = { 0x1b, 0x14, 0x0e, 0x12, 0x08, 0x15, 0x0a, 0x13, 0x19, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=17 */
-static const unsigned char OBF_9[] = { 0x19, 0x16, 0x1b, 0x0f, 0x1e, 0x1f, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=14 */
-static const unsigned char OBF_10[] = { 0x19, 0x15, 0x1e, 0x1f, 0x02, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=13 */
+static const unsigned char OBF_9[] = { 0x1b, 0x14, 0x0e, 0x12, 0x08, 0x15, 0x0a, 0x13, 0x19, 0x05, 0x1b, 0x0f, 0x0e, 0x12, 0x05, 0x0e, 0x15, 0x11, 0x1f, 0x14 }; /* length=20 */
+static const unsigned char OBF_10[] = { 0x19, 0x16, 0x1b, 0x0f, 0x1e, 0x1f, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=14 */
+static const unsigned char OBF_11[] = { 0x19, 0x15, 0x1e, 0x1f, 0x02, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=13 */
+static const unsigned char OBF_12[] = { 0x19, 0x15, 0x0a, 0x13, 0x16, 0x15, 0x0e, 0x05, 0x0a, 0x08, 0x15, 0x0c, 0x13, 0x1e, 0x1f, 0x08, 0x05, 0x1b, 0x0a, 0x13, 0x05, 0x11, 0x1f, 0x03 }; /* length=24 */
 
-static const struct obf_entry OBFUSCATED_DEFAULTS[11] = {
+static const struct obf_entry OBFUSCATED_DEFAULTS[13] = {
     { OBF_0, sizeof(OBF_0) },
     { OBF_1, sizeof(OBF_1) },
     { OBF_2, sizeof(OBF_2) },
@@ -77,6 +79,8 @@ static const struct obf_entry OBFUSCATED_DEFAULTS[11] = {
     { OBF_8, sizeof(OBF_8) },
     { OBF_9, sizeof(OBF_9) },
     { OBF_10, sizeof(OBF_10) },
+    { OBF_11, sizeof(OBF_11) },
+    { OBF_12, sizeof(OBF_12) },
 };
 /* --- END GENERATED OBFUSCATED DEFAULTS --- */
 
@@ -327,6 +331,43 @@ static int get_token_index(const char *name) {
  *
  * For all other variables: passes through to real getenv
  */
+
+/**
+ * Shared cache-and-unset logic for sensitive token interception.
+ * Caches the value, removes it from the environment, logs if debug is on,
+ * and marks the token as accessed. Must be called with token_mutex held.
+ */
+static char *cache_and_unset_token(int token_idx, const char *name, char *result, const char *via_suffix) {
+    if (result != NULL) {
+        /* Cache the value so subsequent reads succeed after unsetenv */
+        /* Note: This memory is intentionally never freed - it must persist
+         * for the lifetime of the process */
+        char *cached = strdup(result);
+        if (cached == NULL) {
+            fprintf(stderr, "[one-shot-token] Failed to cache token %s: out of memory\n", name);
+            /* Still unset and mark as accessed, but return NULL to signal failure */
+            unsetenv(name);
+            token_accessed[token_idx] = 1;
+            return NULL;
+        }
+        token_cache[token_idx] = cached;
+
+        /* Unset the variable from the environment so /proc/self/environ is cleared */
+        unsetenv(name);
+
+        if (debug_enabled) {
+            fprintf(stderr, "[one-shot-token] Token %s accessed and cached (length: %zu)%s\n",
+                    name, strlen(token_cache[token_idx]), via_suffix);
+        }
+
+        result = token_cache[token_idx];
+    }
+
+    /* Mark as accessed even if NULL (prevents repeated log messages) */
+    token_accessed[token_idx] = 1;
+    return result;
+}
+
 __attribute__((visibility("default")))
 char *getenv(const char *name) {
     ensure_real_getenv();
@@ -354,26 +395,7 @@ char *getenv(const char *name) {
     if (!token_accessed[token_idx]) {
         /* First access - get the real value and cache it */
         result = real_getenv(name);
-
-        if (result != NULL) {
-            /* Cache the value so subsequent reads succeed after unsetenv */
-            /* Note: This memory is intentionally never freed - it must persist
-             * for the lifetime of the process */
-            token_cache[token_idx] = strdup(result);
-
-            /* Unset the variable from the environment so /proc/self/environ is cleared */
-            unsetenv(name);
-
-            if (debug_enabled) {
-                fprintf(stderr, "[one-shot-token] Token %s accessed and cached (length: %zu)\n",
-                        name, strlen(token_cache[token_idx]));
-            }
-
-            result = token_cache[token_idx];
-        }
-
-        /* Mark as accessed even if NULL (prevents repeated log messages) */
-        token_accessed[token_idx] = 1;
+        result = cache_and_unset_token(token_idx, name, result, "");
     } else {
         /* Already accessed - return cached value */
         result = token_cache[token_idx];
@@ -428,26 +450,7 @@ char *secure_getenv(const char *name) {
     if (!token_accessed[token_idx]) {
         /* First access - get the real value using secure_getenv */
         result = real_secure_getenv(name);
-
-        if (result != NULL) {
-            /* Cache the value so subsequent reads succeed after unsetenv */
-            /* Note: This memory is intentionally never freed - it must persist
-             * for the lifetime of the process */
-            token_cache[token_idx] = strdup(result);
-
-            /* Unset the variable from the environment so /proc/self/environ is cleared */
-            unsetenv(name);
-
-            if (debug_enabled) {
-                fprintf(stderr, "[one-shot-token] Token %s accessed and cached (length: %zu) (via secure_getenv)\n",
-                        name, strlen(token_cache[token_idx]));
-            }
-
-            result = token_cache[token_idx];
-        }
-
-        /* Mark as accessed even if NULL (prevents repeated log messages) */
-        token_accessed[token_idx] = 1;
+        result = cache_and_unset_token(token_idx, name, result, " (via secure_getenv)");
     } else {
         /* Already accessed - return cached value */
         result = token_cache[token_idx];

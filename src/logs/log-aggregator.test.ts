@@ -2,22 +2,19 @@
  * Tests for log-aggregator module
  */
 
-import { aggregateLogs, loadAllLogs, loadAndAggregate } from './log-aggregator';
+import { loadAllLogs, loadAndAggregate, logAggregatorTestHelpers } from './log-aggregator';
 import { ParsedLogEntry, LogSource } from '../types';
+import { createLogEntry, createRawLogLine } from './log-test-fixtures.test-utils';
 import execa from 'execa';
 import * as fs from 'fs';
+
+const { aggregateLogs } = logAggregatorTestHelpers;
 
 // Mock dependencies
 jest.mock('execa');
 jest.mock('fs');
-jest.mock('../logger', () => ({
-  logger: {
-    debug: jest.fn(),
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-  },
-}));
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+jest.mock('../logger', () => require('../test-helpers/mock-logger.test-utils').loggerMockFactory());
 
 const mockedExeca = execa as jest.MockedFunction<typeof execa>;
 const mockedFs = fs as jest.Mocked<typeof fs>;
@@ -28,6 +25,37 @@ describe('log-aggregator', () => {
   });
 
   describe('aggregateLogs', () => {
+    /** Returns a pair of valid CONNECT tunnel entries used across filtering tests. */
+    function validTunnelEntries(): ParsedLogEntry[] {
+      return [
+        createLogEntry({ domain: 'github.com', url: 'github.com:443', isAllowed: true }),
+        createLogEntry({ domain: 'npmjs.org', url: 'npmjs.org:443', isAllowed: true }),
+      ];
+    }
+
+    /** Returns a benign operational transaction-end-before-headers entry. */
+    function transactionEndEntry(overrides: Partial<ParsedLogEntry> = {}): ParsedLogEntry {
+      return createLogEntry({
+        domain: '-',
+        url: 'error:transaction-end-before-headers',
+        decision: 'NONE_NONE:HIER_NONE',
+        statusCode: 0,
+        isAllowed: false,
+        ...overrides,
+      });
+    }
+
+    /** Asserts that stats reflect only the two valid tunnel entries (github.com + npmjs.org). */
+    function expectOnlyValidTunnelStats(stats: ReturnType<typeof aggregateLogs>): void {
+      expect(stats.totalRequests).toBe(2); // Only actual requests, not benign operational entries
+      expect(stats.allowedRequests).toBe(2);
+      expect(stats.deniedRequests).toBe(0);
+      expect(stats.uniqueDomains).toBe(2);
+      expect(stats.byDomain.has('github.com')).toBe(true);
+      expect(stats.byDomain.has('npmjs.org')).toBe(true);
+      expect(stats.byDomain.has('-')).toBe(false); // Filtered entry not in domain stats
+    }
+
     it('should return empty stats for empty array', () => {
       const stats = aggregateLogs([]);
 
@@ -107,74 +135,30 @@ describe('log-aggregator', () => {
     });
 
     it('should filter out transaction-end-before-headers entries', () => {
+      const [first, second] = validTunnelEntries();
       const entries: ParsedLogEntry[] = [
-        createLogEntry({ 
-          domain: 'github.com', 
-          url: 'github.com:443',
-          isAllowed: true 
-        }),
-        createLogEntry({ 
-          domain: '-', 
-          url: 'error:transaction-end-before-headers',
-          decision: 'NONE_NONE:HIER_NONE',
-          statusCode: 0,
-          isAllowed: false 
-        }),
-        createLogEntry({ 
-          domain: 'npmjs.org', 
-          url: 'npmjs.org:443',
-          isAllowed: true 
-        }),
+        first,
+        transactionEndEntry(),
+        second,
       ];
 
       const stats = aggregateLogs(entries);
 
-      // Should only count the two valid entries
-      expect(stats.totalRequests).toBe(2); // Only actual requests, not benign operational entries
-      expect(stats.allowedRequests).toBe(2);
-      expect(stats.deniedRequests).toBe(0);
-      expect(stats.uniqueDomains).toBe(2);
-      expect(stats.byDomain.has('github.com')).toBe(true);
-      expect(stats.byDomain.has('npmjs.org')).toBe(true);
-      expect(stats.byDomain.has('-')).toBe(false); // Filtered entry not in domain stats
+      expectOnlyValidTunnelStats(stats);
     });
 
     it('should handle multiple transaction-end-before-headers entries', () => {
+      const [first, second] = validTunnelEntries();
       const entries: ParsedLogEntry[] = [
-        createLogEntry({ 
-          domain: 'github.com', 
-          url: 'github.com:443',
-          isAllowed: true 
-        }),
-        createLogEntry({ 
-          domain: '-', 
-          url: 'error:transaction-end-before-headers',
-          clientIp: '::1', // healthcheck from localhost
-          decision: 'NONE_NONE:HIER_NONE',
-          statusCode: 0,
-          isAllowed: false 
-        }),
-        createLogEntry({ 
-          domain: '-', 
-          url: 'error:transaction-end-before-headers',
-          clientIp: '172.30.0.20', // shutdown-time connection closure
-          decision: 'NONE_NONE:HIER_NONE',
-          statusCode: 0,
-          isAllowed: false 
-        }),
-        createLogEntry({ 
-          domain: 'npmjs.org', 
-          url: 'npmjs.org:443',
-          isAllowed: true 
-        }),
+        first,
+        transactionEndEntry({ clientIp: '::1' }), // healthcheck from localhost
+        second,
+        transactionEndEntry({ clientIp: '172.30.0.20' }), // shutdown-time connection closure
       ];
 
       const stats = aggregateLogs(entries);
 
-      expect(stats.totalRequests).toBe(2); // Only actual requests
-      expect(stats.allowedRequests).toBe(2);
-      expect(stats.deniedRequests).toBe(0);
-      expect(stats.uniqueDomains).toBe(2);
+      expectOnlyValidTunnelStats(stats);
     });
 
     it('should still count time range from all entries including filtered ones', () => {
@@ -240,7 +224,7 @@ describe('log-aggregator', () => {
 
     it('should load logs from a file', async () => {
       const mockLogContent = [
-        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"',
+        createRawLogLine(),
       ].join('\n');
 
       mockedFs.existsSync.mockReturnValue(true);
@@ -289,7 +273,7 @@ describe('log-aggregator', () => {
 
     it('should skip unparseable lines', async () => {
       const mockLogContent = [
-        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"',
+        createRawLogLine(),
         'invalid line that cannot be parsed',
         '',
         '1761074375.123 172.30.0.20:39749 npmjs.org:443 104.16.0.0:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT npmjs.org:443 "-"',
@@ -371,6 +355,84 @@ describe('log-aggregator', () => {
     });
   });
 
+  describe('AWF-internal domain filtering', () => {
+    it('should filter denied entries for AWF Docker network IPs', () => {
+      const entries: ParsedLogEntry[] = [
+        createLogEntry({ domain: 'github.com', isAllowed: true }),
+        createLogEntry({ domain: '172.30.0.30', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+        createLogEntry({ domain: '172.30.0.1', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      expect(stats.totalRequests).toBe(1);
+      expect(stats.allowedRequests).toBe(1);
+      expect(stats.deniedRequests).toBe(0);
+      expect(stats.byDomain.has('172.30.0.30')).toBe(false);
+      expect(stats.byDomain.has('172.30.0.1')).toBe(false);
+    });
+
+    it('should filter denied entries for MCP Gateway hostname (awmgmcpg)', () => {
+      const entries: ParsedLogEntry[] = [
+        createLogEntry({ domain: 'github.com', isAllowed: true }),
+        createLogEntry({ domain: 'awmgmcpg', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+        createLogEntry({ domain: 'awmg-mcpg', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+        createLogEntry({ domain: 'evil.com', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      expect(stats.totalRequests).toBe(2); // github.com + evil.com
+      expect(stats.allowedRequests).toBe(1);
+      expect(stats.deniedRequests).toBe(1);
+      expect(stats.byDomain.has('awmgmcpg')).toBe(false);
+      expect(stats.byDomain.has('awmg-mcpg')).toBe(false);
+      expect(stats.byDomain.has('evil.com')).toBe(true);
+    });
+
+    it('should not filter ALLOWED entries for internal domains (explicit allowlist)', () => {
+      // When an operator explicitly adds a topology peer to the allowlist,
+      // allowed traffic to that peer should still appear in stats.
+      const entries: ParsedLogEntry[] = [
+        createLogEntry({ domain: 'awmg-mcpg', isAllowed: true }),
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      // Allowed internal-domain traffic is NOT filtered — only denied entries are
+      expect(stats.totalRequests).toBe(1);
+      expect(stats.byDomain.has('awmg-mcpg')).toBe(true);
+    });
+
+    it('should still track time range from filtered internal-domain entries', () => {
+      const entries: ParsedLogEntry[] = [
+        createLogEntry({ timestamp: 1000.0, domain: 'github.com', isAllowed: true }),
+        createLogEntry({ timestamp: 1500.0, domain: 'awmgmcpg', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+        createLogEntry({ timestamp: 2000.0, domain: 'npmjs.org', isAllowed: true }),
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      // Time range includes all entries, even filtered ones
+      expect(stats.timeRange).toEqual({ start: 1000.0, end: 2000.0 });
+      // But filtered entries don't count toward requests
+      expect(stats.totalRequests).toBe(2);
+    });
+
+    it('should produce zero deniedRequests when all blocked traffic is AWF-internal', () => {
+      const entries: ParsedLogEntry[] = [
+        createLogEntry({ domain: 'github.com', isAllowed: true }),
+        createLogEntry({ domain: 'awmgmcpg', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+        createLogEntry({ domain: '172.30.0.30', isAllowed: false, decision: 'TCP_DENIED:HIER_NONE', statusCode: 403 }),
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      expect(stats.deniedRequests).toBe(0);
+      expect(stats.totalRequests).toBe(1);
+    });
+  });
+
   describe('loadAndAggregate', () => {
     it('should correctly detect blocked domains from real log lines', async () => {
       const mockLogContent = [
@@ -442,9 +504,22 @@ describe('log-aggregator', () => {
 
     it('should load and aggregate logs in one call', async () => {
       const mockLogContent = [
-        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"',
-        '1761074375.123 172.30.0.20:39749 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"',
-        '1761074376.456 172.30.0.20:39750 evil.com:443 -:- 1.1 CONNECT 403 TCP_DENIED:HIER_NONE evil.com:443 "curl/7.81.0"',
+        createRawLogLine(),
+        createRawLogLine({
+          timestamp: 1761074375.123,
+          clientPort: '39749',
+        }),
+        createRawLogLine({
+          timestamp: 1761074376.456,
+          clientPort: '39750',
+          host: 'evil.com:443',
+          destIp: '-',
+          destPort: '-',
+          statusCode: 403,
+          decision: 'TCP_DENIED:HIER_NONE',
+          url: 'evil.com:443',
+          userAgent: 'curl/7.81.0',
+        }),
       ].join('\n');
 
       mockedFs.existsSync.mockReturnValue(true);
@@ -464,27 +539,3 @@ describe('log-aggregator', () => {
     });
   });
 });
-
-/**
- * Helper function to create a mock ParsedLogEntry with default values
- */
-function createLogEntry(overrides: Partial<ParsedLogEntry> = {}): ParsedLogEntry {
-  return {
-    timestamp: 1761074374.646,
-    clientIp: '172.30.0.20',
-    clientPort: '39748',
-    host: 'api.github.com:443',
-    destIp: '140.82.114.22',
-    destPort: '443',
-    protocol: '1.1',
-    method: 'CONNECT',
-    statusCode: 200,
-    decision: 'TCP_TUNNEL:HIER_DIRECT',
-    url: 'api.github.com:443',
-    userAgent: '-',
-    domain: 'api.github.com',
-    isAllowed: true,
-    isHttps: true,
-    ...overrides,
-  };
-}

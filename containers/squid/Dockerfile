@@ -1,15 +1,25 @@
-FROM ubuntu/squid:latest
+FROM alpine:3.24
 
-# Install additional tools for debugging, healthcheck, and SSL Bump
-# Retry logic handles transient 404s when Ubuntu archive supersedes package versions mid-build
+# Install Squid and supporting tools needed by runtime health checks and diagnostics.
+# Keep bash + shadow so the compose preflight can continue to drop privileges with:
+#   su -s /bin/bash proxy -c ...
 RUN set -eux; \
-    PKGS="curl dnsutils net-tools netcat-openbsd openssl squid-openssl"; \
-    apt-get update && \
-    apt-get install -y --only-upgrade gpgv && \
-    ( apt-get install -y --no-install-recommends $PKGS || \
-      (rm -rf /var/lib/apt/lists/* && apt-get update && \
-       apt-get install -y --no-install-recommends $PKGS) ) && \
-    rm -rf /var/lib/apt/lists/*
+    apk add --no-cache \
+      bash \
+      bind-tools \
+      curl \
+      net-tools \
+      netcat-openbsd \
+      openssl \
+      shadow \
+      squid; \
+    # Alpine base assigns GID 13 to the 'news' group (and UID 9 to the 'news' user).
+    # AWF requires proxy user/group at UID/GID 13 for log-dir ownership compatibility.
+    # Remove the 'news' account first so those IDs are free to assign to 'proxy'.
+    userdel news 2>/dev/null || true; \
+    groupdel news 2>/dev/null || true; \
+    groupadd -r -g 13 proxy; \
+    useradd -r -u 13 -g proxy -M -s /sbin/nologin proxy
 
 # Create log directory and SSL database directory, ensure proxy user owns them
 RUN mkdir -p /var/log/squid /var/spool/squid /var/run/squid && \

@@ -5,8 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
-    paths-ignore:
-      - '.github/workflows/release.yml'
+    types: [labeled]
   workflow_dispatch:
 
 permissions:
@@ -15,6 +14,7 @@ permissions:
 jobs:
   test-domain:
     name: Domain Tests
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ready-for-aw'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -37,8 +37,22 @@ jobs:
       - name: Build local containers
         run: |
           echo "=== Building local containers ==="
-          docker build -t ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
-          docker build -t ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
+          retry_docker_build() {
+            local image="$1"
+            local context="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if docker build -t "$image" "$context"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 10))
+              fi
+            done
+            return 1
+          }
+          retry_docker_build ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
+          retry_docker_build ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
 
       - name: Pre-test cleanup
         run: |
@@ -72,6 +86,7 @@ jobs:
 
   test-network:
     name: Network Tests
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ready-for-aw'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -94,8 +109,22 @@ jobs:
       - name: Build local containers
         run: |
           echo "=== Building local containers ==="
-          docker build -t ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
-          docker build -t ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
+          retry_docker_build() {
+            local image="$1"
+            local context="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if docker build -t "$image" "$context"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 10))
+              fi
+            done
+            return 1
+          }
+          retry_docker_build ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
+          retry_docker_build ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
 
       - name: Pre-test cleanup
         run: |
@@ -129,6 +158,7 @@ jobs:
 
   test-protocol-security:
     name: Protocol & Security Tests
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ready-for-aw'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -151,8 +181,22 @@ jobs:
       - name: Build local containers
         run: |
           echo "=== Building local containers ==="
-          docker build -t ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
-          docker build -t ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
+          retry_docker_build() {
+            local image="$1"
+            local context="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if docker build -t "$image" "$context"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 10))
+              fi
+            done
+            return 1
+          }
+          retry_docker_build ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
+          retry_docker_build ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
 
       - name: Pre-test cleanup
         run: |
@@ -186,6 +230,7 @@ jobs:
 
   test-container-ops:
     name: Container & Ops Tests
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ready-for-aw'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -208,8 +253,17 @@ jobs:
       - name: Build local containers
         run: |
           echo "=== Building local containers ==="
-          docker build -t ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
-          docker build -t ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
+          for image in squid agent; do
+            for attempt in 1 2 3; do
+              if docker build -t "ghcr.io/github/gh-aw-firewall/${image}:latest" "containers/${image}/"; then
+                break
+              fi
+              if [ "$attempt" -eq 3 ]; then
+                exit 1
+              fi
+              sleep $((attempt * 10))
+            done
+          done
 
       - name: Pre-test cleanup
         run: |
@@ -220,7 +274,7 @@ jobs:
         run: |
           echo "=== Running container & ops tests ==="
           npm run test:integration -- \
-            --testPathPatterns="(container-workdir|environment-variables|error-handling|exit-code-propagation|log-commands|no-docker|volume-mounts|skip-pull)" \
+            --testPathPatterns="(container-workdir|environment-variables|error-handling|exit-code-propagation|filesystem-allowwrite|log-commands|no-docker|volume-mounts|skip-pull)" \
             --verbose
         env:
           JEST_TIMEOUT: 180000
@@ -243,6 +297,7 @@ jobs:
 
   test-api-proxy:
     name: API Proxy Tests
+    if: github.event_name != 'pull_request' || github.event.label.name == 'ready-for-aw'
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
@@ -265,8 +320,22 @@ jobs:
       - name: Build local containers
         run: |
           echo "=== Building local containers ==="
-          docker build -t ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
-          docker build -t ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
+          retry_docker_build() {
+            local image="$1"
+            local context="$2"
+            local attempt
+            for attempt in 1 2 3; do
+              if docker build -t "$image" "$context"; then
+                return 0
+              fi
+              if [ "$attempt" -lt 3 ]; then
+                sleep $((attempt * 10))
+              fi
+            done
+            return 1
+          }
+          retry_docker_build ghcr.io/github/gh-aw-firewall/squid:latest containers/squid/
+          retry_docker_build ghcr.io/github/gh-aw-firewall/agent:latest containers/agent/
 
       - name: Pre-test cleanup
         run: |

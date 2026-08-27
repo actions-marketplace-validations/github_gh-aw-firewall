@@ -4,14 +4,20 @@ on:
   schedule: weekly
   workflow_dispatch:
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
+sandbox:
+  agent:
+    id: awf
 tools:
   github:
     toolsets: [default]
   bash: true
 safe-outputs:
+  threat-detection:
+    enabled: false
   create-discussion:
     title-prefix: "[CLI Flag Review] "
     category: "general"

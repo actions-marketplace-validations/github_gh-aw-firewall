@@ -14,36 +14,12 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import * as crypto from 'crypto';
 import execa from 'execa';
 import { logger } from './logger';
+import { chownRecursive, mountSslTmpfs } from './ssl-key-storage';
 
-/**
- * Recursively chown a directory and its contents
- */
-export function chownRecursive(dirPath: string, uid: number, gid: number): void {
-  fs.chownSync(dirPath, uid, gid);
-  for (const entry of fs.readdirSync(dirPath, { withFileTypes: true })) {
-    const fullPath = path.join(dirPath, entry.name);
-    if (entry.isDirectory()) {
-      chownRecursive(fullPath, uid, gid);
-    } else {
-      fs.chownSync(fullPath, uid, gid);
-    }
-  }
-}
-
-/**
- * Configuration for SSL Bump CA generation
- */
-export interface SslBumpConfig {
-  /** Working directory to store CA files */
-  workDir: string;
-  /** Common name for the CA certificate (default: 'AWF Session CA') */
-  commonName?: string;
-  /** Validity period in days (default: 1) */
-  validityDays?: number;
-}
+// Re-export key-storage utilities so existing callers don't break
+export { unmountSslTmpfs, cleanupSslKeyMaterial } from './ssl-key-storage';
 
 /**
  * Result of CA generation containing paths to certificate files
@@ -58,117 +34,6 @@ export interface CaFiles {
 }
 
 /**
- * Mounts a tmpfs filesystem at the given path so SSL keys are stored in memory only.
- * Falls back gracefully if mount fails (e.g., insufficient permissions).
- *
- * @param sslDir - Directory path to mount tmpfs on
- * @returns true if tmpfs was mounted, false if fallback to disk
- */
-export async function mountSslTmpfs(sslDir: string): Promise<boolean> {
-  try {
-    // Mount tmpfs with restrictive options (4MB is more than enough for SSL keys)
-    await execa('mount', [
-      '-t', 'tmpfs',
-      '-o', 'size=4m,mode=0700,noexec,nosuid,nodev',
-      'tmpfs',
-      sslDir,
-    ]);
-
-    logger.debug(`tmpfs mounted at ${sslDir} for SSL key storage`);
-    return true;
-  } catch (error) {
-    logger.debug(`Could not mount tmpfs at ${sslDir} (falling back to disk): ${error}`);
-    return false;
-  }
-}
-
-/**
- * Unmounts a tmpfs filesystem. All data is immediately destroyed since tmpfs is memory-only.
- *
- * @param sslDir - Directory path where tmpfs was mounted
- */
-export async function unmountSslTmpfs(sslDir: string): Promise<void> {
-  try {
-    await execa('umount', [sslDir]);
-    logger.debug(`tmpfs unmounted at ${sslDir} - key material destroyed`);
-  } catch (error) {
-    logger.debug(`Could not unmount tmpfs at ${sslDir}: ${error}`);
-  }
-}
-
-/**
- * Securely wipes a file by overwriting its contents with random data before unlinking.
- * This prevents recovery of sensitive key material from disk.
- *
- * @param filePath - Path to the file to securely wipe
- */
-export function secureWipeFile(filePath: string): void {
-  try {
-    if (!fs.existsSync(filePath)) {
-      return;
-    }
-
-    const stat = fs.statSync(filePath);
-    const size = stat.size;
-
-    if (size > 0) {
-      // Overwrite with random data
-      const fd = fs.openSync(filePath, 'w');
-      const randomData = crypto.randomBytes(size);
-      fs.writeSync(fd, randomData);
-      fs.fsyncSync(fd);
-      fs.closeSync(fd);
-    }
-
-    fs.unlinkSync(filePath);
-    logger.debug(`Securely wiped: ${filePath}`);
-  } catch (error) {
-    // Best-effort: if secure wipe fails, still try to delete
-    try {
-      fs.unlinkSync(filePath);
-    } catch {
-      // Ignore deletion errors during cleanup
-    }
-    logger.debug(`Could not securely wipe ${filePath}: ${error}`);
-  }
-}
-
-/**
- * Securely cleans up SSL key material from the workDir.
- * Overwrites private keys with random data before deletion to prevent recovery.
- *
- * @param workDir - Working directory containing ssl/ subdirectory
- */
-export function cleanupSslKeyMaterial(workDir: string): void {
-  const sslDir = path.join(workDir, 'ssl');
-  if (!fs.existsSync(sslDir)) {
-    return;
-  }
-
-  logger.debug('Securely wiping SSL key material...');
-
-  // Wipe the private key (most sensitive)
-  secureWipeFile(path.join(sslDir, 'ca-key.pem'));
-
-  // Wipe other SSL files
-  secureWipeFile(path.join(sslDir, 'ca-cert.pem'));
-  secureWipeFile(path.join(sslDir, 'ca-cert.der'));
-
-  // Clean up ssl_db (contains generated per-host certificates)
-  const sslDbPath = path.join(workDir, 'ssl_db');
-  if (fs.existsSync(sslDbPath)) {
-    const certsDir = path.join(sslDbPath, 'certs');
-    if (fs.existsSync(certsDir)) {
-      for (const file of fs.readdirSync(certsDir)) {
-        secureWipeFile(path.join(certsDir, file));
-      }
-    }
-  }
-
-  logger.debug('SSL key material securely wiped');
-}
-
-/**
  * Generates a self-signed CA certificate for SSL Bump
  *
  * The CA certificate is used by Squid to generate per-host certificates
@@ -178,7 +43,7 @@ export function cleanupSslKeyMaterial(workDir: string): void {
  * @returns Paths to generated CA files
  * @throws Error if OpenSSL commands fail
  */
-export async function generateSessionCa(config: SslBumpConfig): Promise<CaFiles> {
+export async function generateSessionCa(config: { workDir: string; commonName?: string; validityDays?: number }): Promise<CaFiles> {
   const { workDir, commonName = 'AWF Session CA', validityDays = 1 } = config;
 
   // Create ssl directory in workDir, backed by tmpfs when possible
@@ -313,51 +178,4 @@ export async function isOpenSslAvailable(): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-/**
- * Regex pattern for matching URL path characters.
- * Uses character class instead of .* to prevent catastrophic backtracking (ReDoS).
- * Matches any non-whitespace character, which is appropriate for URL paths.
- */
-const URL_CHAR_PATTERN = '[^\\s]*';
-
-/**
- * Parses URL patterns for SSL Bump ACL rules
- *
- * Converts user-friendly URL patterns into Squid url_regex ACL patterns.
- *
- * Examples:
- * - `https://github.com/myorg/*` → `^https://github\.com/myorg/[^\s]*`
- * - `https://api.example.com/v1/users` → `^https://api\.example\.com/v1/users$`
- *
- * @param patterns - Array of URL patterns (can include wildcards)
- * @returns Array of regex patterns for Squid url_regex ACL
- */
-export function parseUrlPatterns(patterns: string[]): string[] {
-  return patterns.map(pattern => {
-    // Remove trailing slash for consistency
-    let p = pattern.replace(/\/$/, '');
-
-    // Preserve existing .* patterns by using a placeholder before escaping
-    const WILDCARD_PLACEHOLDER = '\x00WILDCARD\x00';
-    p = p.replace(/\.\*/g, WILDCARD_PLACEHOLDER);
-
-    // Escape regex special characters except *
-    p = p.replace(/[.+?^${}()|[\]\\]/g, '\\$&');
-
-    // Convert * wildcards to safe pattern (prevents ReDoS)
-    p = p.replace(/\*/g, URL_CHAR_PATTERN);
-
-    // Restore preserved patterns from placeholder
-    p = p.replace(new RegExp(WILDCARD_PLACEHOLDER, 'g'), URL_CHAR_PATTERN);
-
-    // Anchor the pattern
-    // If pattern ends with the URL char pattern (from wildcard), don't add end anchor
-    if (p.endsWith(URL_CHAR_PATTERN)) {
-      return `^${p}`;
-    }
-    // For exact matches, add end anchor
-    return `^${p}$`;
-  });
 }

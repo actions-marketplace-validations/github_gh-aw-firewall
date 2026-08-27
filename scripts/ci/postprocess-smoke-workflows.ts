@@ -3,198 +3,222 @@
 import * as fs from 'fs';
 import * as path from 'path';
 
+import { applyGeneralWorkflowPatches } from './apply-general-workflow-patches';
+import { applyCodexWorkflowPatches } from './apply-codex-workflow-patches';
+
+
 const repoRoot = path.resolve(__dirname, '../..');
-const workflowPaths = [
-  // Existing smoke workflows
-  path.join(repoRoot, '.github/workflows/smoke-copilot.lock.yml'),
-  path.join(repoRoot, '.github/workflows/smoke-claude.lock.yml'),
-  path.join(repoRoot, '.github/workflows/smoke-chroot.lock.yml'),
+
+// Codex-only workflow files that use OpenAI models.
+// xpia.md sanitization is applied only to these files because gh-aw v0.64.2
+// introduced an xpia.md security policy that uses specific cybersecurity
+// terminology (e.g. "container escape", "DNS/ICMP tunneling", "port scanning",
+// "exploit tools") which triggers OpenAI's cyber_policy_violation content
+// filter, causing every Codex model request to fail with:
+//   "This user's access to this model has been temporarily limited for
+//    potentially suspicious activity related to cybersecurity."
+// The safe inline replacement achieves the same XPIA-prevention intent without
+// using trigger terms.
+const codexWorkflowPaths = [
   path.join(repoRoot, '.github/workflows/smoke-codex.lock.yml'),
-  // Build test workflow (combined)
-  path.join(repoRoot, '.github/workflows/build-test.lock.yml'),
-  // Agentic workflows (use --image-tag/--skip-pull which must be replaced
-  // with --build-local since chroot mode is now always-on and requires
-  // a container image built from the current source)
-  path.join(repoRoot, '.github/workflows/security-guard.lock.yml'),
-  path.join(repoRoot, '.github/workflows/security-review.lock.yml'),
-  path.join(repoRoot, '.github/workflows/ci-cd-gaps-assessment.lock.yml'),
-  path.join(repoRoot, '.github/workflows/ci-doctor.lock.yml'),
-  path.join(repoRoot, '.github/workflows/cli-flag-consistency-checker.lock.yml'),
-  path.join(repoRoot, '.github/workflows/dependency-security-monitor.lock.yml'),
-  path.join(repoRoot, '.github/workflows/doc-maintainer.lock.yml'),
-  path.join(repoRoot, '.github/workflows/issue-duplication-detector.lock.yml'),
-  path.join(repoRoot, '.github/workflows/issue-monster.lock.yml'),
-  path.join(repoRoot, '.github/workflows/pelis-agent-factory-advisor.lock.yml'),
-  path.join(repoRoot, '.github/workflows/plan.lock.yml'),
-  path.join(repoRoot, '.github/workflows/test-coverage-improver.lock.yml'),
-  path.join(repoRoot, '.github/workflows/update-release-notes.lock.yml'),
-  // Secret digger workflows (red team security research)
-  path.join(repoRoot, '.github/workflows/secret-digger-copilot.lock.yml'),
+  path.join(repoRoot, '.github/workflows/smoke-gvisor-codex.lock.yml'),
+  path.join(repoRoot, '.github/workflows/smoke-docker-sbx-codex.lock.yml'),
+  path.join(repoRoot, '.github/workflows/smoke-cloud-hypervisor-codex.lock.yml'),
   path.join(repoRoot, '.github/workflows/secret-digger-codex.lock.yml'),
-  path.join(repoRoot, '.github/workflows/secret-digger-claude.lock.yml'),
 ];
 
-// Matches the install step with captured indentation:
-// - "Install awf binary" or "Install AWF binary" step at any indent level
-// - run command invoking install_awf_binary.sh with a version
-const installStepRegex =
-  /^(\s*)- name: Install [Aa][Ww][Ff] binary\n\1\s*run: bash (?:\/opt\/gh-aw|\$\{RUNNER_TEMP\}\/gh-aw)\/actions\/install_awf_binary\.sh v[0-9.]+\n/m;
-const installStepRegexGlobal = new RegExp(installStepRegex.source, 'gm');
+// Release-mode workflows that intentionally test published binaries can be
+// excluded here if we add any in the future.
+const releaseModeLockFiles = new Set<string>();
 
-function buildLocalInstallSteps(indent: string): string {
-  const stepIndent = indent;
-  const runIndent = `${indent}  `;
-  const scriptIndent = `${runIndent}  `;
-
-  return [
-    `${stepIndent}- name: Install awf dependencies`,
-    `${runIndent}run: npm ci`,
-    `${stepIndent}- name: Build awf`,
-    `${runIndent}run: npm run build`,
-    `${stepIndent}- name: Install awf binary (local)`,
-    `${runIndent}run: |`,
-    `${scriptIndent}WORKSPACE_PATH="${'${GITHUB_WORKSPACE:-$(pwd)}'}"`,
-    `${scriptIndent}NODE_BIN="$(command -v node)"`,
-    `${scriptIndent}if [ ! -d "$WORKSPACE_PATH" ]; then`,
-    `${scriptIndent}  echo "Workspace path not found: $WORKSPACE_PATH"`,
-    `${scriptIndent}  exit 1`,
-    `${scriptIndent}fi`,
-    `${scriptIndent}if [ ! -x "$NODE_BIN" ]; then`,
-    `${scriptIndent}  echo "Node binary not found: $NODE_BIN"`,
-    `${scriptIndent}  exit 1`,
-    `${scriptIndent}fi`,
-    `${scriptIndent}if [ ! -d "/usr/local/bin" ]; then`,
-    `${scriptIndent}  echo "/usr/local/bin is missing"`,
-    `${scriptIndent}  exit 1`,
-    `${scriptIndent}fi`,
-    `${scriptIndent}sudo tee /usr/local/bin/awf > /dev/null <<EOF`,
-    `${scriptIndent}#!/bin/bash`,
-    `${scriptIndent}exec "${'${NODE_BIN}'}" "${'${WORKSPACE_PATH}'}/dist/cli.js" "\\$@"`,
-    `${scriptIndent}EOF`,
-    `${scriptIndent}sudo chmod +x /usr/local/bin/awf`,
-  ].join('\n') + '\n';
-}
-
-// Remove sparse-checkout from the agent job's checkout step so the full repo
-// is available for npm ci / npm run build. The compiler generates sparse-checkout
-// for .github and .agents only, but we need src/, package.json, tsconfig.json etc.
-// Match the sparse-checkout block (key + indented content lines) and the depth line.
-const sparseCheckoutRegex = /^(\s+)sparse-checkout: \|\n(?:\1  .+\n)+/gm;
-const shallowDepthRegex = /^(\s+)depth: 1\n/gm;
-
-// Replace --image-tag <version> --skip-pull with --build-local so smoke tests
-// use locally-built container images (with the latest entrypoint.sh, setup-iptables.sh, etc.)
-// instead of pre-built GHCR images that may be stale.
-const imageTagRegex = /--image-tag\s+[0-9.]+\s+--skip-pull/g;
-
-// Remove the "Setup Scripts" step from update_cache_memory jobs.
-// This step downloads the private github/gh-aw action but is never used in
-// update_cache_memory (no subsequent steps reference /opt/gh-aw/actions/).
-// With permissions: {} on these jobs, downloading the private action fails
-// with 401 Unauthorized.
-const updateCacheSetupScriptRegex =
-  /^(\s+)- name: Setup Scripts\n\1  uses: github\/gh-aw\/actions\/setup@v[\d.]+\n\1  with:\n\1    destination: \/opt\/gh-aw\/actions\n(\1- name: Download cache-memory artifact)/gm;
+// Auto-discover all lock files so new workflows are automatically included.
+// This avoids the recurring bug where adding a new workflow .md file and
+// compiling it produces a lock file with --image-tag/--skip-pull that isn't
+// post-processed, causing CI failures ("No such image").
+const workflowsDir = path.join(repoRoot, '.github/workflows');
+const workflowPaths = fs.readdirSync(workflowsDir)
+  .filter(f => f.endsWith('.lock.yml'))
+  .filter(f => !releaseModeLockFiles.has(f))
+  .sort()
+  .map(f => path.join(workflowsDir, f));
 
 for (const workflowPath of workflowPaths) {
-  let content = fs.readFileSync(workflowPath, 'utf-8');
-  let modified = false;
-
-  // Replace "Install awf binary" step with local build steps
-  const matches = content.match(installStepRegexGlobal);
-  if (matches) {
-    content = content.replace(
-      installStepRegexGlobal,
-      (_match, indent: string) => buildLocalInstallSteps(indent)
-    );
-    modified = true;
-    console.log(`  Replaced ${matches.length} awf install step(s) with local build`);
-  }
-
-  // Ensure a "Checkout repository" step exists before "Install awf dependencies"
-  // in every job. The gh-aw compiler may add jobs (e.g. detection) that reference
-  // install_awf_binary.sh but don't include a checkout step. After we replace the
-  // install step with local build steps (npm ci / npm run build), they need the
-  // repo checked out. We inject a checkout step right before "Install awf dependencies"
-  // if one doesn't already appear earlier in the same job.
-  const lines = content.split('\n');
-  let injectedCheckouts = 0;
-  for (let i = 0; i < lines.length; i++) {
-    const installMatch = lines[i].match(/^(\s+)- name: Install awf dependencies$/);
-    if (!installMatch) continue;
-
-    // Walk backwards to find the job boundary (non-indented key ending with ':')
-    // and check whether a "Checkout repository" step exists in between.
-    let hasCheckout = false;
-    for (let j = i - 1; j >= 0; j--) {
-      if (/^\s+- name: Checkout repository/.test(lines[j])) {
-        hasCheckout = true;
-        break;
-      }
-      // Job-level key (e.g. "  agent:" or "  detection:") marks the boundary
-      if (/^  \S+:/.test(lines[j]) && !lines[j].startsWith('    ')) {
-        break;
-      }
-    }
-
-    if (!hasCheckout) {
-      const indent = installMatch[1];
-      const checkoutStep = [
-        `${indent}- name: Checkout repository`,
-        `${indent}  uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2`,
-        `${indent}  with:`,
-        `${indent}    persist-credentials: false`,
-      ].join('\n');
-      lines.splice(i, 0, checkoutStep);
-      injectedCheckouts++;
-      i += 4; // Skip past the inserted lines
-    }
-  }
-  if (injectedCheckouts > 0) {
-    content = lines.join('\n');
-    modified = true;
-    console.log(`  Injected ${injectedCheckouts} checkout step(s) before awf build steps`);
-  }
-
-  // Remove sparse-checkout from agent job checkout (need full repo for npm build)
-  const sparseMatches = content.match(sparseCheckoutRegex);
-  if (sparseMatches) {
-    content = content.replace(sparseCheckoutRegex, '');
-    modified = true;
-    console.log(`  Removed ${sparseMatches.length} sparse-checkout block(s)`);
-  }
-
-  // Remove shallow depth (depth: 1) since full checkout is needed
-  const depthMatches = content.match(shallowDepthRegex);
-  if (depthMatches) {
-    content = content.replace(shallowDepthRegex, '');
-    modified = true;
-    console.log(`  Removed ${depthMatches.length} shallow depth setting(s)`);
-  }
-
-  // Replace GHCR image tags with local builds
-  const imageTagMatches = content.match(imageTagRegex);
-  if (imageTagMatches) {
-    content = content.replace(imageTagRegex, '--build-local');
-    modified = true;
-    console.log(`  Replaced ${imageTagMatches.length} --image-tag/--skip-pull with --build-local`);
-  }
-
-  // Remove unused "Setup Scripts" step from update_cache_memory jobs.
-  // The step downloads a private action but is never used in these jobs,
-  // causing 401 Unauthorized failures when permissions: {} is set.
-  const updateCacheSetupMatches = content.match(updateCacheSetupScriptRegex);
-  if (updateCacheSetupMatches) {
-    content = content.replace(updateCacheSetupScriptRegex, '$2');
-    modified = true;
-    console.log(
-      `  Removed ${updateCacheSetupMatches.length} unused Setup Scripts step(s) from update_cache_memory`
-    );
-  }
-
-  if (modified) {
+  const original = fs.readFileSync(workflowPath, 'utf-8');
+  const { content, log } = applyGeneralWorkflowPatches(original, workflowPath);
+  log.forEach(msg => console.log(msg));
+  if (content !== original) {
     fs.writeFileSync(workflowPath, content);
     console.log(`Updated ${workflowPath}`);
   } else {
     console.log(`Skipping ${workflowPath}: no changes needed.`);
   }
+}
+
+for (const workflowPath of codexWorkflowPaths) {
+  let original: string;
+  try {
+    original = fs.readFileSync(workflowPath, 'utf-8');
+  } catch {
+    console.log(`Skipping ${workflowPath}: file not found.`);
+    continue;
+  }
+  const { content, log } = applyCodexWorkflowPatches(original);
+  log.forEach(msg => console.log(msg));
+  if (content !== original) {
+    fs.writeFileSync(workflowPath, content);
+    console.log(`Updated ${workflowPath}`);
+  } else {
+    console.log(`Skipping ${workflowPath}: no xpia.md changes needed.`);
+  }
+}
+
+// ── Runtime workflow patching: inject --container-runtime into AWF commands ───
+// The compiler doesn't support sandbox.agent.containerRuntime yet, so we inject it here.
+const runtimeCmdPattern = /awf --config /g;
+
+const gvisorLockPath = path.join(workflowsDir, 'smoke-gvisor.lock.yml');
+try {
+  const gvisorContent = fs.readFileSync(gvisorLockPath, 'utf-8');
+  const replacedContent = gvisorContent.replace(runtimeCmdPattern, 'awf --container-runtime gvisor --config ');
+  if (replacedContent !== gvisorContent) {
+    fs.writeFileSync(gvisorLockPath, replacedContent);
+    console.log(`  Injected --container-runtime gvisor into AWF command`);
+    console.log(`Updated ${gvisorLockPath}`);
+  } else {
+    console.log(`Skipping ${gvisorLockPath}: no AWF command found to patch.`);
+  }
+} catch {
+  console.log(`Skipping ${gvisorLockPath}: file not found.`);
+}
+
+// sbx CLI install + daemon auth steps that gh-aw v0.82.8 dropped from compilation.
+// Injected after "Install awf binary (local)", before "Determine automatic lockdown mode".
+const SBX_INSTALL_AND_AUTH_STEPS =
+  '      - name: Install Docker sbx CLI\n' +
+  '        run: |\n' +
+  '          set -euo pipefail\n' +
+  '          echo "::group::Install Docker sbx"\n' +
+  '          # Add Docker apt repo (REPO_ONLY=1 skips installing Docker Engine)\n' +
+  '          curl -fsSL https://get.docker.com | sudo REPO_ONLY=1 sh\n' +
+  '          sudo apt-get install -y docker-sbx\n' +
+  '          sbx version\n' +
+  '          echo "::endgroup::"\n' +
+  '\n' +
+  '          echo "::group::Verify KVM availability"\n' +
+  '          if lsmod | grep -q kvm; then\n' +
+  '            echo "✅ KVM is available"\n' +
+  '            # Ensure runner user can access /dev/kvm (may not be in kvm group)\n' +
+  '            if [ -w /dev/kvm ]; then\n' +
+  '              echo "✅ /dev/kvm is writable"\n' +
+  '            else\n' +
+  '              echo "Fixing /dev/kvm permissions..."\n' +
+  '              sudo chmod 666 /dev/kvm\n' +
+  '            fi\n' +
+  '          else\n' +
+  '            echo "⚠️ KVM not available — sbx will not start"\n' +
+  '            kvm-ok 2>&1 || true\n' +
+  '          fi\n' +
+  '          echo "::endgroup::"\n' +
+  '      - name: Authenticate Docker sbx\n' +
+  '        env:\n' +
+  '          DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}\n' +
+  '          DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}\n' +
+  '        run: |\n' +
+  '          set -euo pipefail\n' +
+  '\n' +
+  '          # Start daemon in background\n' +
+  '          nohup sbx daemon start > /tmp/sbx-daemon.log 2>&1 &\n' +
+  '          disown\n' +
+  '          for i in $(seq 1 10); do\n' +
+  '            if sbx daemon status 2>/dev/null | grep -q "running"; then break; fi\n' +
+  '            sleep 1\n' +
+  '          done\n' +
+  '\n' +
+  '          # Authenticate with Docker Hub\n' +
+  '          printf \'%s\' "$DOCKER_PAT_VAL" | docker login --username "$DOCKER_USERNAME_VAL" --password-stdin\n' +
+  '          printf \'%s\' "$DOCKER_PAT_VAL" | sbx login --username "$DOCKER_USERNAME_VAL" --password-stdin\n' +
+  '\n' +
+  '          # Reset policy store and re-initialize (required for mount policy)\n' +
+  '          sbx daemon stop || true\n' +
+  '          sbx policy reset --force || true\n' +
+  '          sbx policy init allow-all\n' +
+  '          nohup sbx daemon start > /tmp/sbx-daemon.log 2>&1 &\n' +
+  '          disown\n' +
+  '          for i in $(seq 1 10); do\n' +
+  '            if sbx daemon status 2>/dev/null | grep -q "running"; then break; fi\n' +
+  '            sleep 1\n' +
+  '          done\n' +
+  '          # Re-authenticate after daemon restart\n' +
+  '          printf \'%s\' "$DOCKER_PAT_VAL" | sbx login --username "$DOCKER_USERNAME_VAL" --password-stdin\n' +
+  '\n' +
+  '          # Pre-pull template image into sbx\'s containerd cache\n' +
+  '          docker pull docker/sandbox-templates:shell-docker\n' +
+  '\n' +
+  '          # Smoke test: create → exec → cleanup\n' +
+  '          bash -c \'yes | sbx create shell --name test-sandbox-direct "$GITHUB_WORKSPACE" 2>&1\' || true\n' +
+  '          sbx exec test-sandbox-direct uname -a\n' +
+  '          sbx stop test-sandbox-direct 2>/dev/null || true\n' +
+  '          sbx rm --force test-sandbox-direct 2>/dev/null || true\n' +
+  '          echo "✅ sbx ready"\n';
+
+// sbx credential refresh step injected immediately before the agent execution step.
+const SBX_REFRESH_CREDENTIALS_STEP =
+  '      - name: Refresh sbx credentials\n' +
+  '        env:\n' +
+  '          DOCKER_PAT_VAL: ${{ secrets.DOCKER_PAT }}\n' +
+  '          DOCKER_USERNAME_VAL: ${{ secrets.DOCKER_USERNAME }}\n' +
+  '        run: |\n' +
+  '          # Re-authenticate sbx immediately before AWF runs.\n' +
+  '          # Docker Hub OAuth tokens from sbx login can expire between steps.\n' +
+  '          printf \'%s\' "$DOCKER_PAT_VAL" | sbx login --username "$DOCKER_USERNAME_VAL" --password-stdin\n' +
+  '          echo "✅ sbx credentials refreshed"\n';
+
+const SBX_LOCKDOWN_ANCHOR = '      - name: Determine automatic lockdown mode for GitHub MCP Server';
+const SBX_EXECUTE_ANCHOR = '      - name: Execute GitHub Copilot CLI';
+
+const sbxLockPath = path.join(workflowsDir, 'smoke-docker-sbx.lock.yml');
+try {
+  const sbxOriginal = fs.readFileSync(sbxLockPath, 'utf-8');
+  let sbxContent = sbxOriginal;
+
+  // (1) Inject --container-runtime sbx into AWF command
+  runtimeCmdPattern.lastIndex = 0;
+  const sbxWithRuntime = sbxContent.replace(runtimeCmdPattern, 'awf --container-runtime sbx --config ');
+  if (sbxWithRuntime !== sbxContent) {
+    sbxContent = sbxWithRuntime;
+    console.log(`  Injected --container-runtime sbx into AWF command`);
+  }
+
+  // (2) Inject sbx CLI install + daemon auth steps (dropped by gh-aw v0.82.8 compiler)
+  if (!sbxContent.includes('- name: Install Docker sbx CLI')) {
+    if (sbxContent.includes(SBX_LOCKDOWN_ANCHOR)) {
+      sbxContent = sbxContent.replace(SBX_LOCKDOWN_ANCHOR, SBX_INSTALL_AND_AUTH_STEPS + SBX_LOCKDOWN_ANCHOR);
+      console.log(`  Injected sbx CLI install and daemon auth steps`);
+    } else {
+      console.log(`  WARNING: Could not find lockdown anchor; sbx install/auth steps not injected`);
+    }
+  } else {
+    console.log(`  sbx CLI install and auth steps already present`);
+  }
+
+  // (3) Inject sbx credential refresh step immediately before agent execution
+  if (!sbxContent.includes('- name: Refresh sbx credentials')) {
+    if (sbxContent.includes(SBX_EXECUTE_ANCHOR)) {
+      sbxContent = sbxContent.replace(SBX_EXECUTE_ANCHOR, SBX_REFRESH_CREDENTIALS_STEP + SBX_EXECUTE_ANCHOR);
+      console.log(`  Injected sbx credential refresh step`);
+    } else {
+      console.log(`  WARNING: Could not find execute anchor; sbx credential refresh step not injected`);
+    }
+  } else {
+    console.log(`  sbx credential refresh step already present`);
+  }
+
+  if (sbxContent !== sbxOriginal) {
+    fs.writeFileSync(sbxLockPath, sbxContent);
+    console.log(`Updated ${sbxLockPath}`);
+  } else {
+    console.log(`Skipping ${sbxLockPath}: no changes needed.`);
+  }
+} catch {
+  console.log(`Skipping ${sbxLockPath}: file not found.`);
 }

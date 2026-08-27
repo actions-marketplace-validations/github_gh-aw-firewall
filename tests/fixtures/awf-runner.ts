@@ -13,6 +13,7 @@ export interface AwfOptions {
   imageTag?: string;
   timeout?: number; // milliseconds
   env?: Record<string, string>;
+  configFile?: string;
   volumeMounts?: string[]; // Volume mounts in format: host_path:container_path[:mode]
   containerWorkDir?: string; // Working directory inside the container
   tty?: boolean; // Allocate pseudo-TTY (required for interactive tools like Claude Code)
@@ -20,6 +21,8 @@ export interface AwfOptions {
   allowHostPorts?: string; // Ports or port ranges to allow for host access (e.g., '3000' or '3000-8000')
   allowHostServicePorts?: string; // Ports to allow ONLY to host gateway (bypasses dangerous port restrictions)
   enableApiProxy?: boolean; // Enable API proxy sidecar for LLM credential management
+  difcProxyHost?: string; // Connect to external DIFC proxy at host:port (enables CLI proxy)
+  difcProxyCaCert?: string; // Path to TLS CA cert written by the external DIFC proxy
   rateLimitRpm?: number; // Requests per minute per provider
   rateLimitRph?: number; // Requests per hour per provider
   rateLimitBytesPm?: number; // Request bytes per minute per provider
@@ -57,6 +60,10 @@ export class AwfRunner {
    */
   async run(command: string, options: AwfOptions = {}): Promise<AwfResult> {
     const args: string[] = [];
+
+    if (options.configFile) {
+      args.push('--config', options.configFile);
+    }
 
     // Add allow-domains
     if (options.allowDomains && options.allowDomains.length > 0) {
@@ -128,6 +135,14 @@ export class AwfRunner {
     // Add enable-api-proxy flag
     if (options.enableApiProxy) {
       args.push('--enable-api-proxy');
+    }
+
+    // Add DIFC proxy flags (replaces --enable-cli-proxy)
+    if (options.difcProxyHost) {
+      args.push('--difc-proxy-host', options.difcProxyHost);
+    }
+    if (options.difcProxyCaCert) {
+      args.push('--difc-proxy-ca-cert', options.difcProxyCaCert);
     }
 
     // Add API target flags
@@ -231,7 +246,10 @@ export class AwfRunner {
   }
 
   /**
-   * Run awf with sudo (required for iptables manipulation)
+   * Run awf with sudo in compat mode (legacy iptables-based enforcement).
+   *
+   * Prefer `run()` for new tests — it uses the default strict security mode
+   * (network-isolation, no sudo required).
    *
    * @param command - Command to execute:
    *   - String: Complete shell command (may contain $vars, pipes, redirects)
@@ -270,6 +288,13 @@ export class AwfRunner {
 
     // Add awf path
     args.push('node', this.awfPath);
+
+    if (options.configFile) {
+      args.push('--config', options.configFile);
+    }
+
+    // runWithSudo uses the legacy iptables path
+    args.push('--legacy-security');
 
     // Add allow-domains
     if (options.allowDomains && options.allowDomains.length > 0) {
@@ -341,6 +366,14 @@ export class AwfRunner {
     // Add enable-api-proxy flag
     if (options.enableApiProxy) {
       args.push('--enable-api-proxy');
+    }
+
+    // Add DIFC proxy flags (replaces --enable-cli-proxy)
+    if (options.difcProxyHost) {
+      args.push('--difc-proxy-host', options.difcProxyHost);
+    }
+    if (options.difcProxyCaCert) {
+      args.push('--difc-proxy-ca-cert', options.difcProxyCaCert);
     }
 
     // Add API target flags

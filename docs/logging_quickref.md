@@ -63,6 +63,21 @@ awf logs summary >> $GITHUB_STEP_SUMMARY
 awf logs summary --format json
 ```
 
+### Audit Policy Rule Matching
+
+```bash
+# Show which policy rule caused each allow/deny decision
+awf logs audit
+
+# Filter to denied requests only
+awf logs audit --decision denied
+
+# Filter by domain
+awf logs audit --domain github.com
+```
+
+> Requires `policy-manifest.json` — run awf with `--audit-dir <path>` to generate audit artifacts.
+
 **CLI Options:**
 | Flag | Description |
 |------|-------------|
@@ -77,6 +92,7 @@ awf logs summary --format json
 |---------|-------------|
 | `awf logs stats` | Show aggregated statistics (total requests, allowed/denied counts, per-domain breakdown) |
 | `awf logs summary` | Generate markdown summary (optimized for GitHub Actions) |
+| `awf logs audit` | Enrich logs with policy rule matching (requires `policy-manifest.json` from `--audit-dir`) |
 
 ## Manual Docker Commands
 
@@ -360,3 +376,55 @@ docker exec awf-squid awk 'NF != 10' /var/log/squid/access.log
 - [Squid Log Filtering](squid_log_filtering.md) - Filtering Squid access logs
 - [Troubleshooting](troubleshooting.md) - Common issues and fixes
 - [README.md](../README.md) - Main project documentation
+
+## Log Directory Layout
+
+### Default (no `--proxy-logs-dir`)
+
+All logs are written under the temporary work directory (`/tmp/awf-<timestamp>/`):
+
+```
+/tmp/awf-<timestamp>/
+├── squid-logs/          # Squid access.log (owned by UID 13:13)
+├── agent-logs/          # Copilot CLI logs (owned by host UID:GID)
+├── agent-session-state/ # Session events.jsonl (owned by host UID:GID)
+├── api-proxy-logs/      # API proxy sidecar logs (mode 0777)
+└── cli-proxy-logs/      # CLI proxy logs (mode 0777)
+```
+
+After cleanup, non-empty dirs are preserved to `/tmp/squid-logs-<ts>`, `/tmp/awf-agent-logs-<ts>`, etc.
+
+### With `--proxy-logs-dir <path>`
+
+When `--proxy-logs-dir` is specified (e.g., in GitHub Actions for artifact upload):
+
+```
+<proxy-logs-dir>/
+├── access.log           # Squid writes DIRECTLY here (no subdirectory)
+├── api-proxy-logs/      # API proxy logs in subdirectory
+└── cli-proxy-logs/      # CLI proxy logs in subdirectory
+```
+
+**Note:** Squid logs write directly to `<proxy-logs-dir>` (not a `squid-logs/` subdirectory) for historical compatibility with GitHub Actions workflows that glob `<proxy-logs-dir>/access.log`. The api-proxy and cli-proxy logs use subdirectories to avoid filename collisions.
+
+### MCP Gateway Logs
+
+MCP gateway logs are written to a fixed host path:
+
+```
+/tmp/gh-aw/mcp-logs/     # Host-visible, not inside workDir
+```
+
+This directory is pruned of subdirectories older than 24 hours on each AWF invocation.
+
+### Ownership & Permissions (ARC/DinD)
+
+On ARC/DinD runners with split filesystems, the Docker daemon may auto-create
+bind-mount source directories as `root:root`, overriding host-side ownership.
+AWF uses a triple-layer defense to ensure correct permissions:
+
+1. **Host-side prep** (`workdir-setup.ts`): best-effort `chown` to service UID during workdir setup (runs even if the directory already exists)
+2. **Container preflight** (`squid-service.ts`): `chown`/`chmod` inside the container before the service starts
+3. **Pre-shutdown repair** (`container-stop.ts`): `chmod -R a+rX` while container is still running
+
+Each layer compensates for the others' failure modes across different topologies.

@@ -3,9 +3,12 @@ description: Build Test Suite
 on:
   roles: all
   workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened]
+  label_command:
+    name: ready-for-aw
+    events: [pull_request]
+    remove_label: false
 permissions:
+  copilot-requests: write
   contents: read
   pull-requests: read
   issues: read
@@ -41,10 +44,9 @@ tools:
     - "*"
   github:
     github-token: "${{ secrets.GH_AW_GITHUB_MCP_SERVER_TOKEN }}"
-sandbox:
-  mcp:
-    container: "ghcr.io/github/gh-aw-mcpg"
 safe-outputs:
+  threat-detection:
+    enabled: false
   add-comment:
     hide-older-comments: true
   add-labels:
@@ -52,6 +54,9 @@ safe-outputs:
   messages:
     run-failure: "**Build Test Failed** [{workflow_name}]({run_url}) - See logs for details"
 timeout-minutes: 45
+sandbox:
+  agent:
+    id: awf
 strict: true
 ---
 
@@ -72,7 +77,7 @@ You must run ALL of the following build test tasks sequentially. After completin
    export PATH="$BUN_INSTALL/bin:$PATH"
    ```
 
-2. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-bun /tmp/test-bun`
+2. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-bun.git /tmp/test-bun`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for Bun and continue to next task.
 
 3. **Test Projects**:
@@ -85,7 +90,7 @@ You must run ALL of the following build test tasks sequentially. After completin
 
 ## Task 2: C++
 
-1. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-cpp /tmp/test-cpp`
+1. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-cpp.git /tmp/test-cpp`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for C++ and continue to next task.
 
 2. **Test Projects**:
@@ -117,7 +122,7 @@ You must run ALL of the following build test tasks sequentially. After completin
    export PATH="$DENO_INSTALL/bin:$PATH"
    ```
 
-2. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-deno /tmp/test-deno`
+2. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-deno.git /tmp/test-deno`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for Deno and continue to next task.
 
 3. **Test Projects**:
@@ -130,7 +135,7 @@ You must run ALL of the following build test tasks sequentially. After completin
 
 ## Task 4: .NET
 
-1. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-dotnet /tmp/test-dotnet`
+1. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-dotnet.git /tmp/test-dotnet`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for .NET and continue to next task.
 
 2. **Test Projects**:
@@ -143,7 +148,7 @@ You must run ALL of the following build test tasks sequentially. After completin
 
 ## Task 5: Go
 
-1. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-go /tmp/test-go`
+1. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-go.git /tmp/test-go`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for Go and continue to next task.
 
 2. **Test Projects**:
@@ -157,7 +162,7 @@ You must run ALL of the following build test tasks sequentially. After completin
 
 ## Task 6: Java
 
-1. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-java /tmp/test-java`
+1. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-java.git /tmp/test-java`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for Java and continue to next task.
 
 2. **Configure Maven Proxy**: Maven ignores Java system properties for proxy configuration, so you must create `~/.m2/settings.xml` before running any Maven commands. **IMPORTANT**: Use the literal values `squid-proxy` and `3128` directly in the XML - do NOT use shell variables or environment variable syntax:
@@ -189,7 +194,7 @@ You must run ALL of the following build test tasks sequentially. After completin
 
 ## Task 7: Node.js
 
-1. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-node /tmp/test-node`
+1. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-node.git /tmp/test-node`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for Node.js and continue to next task.
 
 2. **Test Projects**:
@@ -203,7 +208,7 @@ You must run ALL of the following build test tasks sequentially. After completin
 
 ## Task 8: Rust
 
-1. **Clone Repository**: `gh repo clone Mossaka/gh-aw-firewall-test-rust /tmp/test-rust`
+1. **Clone Repository**: `git clone https://github.com/Mossaka/gh-aw-firewall-test-rust.git /tmp/test-rust`
    - **CRITICAL**: If clone fails, record CLONE_FAILED for Rust and continue to next task.
 
 2. **Test Projects**:
@@ -243,7 +248,7 @@ After completing ALL tasks, add a **single comment** to the current pull request
 
 **Overall: X/8 ecosystems passed — PASS/FAIL**
 
-If ALL tests across all ecosystems pass, add the label `build-test` to the pull request.
+If ALL tests across all ecosystems pass **and** this run was triggered by a pull request (not `workflow_dispatch`), add the label `build-test` to the pull request.
 If ANY test fails, report the failure with error details below the table.
 
 ## Error Handling

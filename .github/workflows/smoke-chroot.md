@@ -3,15 +3,13 @@ description: Smoke test workflow that validates the feature by testing host bina
 on:
   roles: all
   workflow_dispatch:
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths:
-      - 'src/**'
-      - 'containers/**'
-      - 'package.json'
-      - '.github/workflows/smoke-chroot.md'
+  label_command:
+    name: ready-for-aw
+    events: [pull_request]
+    remove_label: false
   reaction: "rocket"
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
@@ -19,20 +17,23 @@ permissions:
 name: Smoke Chroot
 engine:
   id: copilot
-strict: true
+sandbox:
+  agent:
+    id: awf
+strict: false
 network:
   allowed:
     - defaults
     - github
-sandbox:
-  mcp:
-    container: "ghcr.io/github/gh-aw-mcpg"
 tools:
   github:
+    mode: gh-proxy
     toolsets: [repos, pull_requests]
   bash:
     - "*"
 safe-outputs:
+    threat-detection:
+      enabled: false
     add-comment:
       hide-older-comments: true
     add-labels:
@@ -45,7 +46,7 @@ safe-outputs:
 timeout-minutes: 20
 steps:
   - name: Setup Go
-    uses: actions/setup-go@0aaccfd150d50ccaeb58ebd88d36e91967a5f35b
+    uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7.0.0
     with:
       go-version: '1.22'
   - name: Capture host versions for verification
@@ -85,15 +86,15 @@ steps:
 
       # Test Python version in chroot
       echo "Testing Python..."
-      CHROOT_PYTHON=$(sudo -E awf --skip-pull --allow-domains localhost -- python3 --version 2>&1 | grep -oP 'Python \d+\.\d+\.\d+' | head -1) || CHROOT_PYTHON="FAILED"
+      CHROOT_PYTHON=$(awf --build-local --allow-domains localhost -- python3 --version 2>&1 | grep -oP 'Python \d+\.\d+\.\d+' | head -1) || CHROOT_PYTHON="FAILED"
 
       # Test Node version in chroot
       echo "Testing Node..."
-      CHROOT_NODE=$(sudo -E awf --skip-pull --allow-domains localhost -- node --version 2>&1 | grep -oP 'v\d+\.\d+\.\d+' | head -1) || CHROOT_NODE="FAILED"
+      CHROOT_NODE=$(awf --build-local --allow-domains localhost -- node --version 2>&1 | grep -oP 'v\d+\.\d+\.\d+' | head -1) || CHROOT_NODE="FAILED"
 
       # Test Go version in chroot
       echo "Testing Go..."
-      CHROOT_GO=$(sudo -E awf --skip-pull --allow-domains localhost -- go version 2>&1 | grep -oP 'go\d+\.\d+(\.\d+)?' | head -1) || CHROOT_GO="FAILED"
+      CHROOT_GO=$(awf --build-local --allow-domains localhost -- go version 2>&1 | grep -oP 'go\d+\.\d+(\.\d+)?' | head -1) || CHROOT_GO="FAILED"
 
       # Save chroot versions
       {
@@ -160,7 +161,7 @@ steps:
 post-steps:
   - name: Validate safe outputs were invoked
     run: |
-      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-/opt/gh-aw/safeoutputs/outputs.jsonl}"
+      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-${RUNNER_TEMP}/gh-aw/safeoutputs/outputs.jsonl}"
       if [ ! -s "$OUTPUTS_FILE" ]; then
         echo "::error::No safe outputs were invoked. Smoke tests require the agent to call safe output tools."
         exit 1

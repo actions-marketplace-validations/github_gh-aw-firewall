@@ -5,7 +5,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { logger } from '../logger';
-import type { LogSource, PolicyManifest } from '../types';
+import type { LogSource, LogStatsFormat, PolicyManifest } from '../types';
 import {
   discoverLogSources,
   selectMostRecent,
@@ -14,15 +14,16 @@ import {
 import { loadAndAggregate, loadAllLogs } from '../logs/log-aggregator';
 import type { AggregatedStats } from '../logs/log-aggregator';
 import { enrichWithPolicyRules, computeRuleStats } from '../logs/audit-enricher';
+import { formatStats } from '../logs/stats-formatter';
 
 /**
  * Options for determining which logs to show (based on log level)
  */
-export interface LoggingOptions {
+interface LoggingOptions {
   /** The output format being used */
-  format: string;
+  format: LogStatsFormat;
   /** Callback to determine if info logs should be shown */
-  shouldLog: (format: string) => boolean;
+  shouldLog: (format: LogStatsFormat) => boolean;
 }
 
 /**
@@ -30,12 +31,12 @@ export interface LoggingOptions {
  * Handles validation, error messages, and optional logging.
  *
  * @param sourceOption - User-specified source path or "running", or undefined for auto-discovery
- * @param loggingOptions - Options controlling when to emit log messages
+ * @param loggingOptions - Options controlling when to emit log messages; when omitted, info messages are always emitted
  * @returns Selected log source
  */
 export async function discoverAndSelectSource(
   sourceOption: string | undefined,
-  loggingOptions: LoggingOptions
+  loggingOptions?: LoggingOptions
 ): Promise<LogSource> {
   // Discover log sources
   const sources = await discoverLogSources();
@@ -67,7 +68,8 @@ export async function discoverAndSelectSource(
     source = selected;
 
     // Log which source we're using (conditionally based on format)
-    if (loggingOptions.shouldLog(loggingOptions.format)) {
+    const shouldEmitInfo = !loggingOptions || loggingOptions.shouldLog(loggingOptions.format);
+    if (shouldEmitInfo) {
       if (source.type === 'running') {
         logger.info(`Using live logs from running container: ${source.containerName}`);
       } else {
@@ -123,14 +125,22 @@ export function findPolicyManifestForSource(source: LogSource): PolicyManifest |
  * @param source - Log source to load from
  * @returns Aggregated statistics
  */
-export async function loadLogsWithErrorHandling(
+async function loadLogsWithErrorHandling(
   source: LogSource
 ): Promise<AggregatedStats> {
   try {
-    const stats = await loadAndAggregate(source);
-
-    // Try to enrich with policy rule stats
+    // Read the policy manifest first so topology peers can be passed to the
+    // aggregator. This suppresses spurious denied-domain entries for peers with
+    // dots in their name (e.g. mcp.gateway-01) that the single-label heuristic
+    // cannot detect.
     const manifest = findPolicyManifestForSource(source);
+    const knownTopologyPeers = manifest && Array.isArray(manifest.topologyPeers) && manifest.topologyPeers.length > 0
+      ? new Set(manifest.topologyPeers.map(p => p.toLowerCase()))
+      : undefined;
+
+    const stats = await loadAndAggregate(source, knownTopologyPeers);
+
+    // Enrich with policy rule stats when a manifest is available
     if (manifest) {
       const entries = await loadAllLogs(source);
       const enriched = enrichWithPolicyRules(entries, manifest);
@@ -143,4 +153,30 @@ export async function loadLogsWithErrorHandling(
     logger.error(`Failed to load logs: ${error instanceof Error ? error.message : error}`);
     process.exit(1);
   }
+}
+
+/**
+ * Shared output pipeline for `logs stats` and `logs summary`.
+ *
+ * Discovers the log source, loads and aggregates the logs, formats them, and
+ * prints the result. Each command passes only the `shouldLog` predicate that
+ * controls whether informational source-selection messages are emitted.
+ *
+ * @param options - Command options containing `format` and optional `source`
+ * @param shouldLog - Returns true when info-level log messages should be shown
+ */
+export async function runLogsCommand(
+  options: { format: LogStatsFormat; source?: string },
+  shouldLog: (format: LogStatsFormat) => boolean
+): Promise<void> {
+  const source = await discoverAndSelectSource(options.source, {
+    format: options.format,
+    shouldLog,
+  });
+
+  const stats = await loadLogsWithErrorHandling(source);
+
+  const colorize = !!(process.stdout.isTTY && options.format === 'pretty');
+  const output = formatStats(stats, options.format, colorize);
+  console.log(output);
 }

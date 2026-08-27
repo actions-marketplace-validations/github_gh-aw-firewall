@@ -10,6 +10,9 @@
 
 set -e
 
+# Must match src/constants/placeholders.ts (COPILOT_PLACEHOLDER_TOKEN)
+COPILOT_PLACEHOLDER_TOKEN="ghu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+
 echo "[health-check] API Proxy Pre-flight Check"
 echo "[health-check] =========================================="
 
@@ -33,9 +36,9 @@ if [ -n "$ANTHROPIC_BASE_URL" ]; then
 
   # Verify ANTHROPIC_AUTH_TOKEN is placeholder (if present)
   if [ -n "$ANTHROPIC_AUTH_TOKEN" ]; then
-    if [ "$ANTHROPIC_AUTH_TOKEN" != "placeholder-token-for-credential-isolation" ]; then
+    if [ "$ANTHROPIC_AUTH_TOKEN" != "sk-ant-placeholder-key-for-credential-isolation" ]; then
       echo "[health-check][ERROR] ANTHROPIC_AUTH_TOKEN contains non-placeholder value!"
-      echo "[health-check][ERROR] Token should be 'placeholder-token-for-credential-isolation'"
+      echo "[health-check][ERROR] Token should be 'sk-ant-placeholder-key-for-credential-isolation'"
       exit 1
     fi
     echo "[health-check] ✓ ANTHROPIC_AUTH_TOKEN is placeholder value (correct)"
@@ -63,8 +66,23 @@ if [ -n "$OPENAI_BASE_URL" ]; then
   API_PROXY_CONFIGURED=true
   echo "[health-check] Checking OpenAI API proxy configuration..."
 
-  # Verify credentials are NOT in agent environment
-  if [ -n "$OPENAI_API_KEY" ] || [ -n "$CODEX_API_KEY" ] || [ -n "$OPENAI_KEY" ]; then
+  # Verify credentials are NOT in agent environment (real keys must stay in api-proxy sidecar).
+  # A placeholder value is intentionally injected so clients like Codex v0.121+ (which bypass
+  # OPENAI_BASE_URL when no key is present) still route through the sidecar. The placeholder
+  # is never sent upstream — the api-proxy replaces it with the real key before forwarding.
+  AWF_PLACEHOLDER="sk-placeholder-for-api-proxy"
+  REAL_KEY_PRESENT=false
+  if [ -n "$OPENAI_API_KEY" ] && [ "$OPENAI_API_KEY" != "$AWF_PLACEHOLDER" ]; then
+    REAL_KEY_PRESENT=true
+  fi
+  if [ -n "$CODEX_API_KEY" ] && [ "$CODEX_API_KEY" != "$AWF_PLACEHOLDER" ]; then
+    REAL_KEY_PRESENT=true
+  fi
+  if [ -n "$OPENAI_KEY" ] && [ "$OPENAI_KEY" != "$AWF_PLACEHOLDER" ]; then
+    REAL_KEY_PRESENT=true
+  fi
+
+  if [ "$REAL_KEY_PRESENT" = "true" ]; then
     echo "[health-check][ERROR] OpenAI/Codex API key found in agent environment!"
     echo "[health-check][ERROR] Credential isolation failed - keys should only be in api-proxy container"
     echo "[health-check][ERROR] OPENAI_API_KEY=${OPENAI_API_KEY:+<present>}"
@@ -72,7 +90,12 @@ if [ -n "$OPENAI_BASE_URL" ]; then
     echo "[health-check][ERROR] OPENAI_KEY=${OPENAI_KEY:+<present>}"
     exit 1
   fi
-  echo "[health-check] ✓ OpenAI/Codex credentials NOT in agent environment (correct)"
+
+  if [ -n "$OPENAI_API_KEY" ] || [ -n "$CODEX_API_KEY" ]; then
+    echo "[health-check] ✓ OpenAI/Codex placeholder key in agent environment (credential isolation active)"
+  else
+    echo "[health-check] ✓ OpenAI/Codex credentials NOT in agent environment (correct)"
+  fi
 
   # Perform health check using BASE_URL
   echo "[health-check] Testing connectivity to OpenAI API proxy at $OPENAI_BASE_URL..."
@@ -99,9 +122,9 @@ if [ -n "$COPILOT_API_URL" ]; then
 
   # Verify COPILOT_GITHUB_TOKEN is placeholder (protected by one-shot-token)
   if [ -n "$COPILOT_GITHUB_TOKEN" ]; then
-    if [ "$COPILOT_GITHUB_TOKEN" != "placeholder-token-for-credential-isolation" ]; then
+    if [ "$COPILOT_GITHUB_TOKEN" != "$COPILOT_PLACEHOLDER_TOKEN" ]; then
       echo "[health-check][ERROR] COPILOT_GITHUB_TOKEN contains non-placeholder value!"
-      echo "[health-check][ERROR] Token should be 'placeholder-token-for-credential-isolation'"
+      echo "[health-check][ERROR] Token should be '$COPILOT_PLACEHOLDER_TOKEN'"
       exit 1
     fi
     echo "[health-check] ✓ COPILOT_GITHUB_TOKEN is placeholder value (correct)"
@@ -109,12 +132,35 @@ if [ -n "$COPILOT_API_URL" ]; then
 
   # Verify COPILOT_TOKEN is placeholder (if present)
   if [ -n "$COPILOT_TOKEN" ]; then
-    if [ "$COPILOT_TOKEN" != "placeholder-token-for-credential-isolation" ]; then
+    if [ "$COPILOT_TOKEN" != "$COPILOT_PLACEHOLDER_TOKEN" ]; then
       echo "[health-check][ERROR] COPILOT_TOKEN contains non-placeholder value!"
-      echo "[health-check][ERROR] Token should be 'placeholder-token-for-credential-isolation'"
+      echo "[health-check][ERROR] Token should be '$COPILOT_PLACEHOLDER_TOKEN'"
       exit 1
     fi
     echo "[health-check] ✓ COPILOT_TOKEN is placeholder value (correct)"
+  fi
+
+  # Verify COPILOT_PROVIDER_API_KEY (offline+BYOK) is placeholder when api-proxy is enabled (if present)
+  if [ -n "$COPILOT_PROVIDER_API_KEY" ]; then
+    if [ "$COPILOT_PROVIDER_API_KEY" != "$COPILOT_PLACEHOLDER_TOKEN" ]; then
+      echo "[health-check][ERROR] COPILOT_PROVIDER_API_KEY contains non-placeholder value!"
+      echo "[health-check][ERROR] Token should be '$COPILOT_PLACEHOLDER_TOKEN'"
+      exit 1
+    fi
+    echo "[health-check] ✓ COPILOT_PROVIDER_API_KEY is placeholder value (correct)"
+  fi
+
+  # Verify COPILOT_PROVIDER_BASE_URL matches the sidecar URL when set (offline+BYOK mode)
+  if [ -n "$COPILOT_PROVIDER_BASE_URL" ]; then
+    echo "[health-check] COPILOT_PROVIDER_BASE_URL=$COPILOT_PROVIDER_BASE_URL (offline+BYOK mode)"
+    if [ "$COPILOT_PROVIDER_BASE_URL" != "$COPILOT_API_URL" ]; then
+      echo "[health-check][ERROR] COPILOT_PROVIDER_BASE_URL does not match COPILOT_API_URL"
+      echo "[health-check][ERROR] COPILOT_PROVIDER_BASE_URL=$COPILOT_PROVIDER_BASE_URL"
+      echo "[health-check][ERROR] COPILOT_API_URL=$COPILOT_API_URL"
+      exit 1
+    fi
+    echo "[health-check] ✓ COPILOT_PROVIDER_BASE_URL matches COPILOT_API_URL"
+    echo "[health-check] ✓ Copilot CLI offline+BYOK mode configured"
   fi
 
   # Perform health check using API URL

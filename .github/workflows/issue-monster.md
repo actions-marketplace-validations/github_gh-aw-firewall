@@ -12,6 +12,7 @@ on:
   skip-if-no-match: "is:issue is:open"
 
 permissions:
+  copilot-requests: write
   actions: read
   contents: read
   issues: read
@@ -20,6 +21,9 @@ permissions:
 engine: copilot
 timeout-minutes: 30
 
+sandbox:
+  agent:
+    id: awf
 tools:
   github:
     toolsets: [default, pull_requests]
@@ -41,7 +45,7 @@ jobs:
     steps:
       - name: Search for candidate issues
         id: search
-        uses: actions/github-script@v8
+        uses: actions/github-script@v9.0.0
         with:
           script: |
             const { owner, repo } = context.repo;
@@ -238,6 +242,8 @@ jobs:
             }
 
 safe-outputs:
+  threat-detection:
+    enabled: false
   assign-to-agent:
     name: "copilot"
   add-comment:

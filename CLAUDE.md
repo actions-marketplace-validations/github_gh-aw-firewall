@@ -1,4 +1,4 @@
-# AGENTS.md
+# CLAUDE.md
 
 This file provides guidance to coding agent when working with code in this repository.
 
@@ -6,9 +6,9 @@ This file provides guidance to coding agent when working with code in this repos
 
 `awf` (Agentic Workflow Firewall, package `@github/awf`) is a CLI that wraps any command in a sandboxed Docker network. It provides L7 (HTTP/HTTPS) egress control using Squid proxy, restricting network access to a whitelist of approved domains while giving the agent access to the host workspace and selected system paths via chroot and selective bind mounts.
 
-### Three Container Components
+### Core and Optional Container Components
 
-The system is orchestrated by `src/cli.ts` and managed by `src/docker-manager.ts`. There are three containers, two of which are always required and one optional:
+The system is orchestrated by `src/cli.ts` and managed by `src/docker-manager.ts`. Squid, the primary agent, and the general API proxy are the baseline services; private-repository enclaves add AWF-owned optional services on top:
 
 **1. Squid Proxy (always required)** — `containers/squid/`, IP `172.30.0.10`
 - Enforces domain ACL filtering for all HTTP/HTTPS traffic
@@ -26,7 +26,17 @@ The system is orchestrated by `src/cli.ts` and managed by `src/docker-manager.ts
 - Enabled via `--enable-api-proxy`; not started otherwise
 - Injects real API credentials (OpenAI, Anthropic, Copilot) that the agent never sees
 - Agent calls the sidecar with no auth (e.g., `http://172.30.0.30:10001` for Anthropic); sidecar injects the real key and forwards via Squid
-- Ports: 10000 (OpenAI), 10001 (Anthropic), 10002 (Copilot), 10004 (OpenCode) — these are discrete ports, not a contiguous range
+- Ports: 10000 (OpenAI), 10001 (Anthropic), 10002 (Copilot), 10003 (Gemini) — these are discrete ports, not a contiguous range
+
+**4. Unified Enclaves (optional)** — `containers/enclave/`
+- Enabled by declaring `enclaves` entries in the AWF config file
+- One AWF-owned MCP server (`enclave-mcp-server`) exposes enabled enclave executors only through compiler-launched `gh-aw-mcpg`; the primary agent gets no direct enclave socket, wrapper binary, capability, or private transport
+- `enclave_run_script` launches a no-network, read-only, single-use Python executor and returns one canonical JSON result
+- `enclave_run_agent` launches a single-use Copilot enclave on the dedicated `internal` `awf-enclave-agent` network whose sole peer is the dedicated API proxy; Squid, the primary agent, the general API proxy, safe outputs, and the MCP gateway are excluded
+- Script and agent executors are configured as a top-level `enclaves` array of `script`/`agent` entries whose merged `repos` lists form one trusted repository catalog, sharing one per-run information ledger and one AWF-owned admission lane
+- Rollout depends on the compiler handoff contract in `github/gh-aw#50920` and late backend rediscovery in `github/gh-aw-mcpg#10784`, which requires MCP Gateway spec 1.15.0 and the first mcpg release after v0.4.8 containing it
+- While the gateway backend is still coming up, AWF retries retryable HTTP `503 backend_unavailable` responses within `AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS`
+- See [docs/enclaves-architecture.md](docs/enclaves-architecture.md) and [docs/awf-config-spec.md](docs/awf-config-spec.md) §14
 
 ### Documentation Files
 
@@ -36,6 +46,8 @@ The system is orchestrated by `src/cli.ts` and managed by `src/docker-manager.ts
 - **[docs/logging_quickref.md](docs/logging_quickref.md)** - Quick reference for log queries and monitoring
 - **[docs/releasing.md](docs/releasing.md)** - Release process and versioning instructions
 - **[docs/INTEGRATION-TESTS.md](docs/INTEGRATION-TESTS.md)** - Integration test coverage guide with gap analysis
+- **[docs/enclaves-architecture.md](docs/enclaves-architecture.md)** - Unified enclave architecture, MCP gateway handoff, and coverage notes
+- **[docs/cloud-hypervisor-foundation.md](docs/cloud-hypervisor-foundation.md)** - Cloud Hypervisor v53.0 microVM backend (preview): REST API client, secure launcher (network-namespace join + privilege drop + Landlock/seccomp in place of a jailer), manager/backend, GitHub-hosted Ubuntu x86_64 KVM runners only
 
 ## Development Workflow
 
@@ -76,86 +88,6 @@ Use `scripts/download-latest-artifact.sh` to download logs from GitHub Actions r
 This downloads artifacts to `./artifacts-run-$RUN_ID` for local examination. Requires GitHub CLI (`gh`) authenticated with the repository.
 
 **Example:** The "Pool overlaps" Docker network error was reproduced locally, traced to orphaned networks from `timeout`-killed processes, fixed by adding pre-test cleanup in scripts, then verified before updating workflows.
-
-## Development Commands
-
-### Build and Testing
-```bash
-# Build TypeScript to dist/
-npm run build
-
-# Watch mode (rebuilds on changes)
-npm run dev
-
-# Run tests
-npm test
-
-# Run tests in watch mode
-npm test:watch
-
-# Lint TypeScript files
-npm run lint
-
-# Clean build artifacts
-npm run clean
-```
-
-### Workflow Compilation
-
-**IMPORTANT:** When modifying smoke or build-test workflow `.md` files, you MUST run the post-processing script after compiling. The compiled `.lock.yml` files need post-processing to replace GHCR image references with local builds, remove sparse-checkout, and install awf from source.
-
-```bash
-# 1. Compile the workflow(s)
-gh-aw compile .github/workflows/smoke-claude.md
-
-# 2. Post-process ALL lock files (always run this after any compile)
-npx tsx scripts/ci/postprocess-smoke-workflows.ts
-```
-
-The post-processing script (`scripts/ci/postprocess-smoke-workflows.ts`) applies these transformations to lock files:
-- Replaces the "Install awf binary" step with local `npm ci && npm run build` steps
-- Removes sparse-checkout blocks (full repo needed for npm build)
-- Removes shallow depth settings
-- Replaces `--image-tag <version> --skip-pull` with `--build-local`
-
-### Local Installation
-
-**For regular use:**
-```bash
-# Link locally for testing
-npm link
-
-# Use the CLI
-awf --allow-domains github.com 'curl https://api.github.com'
-```
-
-**For sudo usage (required for iptables manipulation):**
-
-Since `npm link` creates symlinks in the user's npm directory which isn't in root's PATH, you need to create a wrapper script in `/usr/local/bin/`:
-
-```bash
-# Build the project
-npm run build
-
-# Create sudo wrapper script
-# Update the paths below to match your system:
-# - NODE_PATH: Find with `which node` (example shows nvm installation)
-# - PROJECT_PATH: Your cloned repository location
-sudo tee /usr/local/bin/awf > /dev/null <<'EOF'
-#!/bin/bash
-NODE_PATH="$HOME/.nvm/versions/node/v22.13.0/bin/node"
-PROJECT_PATH="$HOME/developer/gh-aw-firewall"
-
-exec "$NODE_PATH" "$PROJECT_PATH/dist/cli.js" "$@"
-EOF
-
-sudo chmod +x /usr/local/bin/awf
-
-# Verify it works
-sudo awf --help
-```
-
-**Note:** After each `npm run build`, the wrapper automatically uses the latest compiled code. Update the paths in the wrapper script to match your node installation and project directory.
 
 ## Container Image Strategy
 
@@ -223,7 +155,8 @@ The codebase follows a modular architecture with clear separation of concerns:
 - Based on `ubuntu:22.04`; can also use GitHub Actions parity image (`act` preset)
 - Selective bind mounts under `/host/`: system binaries `/usr`, `/bin`, `/sbin`, `/lib`, `/lib64`, `/opt`, `/sys`, `/dev` (ro); workspace and `/tmp` (rw); whitelisted `$HOME` subdirs (rw); select `/etc` files — NOT a blanket host FS mount; `/etc/shadow`, unwhitelisted home dirs, and most of `/etc` are excluded
 - `entrypoint.sh` handles: UID/GID remapping → DNS config → SSL CA import → chroot to `/host` → capability drop → run user command as host user
-- **iptables init container** (`awf-iptables-init`): separate container sharing agent's network namespace via `network_mode: service:agent`. Runs `setup-iptables.sh` to configure NAT rules before user command starts. Agent waits for `/tmp/awf-init/ready` signal file.
+- **procfs mount**: A container-scoped procfs is mounted at `/host/proc` with `hidepid=2` to support runtimes that read `/proc/self/exe` (Java, .NET) while preventing the agent from reading other processes' `/proc/[pid]/environ` (credential isolation)
+- **iptables init container** (`awf-iptables-init`): separate container sharing agent's network namespace via `network_mode: service:agent`. Runs `setup-iptables.sh` to configure NAT rules before user command starts. Agent waits for `/run/awf-init/ready` signal file (also accepting the legacy `/tmp/awf-init/ready` so an older pinned agent image still works).
 - Key iptables rules (in `setup-iptables.sh`):
   - Allow localhost (for stdio MCP servers) and DNS
   - Allow traffic to Squid proxy itself
@@ -232,7 +165,7 @@ The codebase follows a modular architecture with clear separation of concerns:
 - `SYS_CHROOT` and `SYS_ADMIN` dropped via `capsh` before user code runs; `NET_ADMIN` never granted to agent (only to the iptables-init init container)
 
 **API Proxy Sidecar** (`containers/api-proxy/`) — *optional, requires `--enable-api-proxy`*
-- Node.js HTTP proxy at `172.30.0.30`; listens on ports 10000, 10001, 10002, 10004
+- Node.js HTTP proxy at `172.30.0.30`; listens on ports 10000, 10001, 10002, 10003
 - Agent sends unauthenticated requests; sidecar injects the real API key before forwarding
 - All upstream traffic goes through Squid (`HTTP_PROXY` env set inside sidecar)
 - Agent container's `depends_on` adds `api-proxy: service_healthy` when enabled
@@ -294,6 +227,28 @@ AWF sets the following proxy-related environment variables in the agent containe
 sudo awf --allow-domains github.com --dns-servers 1.1.1.1,1.0.0.1 -- curl https://api.github.com
 ```
 
+## ARC / DinD Split Filesystem Support
+
+AWF supports ARC (Actions Runner Controller) runners that use the DinD (Docker-in-Docker) sidecar pattern, where the runner and Docker daemon have separate filesystems.
+
+### Key flags
+
+- **`--docker-host`**: Override the Docker socket path (auto-detected from `DOCKER_HOST`). When combined with `--enable-dind`, this socket is also exposed inside the agent container.
+- **`--docker-host-path-prefix <prefix>`**: Prefix all bind-mount source paths so the Docker daemon can resolve runner filesystem paths. Example: `--docker-host-path-prefix /host` rewrites `/tmp` → `/host/tmp`.
+- **`--enable-dind`**: Expose the Docker socket inside the agent container.
+
+### Path translation
+
+`--docker-host-path-prefix` applies to all service volumes (agent, squid, api-proxy, cli-proxy, iptables-init). However, kernel virtual filesystems (`/dev`, `/sys`, `/proc`) are automatically excluded from prefixing because they are provided by the Docker daemon's own kernel, not the runner's staged filesystem.
+
+The `/dev/null` path used for credential-hiding overlays is also preserved as-is.
+
+### Implementation files
+
+- `src/services/agent-volumes.ts`: `normalizeDockerHostPathPrefix()`, `translateBindMountHostPath()` — prefix normalization and per-mount translation with kernel VFS passthrough
+- `src/option-parsers.ts`: `resolveDockerHostPathPrefix()` — resolves the effective prefix from CLI args
+- `containers/agent/entrypoint.sh`: procfs mount with `hidepid=2` for credential isolation
+
 ## Exit Code Handling
 
 The wrapper propagates the exit code from the agent container:
@@ -301,44 +256,6 @@ The wrapper propagates the exit code from the agent container:
 2. Container exits with command's exit code
 3. Wrapper inspects container: `docker inspect --format={{.State.ExitCode}}`
 4. Wrapper exits with same code
-
-## Cleanup Lifecycle
-
-The system uses a defense-in-depth cleanup strategy across four stages to prevent Docker resource leaks:
-
-### 1. Pre-Test Cleanup (CI/CD Scripts)
-**Location:** `scripts/ci/test-agent-*.sh` (start of each script)
-**What:** Runs `cleanup.sh` to remove orphaned resources from previous failed runs
-**Why:** Prevents Docker network subnet pool exhaustion and container name conflicts
-**Critical:** Without this, `timeout` commands that kill the wrapper mid-cleanup leave networks/containers behind
-
-### 2. Normal Exit Cleanup (Built-in)
-**Location:** `src/cli.ts:117-118` (`performCleanup()`)
-**What:**
-- `stopContainers()` → `docker compose down -v` (stops containers, removes volumes)
-- `cleanup()` → Deletes workDir (`/tmp/awf-<timestamp>`)
-**Trigger:** Successful command completion
-
-### 3. Signal/Error Cleanup (Built-in)
-**Location:** `src/cli.ts:95-103, 122-126` (SIGINT/SIGTERM handlers, catch blocks)
-**What:** Same as normal exit cleanup
-**Trigger:** User interruption (Ctrl+C), timeout signals, or errors
-**Limitation:** Cannot catch SIGKILL (9) from `timeout` after grace period
-
-### 4. CI/CD Always Cleanup
-**Location:** `.github/workflows/test-agent-*.yml` (`if: always()`)
-**What:** Runs `cleanup.sh` regardless of job status
-**Why:** Safety net for SIGKILL, job cancellation, and unexpected failures
-
-### Cleanup Script (`scripts/ci/cleanup.sh`)
-Removes all awf resources:
-- Containers by name (`awf-squid`, `awf-agent`)
-- All docker-compose services from work directories
-- Unused containers (`docker container prune -f`)
-- Unused networks (`docker network prune -f`) - **critical for subnet pool management**
-- Temporary directories (`/tmp/awf-*`)
-
-**Note:** Test scripts use `timeout 60s` which can kill the wrapper before Stage 2/3 cleanup completes. Stage 1 (pre-test) and Stage 4 (always) prevent accumulation across test runs.
 
 ## Configuration Files
 
@@ -349,102 +266,6 @@ All temporary files are created in `workDir` (default: `/tmp/awf-<timestamp>`):
 - `squid-logs/`: Directory for Squid proxy logs (automatically preserved if logs are created)
 
 Use `--keep-containers` to preserve containers and files after execution for debugging.
-
-## Log Streaming and Persistence
-
-### Real-Time Log Streaming
-
-The wrapper streams container logs in real-time using `docker logs -f`, allowing you to see output as commands execute rather than waiting until completion. This is implemented in `src/docker-manager.ts:runAgentCommand()` which runs `docker logs -f` concurrently with `docker wait`.
-
-**Note:** The container is configured with `tty: false` (line 202 in `src/docker-manager.ts`) to prevent ANSI escape sequences from appearing in log output. This provides cleaner, more readable streaming logs.
-
-### Agent Logs Preservation
-
-Agent logs (including GitHub Copilot CLI logs) are automatically preserved for debugging:
-
-**Directory Structure:**
-- Container writes logs to: `~/.copilot/logs/` (GitHub Copilot CLI's default location)
-- Volume mount maps to: `${workDir}/agent-logs/`
-- After cleanup: Logs moved to `/tmp/awf-agent-logs-<timestamp>` (if they exist)
-
-**Automatic Preservation:**
-- If agent creates logs, they're automatically moved to `/tmp/awf-agent-logs-<timestamp>/` before workDir cleanup
-- Empty log directories are not preserved (avoids cluttering /tmp)
-- You'll see: `[INFO] Agent logs preserved at: /tmp/awf-agent-logs-<timestamp>` when logs exist
-
-**With `--keep-containers`:**
-- Logs remain at: `${workDir}/agent-logs/`
-- All config files and containers are preserved
-- You'll see: `[INFO] Agent logs available at: /tmp/awf-<timestamp>/agent-logs/`
-
-**Usage Examples:**
-```bash
-# Logs automatically preserved (if created)
-awf --allow-domains github.com \
-  "npx @github/copilot@0.0.347 -p 'your prompt' --log-level debug --allow-all-tools"
-# Output: [INFO] Agent logs preserved at: /tmp/awf-agent-logs-1761073250147
-
-# Increase log verbosity for debugging
-awf --allow-domains github.com \
-  "npx @github/copilot@0.0.347 -p 'your prompt' --log-level all --allow-all-tools"
-
-# Keep everything for detailed inspection
-awf --allow-domains github.com --keep-containers \
-  "npx @github/copilot@0.0.347 -p 'your prompt' --log-level debug"
-```
-
-**Implementation Details:**
-- Volume mount added in `src/docker-manager.ts:172`
-- Log directory creation in `src/docker-manager.ts:247-252`
-- Preservation logic in `src/docker-manager.ts:540-550` (cleanup function)
-
-### Squid Logs Preservation
-
-Squid proxy logs are automatically preserved for debugging network traffic:
-
-**Directory Structure:**
-- Container writes logs to: `/var/log/squid/` (Squid's default location)
-- Volume mount maps to: `${workDir}/squid-logs/`
-- After cleanup: Logs moved to `/tmp/squid-logs-<timestamp>` (if they exist)
-
-**Automatic Preservation:**
-- If Squid creates logs, they're automatically moved to `/tmp/squid-logs-<timestamp>/` before workDir cleanup
-- Empty log directories are not preserved (avoids cluttering /tmp)
-- You'll see: `[INFO] Squid logs preserved at: /tmp/squid-logs-<timestamp>` when logs exist
-
-**With `--keep-containers`:**
-- Logs remain at: `${workDir}/squid-logs/`
-- All config files and containers are preserved
-- You'll see: `[INFO] Squid logs available at: /tmp/awf-<timestamp>/squid-logs/`
-
-**Log Files:**
-- `access.log`: All HTTP/HTTPS traffic with custom format showing domains, IPs, and allow/deny decisions
-- `cache.log`: Squid internal diagnostic messages
-
-**Viewing Logs:**
-```bash
-# Logs are owned by the 'proxy' user (from container), requires sudo on host
-sudo cat /tmp/squid-logs-<timestamp>/access.log
-
-# Example log entries:
-# Allowed: TCP_TUNNEL:HIER_DIRECT with status 200
-# Denied: TCP_DENIED:HIER_NONE with status 403
-```
-
-**Usage Examples:**
-```bash
-# Check which domains were blocked
-sudo grep "TCP_DENIED" /tmp/squid-logs-<timestamp>/access.log
-
-# View all traffic
-sudo cat /tmp/squid-logs-<timestamp>/access.log
-```
-
-**Implementation Details:**
-- Volume mount in `src/docker-manager.ts:135`
-- Log directory creation in `src/docker-manager.ts:254-261`
-- Entrypoint script fixes permissions: `containers/squid/entrypoint.sh`
-- Preservation logic in `src/docker-manager.ts:552-562` (cleanup function)
 
 ## Key Dependencies
 
@@ -473,7 +294,7 @@ The firewall implements comprehensive logging at two levels:
 
 - `src/squid-config.ts` - Generates Squid config with custom `firewall_detailed` logformat
 - `containers/agent/setup-iptables.sh` - Configures iptables LOG rules for rejected traffic
-- `src/squid-config.test.ts` - Tests for logging configuration
+- `src/squid-config-features.test.ts` - Tests for logging configuration
 
 ### Squid Log Format
 
@@ -507,7 +328,7 @@ Both use `--log-uid` flag to capture process UID.
 
 Run tests:
 ```bash
-npm test -- squid-config.test.ts
+npm test -- squid-config-features.test.ts
 ```
 
 Manual testing:

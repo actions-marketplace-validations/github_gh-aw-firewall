@@ -7,50 +7,218 @@
 # NOTE: ARG declared before first FROM is global and available in all FROM statements
 ARG BASE_IMAGE=ubuntu:22.04
 
+FROM golang:1.26.6-alpine@sha256:af8d6740070b8906d12eae1c3e3ea0957fb63f492051ea05e354c38ef9fe88df AS gh-build
+
+ARG GH_VERSION=2.97.0
+ARG GH_SOURCE_SHA256=18cd1280f70911c9c16dd5965cdac0b9e6b16e54466f0c892ce2829ecdd339a6
+ARG GH_SOURCE_DATE_EPOCH=1785488640
+RUN wget -q "https://github.com/cli/cli/archive/refs/tags/v${GH_VERSION}.tar.gz" -O /tmp/gh.tar.gz \
+    && echo "${GH_SOURCE_SHA256}  /tmp/gh.tar.gz" | sha256sum -c - \
+    && tar -xzf /tmp/gh.tar.gz -C /tmp \
+    && cd "/tmp/cli-${GH_VERSION}" \
+    && CGO_ENABLED=0 GH_VERSION="${GH_VERSION}" SOURCE_DATE_EPOCH="${GH_SOURCE_DATE_EPOCH}" \
+         go run ./script/build.go bin/gh \
+    && /tmp/cli-${GH_VERSION}/bin/gh --version
+
+FROM ${BASE_IMAGE} AS one-shot-token-build
+
+COPY one-shot-token/one-shot-token.c /tmp/one-shot-token.c
+RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+      install -y --no-install-recommends gcc libc6-dev binutils && \
+    gcc -shared -fPIC -fvisibility=hidden -O2 -Wall -s \
+        -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+        -o /tmp/one-shot-token.so /tmp/one-shot-token.c -ldl -lpthread && \
+    strip --strip-unneeded /tmp/one-shot-token.so
+
 FROM ${BASE_IMAGE}
 
-# Install required packages and Node.js 22
+# Optionally switch to Azure apt mirror for faster package fetches in CI
+# Only rewrite if azure.archive.ubuntu.com is resolvable (BuildKit DNS can fail)
+# Falls back to default archive.ubuntu.com which is universally reachable
+RUN if getent hosts azure.archive.ubuntu.com >/dev/null 2>&1; then \
+      echo "Using Azure apt mirror (DNS resolved successfully)"; \
+      if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list; \
+        sed -i 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list; \
+      fi; \
+      if [ -d /etc/apt/sources.list.d ]; then \
+        find /etc/apt/sources.list.d -name '*.sources' -exec \
+          sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' {} + 2>/dev/null || true; \
+        find /etc/apt/sources.list.d -name '*.sources' -exec \
+          sed -i 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' {} + 2>/dev/null || true; \
+      fi; \
+    else \
+      echo "Azure apt mirror not reachable, using default archive.ubuntu.com"; \
+    fi
+
+# Install required and runner-parity packages, apply security upgrades, then install
+# Node.js 22.23.2 and npm 11.18.0. Keeping apt work in one layer avoids repeatedly
+# downloading package indexes during cold CI builds.
 # Note: Some packages may already exist in runner-like base images, apt handles this gracefully
-# Retry logic handles transient 404s when Ubuntu archive supersedes package versions mid-build
+# apt_update_retry: retries up to 3 times with backoff; if all fail, reverts to archive.ubuntu.com
 RUN set -eux; \
-    PKGS="iptables curl ca-certificates git gh gnupg dnsutils net-tools netcat-openbsd gosu libcap2-bin"; \
-    apt-get update && \
-    ( apt-get install -y --no-install-recommends $PKGS || \
-      (echo "apt-get install failed, retrying with fresh package index..." && \
-       rm -rf /var/lib/apt/lists/* && \
-       apt-get update && \
-       apt-get install -y --no-install-recommends $PKGS) ) && \
+    force_archive_mirror() { \
+      echo "Falling back to archive.ubuntu.com mirror..." >&2; \
+      if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list; \
+        sed -i 's|http://security.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true; \
+      fi; \
+      if [ -d /etc/apt/sources.list.d ]; then \
+        find /etc/apt/sources.list.d -name '*.sources' -exec \
+          sed -i -e 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+                 -e 's|http://security.ubuntu.com|http://archive.ubuntu.com|g' {} + 2>/dev/null || true; \
+      fi; \
+      rm -rf /var/lib/apt/lists/* && \
+        apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update; \
+    }; \
+    apt_update_retry() { \
+      local i; for i in 1 2 3; do \
+        rm -rf /var/lib/apt/lists/*; \
+        if apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+            update > /tmp/apt-update.log 2>&1; then \
+          cat /tmp/apt-update.log; \
+          if ! grep -q "Failed to fetch" /tmp/apt-update.log; then return 0; fi; \
+        else \
+          cat /tmp/apt-update.log; \
+        fi; \
+        echo "apt-get update attempt $i/3 failed or had fetch failures, retrying in $((i*10))s..." >&2; sleep $((i*10)); \
+      done; \
+      echo "All apt-get update retries failed, falling back to archive.ubuntu.com..." >&2; \
+      force_archive_mirror; \
+    }; \
+    apt_install_retry() { \
+      apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends "$@" && return 0; \
+      echo "apt-get install failed (likely mirror fetch timeout), forcing archive.ubuntu.com and retrying..." >&2; \
+      force_archive_mirror; \
+      apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends "$@"; \
+    }; \
+    apt_upgrade_retry() { \
+      apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        upgrade -y && return 0; \
+      echo "apt-get upgrade failed (likely mirror fetch timeout), forcing archive.ubuntu.com and retrying..." >&2; \
+      force_archive_mirror && \
+        apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 upgrade -y; \
+    }; \
+    PKGS="iptables curl ca-certificates git gnupg dnsutils net-tools netcat-openbsd libcap2-bin libgdiplus libev-dev libssl-dev php-intl php-gd python3"; \
+    apt_update_retry && \
+    apt_install_retry $PKGS && \
+    apt_upgrade_retry && \
+    # Raw sockets are unavailable to the agent; remove stale file capabilities
+    # inherited from runner-like base images so they cannot be reactivated.
+    for binary in /usr/bin/ping /usr/bin/mtr-packet; do \
+      if [ -e "$binary" ]; then \
+        if ! before_caps="$(getcap "$binary")"; then \
+          echo "ERROR: Failed to inspect file capabilities on $binary" >&2; \
+          exit 1; \
+        fi; \
+        if [ -n "$before_caps" ]; then \
+          if ! setcap -r "$binary"; then \
+            echo "ERROR: Failed to remove file capabilities from $binary" >&2; \
+            exit 1; \
+          fi; \
+        fi; \
+        if ! after_caps="$(getcap "$binary")"; then \
+          echo "ERROR: Failed to inspect file capabilities on $binary after removal" >&2; \
+          exit 1; \
+        fi; \
+        if [ -n "$after_caps" ]; then \
+          echo "ERROR: Failed to remove file capabilities from $binary" >&2; \
+          exit 1; \
+        fi; \
+      fi; \
+    done && \
+    # Install gosu 1.19 from GitHub releases (compiled with Go 1.24.6 — avoids Ubuntu's
+    # apt gosu which is compiled with Go 1.18 and carries 44 stdlib CVEs including Critical ones).
+    # GO-2026-4337 (TLS session resumption in Go stdlib) is reported against this binary by
+    # Grype, but is NOT REACHABLE: gosu is a pure setuid/exec privilege-drop tool with no
+    # network or TLS code. It is suppressed in .grype.yaml with a full justification.
+    # See also: tianon/gosu#176 for the upstream govulncheck reachability policy.
+    # Checksums sourced from https://github.com/tianon/gosu/releases/tag/1.19
+    GOSU_VERSION="1.19" && \
+    GOSU_ARCH="$(dpkg --print-architecture)" && \
+    case "$GOSU_ARCH" in \
+      amd64)   GOSU_SHA256="52c8749d0142edd234e9d6bd5237dff2d81e71f43537e2f4f66f75dd4b243dd0" ;; \
+      arm64)   GOSU_SHA256="3a8ef022d82c0bc4a98bcb144e77da714c25fcfa64dccc57f6aba7ae47ff1a44" ;; \
+      armhf)   GOSU_SHA256="8457a0bfd28e016c2c7d8ea6e5f7eed1376033ffbd36491bb455094c8b1dc9fd" ;; \
+      armel)   GOSU_SHA256="6b6a27eb5b5f1efe74978f51aceb773cf004db34e9019f869c056ac8ebc232d9" ;; \
+      ppc64el) GOSU_SHA256="52102a5903b79dcf6287cf1fbc3a3157393989195a8c95e4788556cd35650ae3" ;; \
+      s390x)   GOSU_SHA256="6717b460d0b1a8fabbdca1fa3cbe7ea0e1c0d64f3ed252e1e1e101ed4e16d9e2" ;; \
+      i386)    GOSU_SHA256="4b38085eecdf33a79b6a2f1df8d36e2a93c93346679106127fcbd605aebf01c9" ;; \
+      riscv64) GOSU_SHA256="17ece9173569485c29875058d0edd4cd4a70c00f4cfa6a11b04050e25fda2297" ;; \
+      *) echo "Unsupported architecture: $GOSU_ARCH" >&2; exit 1 ;; \
+    esac && \
+    curl -fsSL "https://github.com/tianon/gosu/releases/download/${GOSU_VERSION}/gosu-${GOSU_ARCH}" \
+        -o /usr/local/bin/gosu && \
+    echo "${GOSU_SHA256}  /usr/local/bin/gosu" | sha256sum -c - && \
+    chmod +x /usr/local/bin/gosu && \
+    gosu --version && \
     # Prefer system binaries over runner toolcache (e.g., act images) for Node checks.
     export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:$PATH" && \
-    # Install Node.js 22 from NodeSource
-    # Check if Node.js 22 is already installed (common in runner images)
-    if ! command -v node >/dev/null 2>&1 || ! node --version | grep -qE '^v22\.'; then \
-        # Remove any existing nodejs packages first to avoid conflicts
-        apt-get remove -y nodejs npm || true && \
-        curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-        apt-get install -y nodejs && \
-        # Verify Node.js 22 was installed correctly
-        node --version | grep -q "^v22\." || (echo "ERROR: Node.js 22 not installed correctly" && exit 1) && \
+    # Install Node.js 22.23.2 from the official Node.js binary distribution
+    # (nodejs.org), NOT the NodeSource apt repo. The NodeSource .deb is tracked by
+    # a Debian/NodeSource security feed that yields false-positive CVE matches
+    # (e.g. CVE-2023-44487 and CVE-2026-45447) against a binary that is already
+    # patched (22.23.2 bundles OpenSSL 3.5.7). The official tarball carries no .deb
+    # metadata, so grype matches it via NVD CPE data instead, which correctly
+    # excludes 22.23.2 for both CVEs.
+    # Checksums sourced from https://nodejs.org/dist/v22.23.2/SHASUMS256.txt
+    # Note: node --version segfaults under QEMU arm64 emulation, so detect QEMU
+    # and skip the runtime version check there.
+    UNDER_QEMU=false && \
+    if [ -f /dev/.buildkit_qemu_emulator ] || [ -n "${QEMU_CPU:-}" ]; then UNDER_QEMU=true; fi && \
+    # Remove any existing nodejs packages first to avoid conflicting detections
+    (apt-get remove -y nodejs npm || true) && \
+    NODE_VERSION="v22.23.2" && \
+    NODE_DPKG_ARCH="$(dpkg --print-architecture)" && \
+    case "$NODE_DPKG_ARCH" in \
+      amd64) NODE_ARCH="x64";    NODE_SHA256="b294a556e639d64338823920e5866c21c02741742d2e1529ee1a225c1ec9252a" ;; \
+      arm64) NODE_ARCH="arm64";  NODE_SHA256="013b59cfd2819703a6f4a14ab891fc46fc2a4e3f5bcd92de3fb4929b43e35b30" ;; \
+      armhf) NODE_ARCH="armv7l"; NODE_SHA256="2a2f59eb8fd9dec27b3bee17c729131d1fd3e6d9943d479f1156ce38af8cd599" ;; \
+      *) echo "Unsupported architecture for Node.js: $NODE_DPKG_ARCH" >&2; exit 1 ;; \
+    esac && \
+    NODE_TARBALL="node-${NODE_VERSION}-linux-${NODE_ARCH}.tar.gz" && \
+    curl -fsSL "https://nodejs.org/dist/${NODE_VERSION}/${NODE_TARBALL}" -o "/tmp/${NODE_TARBALL}" && \
+    echo "${NODE_SHA256}  /tmp/${NODE_TARBALL}" | sha256sum -c - && \
+    # Extract bin/, lib/, include/, share/ into /usr/local (strip the top-level dir)
+    tar -xzf "/tmp/${NODE_TARBALL}" -C /usr/local --strip-components=1 --no-same-owner && \
+    rm -f "/tmp/${NODE_TARBALL}" && \
+    # Verify Node.js 22.23.2 was installed correctly (skip node exec under QEMU — segfaults)
+    if [ "$UNDER_QEMU" = "true" ]; then \
+        echo "Skipping node --version check (QEMU emulation detected)" && \
+        test -x /usr/local/bin/node || (echo "ERROR: /usr/local/bin/node missing" && exit 1); \
+    else \
+        node --version | grep -qE '^v22\.23\.2' || (echo "ERROR: Node.js 22.23.2 not installed correctly" && exit 1) && \
         npx --version || (echo "ERROR: npx not found" && exit 1); \
     fi && \
+    # Replace Node's bundled npm 10.x with npm 11.18.0
+    # Download the tarball and verify its SHA-256 before installing
+    NPM_TGZ_URL="https://registry.npmjs.org/npm/-/npm-11.18.0.tgz" && \
+    NPM_TGZ_SHA256="73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e" && \
+    curl -fsSL "$NPM_TGZ_URL" -o /tmp/npm-11.18.0.tgz && \
+    echo "${NPM_TGZ_SHA256}  /tmp/npm-11.18.0.tgz" | sha256sum -c - && \
+    # Remove stale npm 10.x trees so scanners do not retain them
+    rm -rf /usr/lib/node_modules/npm /usr/local/lib/node_modules/npm && \
+    rm -f /usr/bin/npm /usr/bin/npx /usr/local/bin/npm /usr/local/bin/npx && \
+    # Extract npm 11.18.0 manually — avoids executing node under QEMU (node segfaults there)
+    mkdir -p /usr/local/lib/node_modules/npm && \
+    tar -xzf /tmp/npm-11.18.0.tgz -C /usr/local/lib/node_modules/npm --strip-components=1 && \
+    chmod +x /usr/local/lib/node_modules/npm/bin/npm-cli.js \
+             /usr/local/lib/node_modules/npm/bin/npx-cli.js && \
+    ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
+    ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
+    # Verify version on non-QEMU builds (node segfaults under QEMU)
+    if [ "$UNDER_QEMU" = "false" ]; then \
+        npm --version | grep -qE '^11\.18\.0' || (echo "ERROR: npm 11.18.0 not installed correctly" && exit 1); \
+    fi && \
+    rm -f /tmp/npm-11.18.0.tgz && \
     rm -rf /var/lib/apt/lists/*
 
-# Install additional system packages for GitHub Actions runner parity
-# These packages are commonly needed by workflows and avoid agents spending time installing them manually
-# See: https://github.com/actions/runner-images/blob/main/images/ubuntu/Ubuntu2204-Readme.md
-RUN set -eux; \
-    PARITY_PKGS="libgdiplus libev-dev libssl-dev php-intl php-gd"; \
-    apt-get update && \
-    ( apt-get install -y --no-install-recommends $PARITY_PKGS || \
-      (echo "apt-get install failed, retrying with fresh package index..." && \
-       rm -rf /var/lib/apt/lists/* && \
-       apt-get update && \
-       apt-get install -y --no-install-recommends $PARITY_PKGS) ) && \
-    rm -rf /var/lib/apt/lists/*
-
-# Upgrade all packages to pick up security patches
-# Addresses CVE-2023-44487 (HTTP/2 Rapid Reset) and other known vulnerabilities
-RUN apt-get update && apt-get upgrade -y && rm -rf /var/lib/apt/lists/*
+# Build the pinned GitHub CLI release with the patched Go toolchain.
+COPY --from=gh-build /tmp/cli-2.97.0/bin/gh /usr/local/bin/gh
+RUN gh --version | grep -qE '^gh version 2\.97\.0'
 
 # Create non-root user with UID/GID matching host user
 # This allows the user command to run with appropriate permissions
@@ -75,31 +243,22 @@ RUN if ! getent group awfuser >/dev/null 2>&1; then \
     mkdir -p /home/awfuser/.copilot/logs && \
     chown -R awfuser:awfuser /home/awfuser
 
-# Copy iptables setup script, PID logger, API proxy health check, and Claude key helper
+# Copy iptables setup script, PID logger, API proxy health check, Claude key helper,
+# gh CLI proxy wrapper (used when --enable-cli-proxy is active)
 COPY setup-iptables.sh /usr/local/bin/setup-iptables.sh
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 COPY pid-logger.sh /usr/local/bin/pid-logger.sh
 COPY api-proxy-health-check.sh /usr/local/bin/api-proxy-health-check.sh
 COPY get-claude-key.sh /usr/local/bin/get-claude-key.sh
-RUN chmod +x /usr/local/bin/setup-iptables.sh /usr/local/bin/entrypoint.sh /usr/local/bin/pid-logger.sh /usr/local/bin/api-proxy-health-check.sh /usr/local/bin/get-claude-key.sh
+COPY gh-cli-proxy-wrapper.sh /usr/local/bin/gh-cli-proxy-wrapper.sh
+RUN chmod +x /usr/local/bin/setup-iptables.sh /usr/local/bin/entrypoint.sh /usr/local/bin/pid-logger.sh /usr/local/bin/api-proxy-health-check.sh /usr/local/bin/get-claude-key.sh /usr/local/bin/gh-cli-proxy-wrapper.sh
 
-# Copy pre-built one-shot-token library from rust-builder stage
+# Copy the one-shot-token library from its isolated build stage.
 # This prevents tokens from being read multiple times (e.g., by malicious code)
 # Build flags: -fvisibility=hidden hides internal symbols, -s strips at link time
-COPY one-shot-token/one-shot-token.c /tmp/one-shot-token.c
-RUN set -eux; \
-    BUILD_PKGS="gcc libc6-dev binutils"; \
-    apt-get update && \
-    ( apt-get install -y --no-install-recommends $BUILD_PKGS || \
-      (rm -rf /var/lib/apt/lists/* && apt-get update && \
-       apt-get install -y --no-install-recommends $BUILD_PKGS) ) && \
-    gcc -shared -fPIC -fvisibility=hidden -O2 -Wall -s \
-        -o /usr/local/lib/one-shot-token.so /tmp/one-shot-token.c -ldl -lpthread && \
-    strip --strip-unneeded /usr/local/lib/one-shot-token.so && \
-    rm /tmp/one-shot-token.c && \
-    apt-get remove -y $BUILD_PKGS && \
-    apt-get autoremove -y && \
-    rm -rf /var/lib/apt/lists/*
+# -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 disables glibc fortification macros (e.g.
+# __fprintf_chk) so the resulting .so loads on musl-based hosts (Alpine/ARC runners)
+COPY --from=one-shot-token-build /tmp/one-shot-token.so /usr/local/lib/one-shot-token.so
 
 # Install Docker stub script that shows helpful error message
 # Docker-in-Docker support was removed in v0.9.1

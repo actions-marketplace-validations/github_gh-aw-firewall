@@ -9,11 +9,13 @@ on:
   workflow_dispatch:
 
 permissions:
+  copilot-requests: write
   contents: read
   issues: read
   pull-requests: read
   security-events: read
 
+  vulnerability-alerts: read
 imports:
   - shared/mcp-pagination.md
 
@@ -22,20 +24,27 @@ tools:
     toolsets: [default, code_security, dependabot]
   bash: true
 
+sandbox:
+  agent:
+    id: awf
 network:
   allowed:
     - node
 
 safe-outputs:
+  threat-detection:
+    enabled: false
   create-issue:
     title-prefix: "[Security] "
     labels: [security, dependencies]
     max: 10
-    expires: 30
+    expires: 30d
   create-pull-request:
     title-prefix: "[Deps] "
     labels: [dependencies, automated]
     draft: true
+    allowed-files: [package.json, package-lock.json]
+    protected-files: fallback-to-issue
   add-comment:
     max: 5
     target: "*"

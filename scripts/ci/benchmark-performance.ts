@@ -9,35 +9,40 @@
  *  - Docker network creation time
  *
  * Outputs structured JSON with mean, median, p95, p99 per metric.
+ *
+ * IMPORTANT: stdout/stderr contract:
+ *   - stdout (console.log): JSON result only — consumed by the CI workflow via redirect to file
+ *   - stderr (console.error): progress messages and diagnostics — kept separate so JSON stays valid
  */
 
-import { execSync, ExecSyncOptions } from "child_process";
+import { execSync, ExecSyncOptions, spawn, ChildProcess } from "child_process";
+import { stats, parseMb, checkRegressions, BenchmarkResult, BenchmarkReport } from "./benchmark-utils";
 
 // ── Configuration ──────────────────────────────────────────────────
 
-const ITERATIONS = 5;
-const AWF_CMD = "sudo awf";
+const DEFAULT_ITERATIONS = 30;
+
+function getIterations(): number {
+  const raw = process.env.AWF_BENCHMARK_ITERATIONS;
+  if (raw === undefined) {
+    return DEFAULT_ITERATIONS;
+  }
+
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    console.error(
+      `Invalid AWF_BENCHMARK_ITERATIONS=${JSON.stringify(raw)}; using default ${DEFAULT_ITERATIONS}.`
+    );
+    return DEFAULT_ITERATIONS;
+  }
+
+  return parsed;
+}
+
+const ITERATIONS = getIterations();
+const AWF_CMD = "sudo awf --build-local";
 const ALLOWED_DOMAIN = "api.github.com";
-const CLEANUP_CMD = "sudo docker compose down -v 2>/dev/null; sudo docker rm -f awf-squid awf-agent 2>/dev/null; sudo docker network prune -f 2>/dev/null";
-
-interface BenchmarkResult {
-  metric: string;
-  unit: string;
-  values: number[];
-  mean: number;
-  median: number;
-  p95: number;
-  p99: number;
-}
-
-interface BenchmarkReport {
-  timestamp: string;
-  commitSha: string;
-  iterations: number;
-  results: BenchmarkResult[];
-  thresholds: Record<string, { target: number; critical: number }>;
-  regressions: string[];
-}
+const CLEANUP_CMD = "sudo docker compose down -v 2>/dev/null; sudo docker rm -f awf-squid awf-agent awf-iptables-init 2>/dev/null; sudo docker network prune -f 2>/dev/null";
 
 // ── Thresholds (milliseconds or MB) ───────────────────────────────
 
@@ -52,24 +57,13 @@ const THRESHOLDS: Record<string, { target: number; critical: number }> = {
 // ── Helpers ────────────────────────────────────────────────────────
 
 function exec(cmd: string, opts?: ExecSyncOptions): string {
-  return execSync(cmd, { encoding: "utf-8", timeout: 120_000, ...opts }).trim();
+  return (execSync(cmd, { encoding: "utf-8", timeout: 120_000, ...opts }) ?? "").trim();
 }
 
 function timeMs(fn: () => void): number {
   const start = performance.now();
   fn();
   return Math.round(performance.now() - start);
-}
-
-function stats(values: number[]): Pick<BenchmarkResult, "mean" | "median" | "p95" | "p99"> {
-  const sorted = [...values].sort((a, b) => a - b);
-  const n = sorted.length;
-  return {
-    mean: Math.round(sorted.reduce((a, b) => a + b, 0) / n),
-    median: sorted[Math.floor(n / 2)],
-    p95: sorted[Math.min(Math.floor(n * 0.95), n - 1)],
-    p99: sorted[Math.min(Math.floor(n * 0.99), n - 1)],
-  };
 }
 
 function cleanup(): void {
@@ -88,9 +82,9 @@ function benchmarkColdStart(): BenchmarkResult {
 
   for (let i = 0; i < ITERATIONS; i++) {
     cleanup();
-    // Remove cached images to force cold pull
+    // Remove locally-built images and build cache to force a full rebuild
     try {
-      execSync("sudo docker rmi ghcr.io/github/gh-aw-firewall/squid:latest ghcr.io/github/gh-aw-firewall/agent:latest 2>/dev/null", { stdio: "ignore", timeout: 30_000 });
+      execSync("sudo docker image prune -af --filter 'label=com.docker.compose.project' 2>/dev/null; sudo docker builder prune -af 2>/dev/null", { stdio: "ignore", timeout: 60_000 });
     } catch {
       // images may not exist
     }
@@ -129,27 +123,48 @@ function benchmarkWarmStart(): BenchmarkResult {
   return { metric: "container_startup_warm", unit: "ms", values, ...stats(values) };
 }
 
-function benchmarkHttpsLatency(): BenchmarkResult {
+async function benchmarkHttpsLatency(): Promise<BenchmarkResult> {
   console.error("  Benchmarking HTTPS latency through Squid...");
   const values: number[] = [];
 
   for (let i = 0; i < ITERATIONS; i++) {
     cleanup();
+    let child: ChildProcess | null = null;
     try {
-      // Use curl's time_total to measure end-to-end HTTPS request latency
+      // Start AWF in the background so Squid stays alive, then measure
+      // latency by curling through the proxy directly from the host.
+      // This isolates Squid proxy latency from container startup overhead.
+      const awfParts = AWF_CMD.split(/\s+/);
+      child = spawn(
+        awfParts[0],
+        [...awfParts.slice(1), "--allow-domains", ALLOWED_DOMAIN, "--log-level", "error", "--", "sleep", "30"],
+        {
+          detached: true,
+          stdio: "ignore",
+        }
+      );
+      child.unref();
+
+      // Wait for Squid to be running and healthy
+      await waitForContainers(["awf-squid"], 30_000);
+
+      // Measure HTTPS request latency through Squid's proxy port from the host
       const output = exec(
-        `${AWF_CMD} --allow-domains ${ALLOWED_DOMAIN} --log-level error -- ` +
-          `curl -fsS -o /dev/null -w '%{time_total}' https://${ALLOWED_DOMAIN}/zen`
+        `curl -fsS -o /dev/null -w '%{time_total}' -x http://172.30.0.10:3128 https://${ALLOWED_DOMAIN}/zen`
       );
       const seconds = parseFloat(output);
       if (!isNaN(seconds)) {
         values.push(Math.round(seconds * 1000));
       }
-    } catch {
-      console.error(`    Iteration ${i + 1}/${ITERATIONS}: failed (skipped)`);
-      continue;
+      console.error(`    Iteration ${i + 1}/${ITERATIONS}: ${values[values.length - 1]}ms`);
+    } catch (err) {
+      console.error(`    Iteration ${i + 1}/${ITERATIONS}: failed (skipped) - ${err}`);
+    } finally {
+      if (child) {
+        killBackground(child);
+      }
+      cleanup();
     }
-    console.error(`    Iteration ${i + 1}/${ITERATIONS}: ${values[values.length - 1]}ms`);
   }
 
   if (values.length === 0) {
@@ -159,20 +174,98 @@ function benchmarkHttpsLatency(): BenchmarkResult {
   return { metric: "squid_https_latency", unit: "ms", values, ...stats(values) };
 }
 
-function benchmarkMemory(): BenchmarkResult {
+/**
+ * Wait for Docker containers to be running, polling at 500ms intervals.
+ * Uses exact name matching (anchored regex) to avoid false positives from
+ * containers with similar names (e.g., "awf-squid-old").
+ * Throws if containers are not running within timeoutMs.
+ */
+function waitForContainers(containerNames: string[], timeoutMs: number): Promise<void> {
+  const start = Date.now();
+  return new Promise((resolve, reject) => {
+    const poll = (): void => {
+      if (Date.now() - start > timeoutMs) {
+        reject(new Error(`Containers not running after ${timeoutMs}ms`));
+        return;
+      }
+      try {
+        const allRunning = containerNames.every((name) => {
+          const result = execSync(
+            `sudo docker ps --filter name=^${name}$ --filter status=running --format '{{.Names}}' 2>/dev/null`,
+            { encoding: "utf-8", timeout: 5_000 }
+          )
+            .trim()
+            .split("\n")
+            .map((n) => n.trim())
+            .filter(Boolean);
+          return result.some((n) => n === name);
+        });
+        if (allRunning) {
+          resolve();
+          return;
+        }
+      } catch {
+        // container not ready yet
+      }
+      setTimeout(poll, 500);
+    };
+    poll();
+  });
+}
+
+/**
+ * Kill a spawned background process and its entire process group, best-effort.
+ * Sends SIGTERM then SIGKILL to the process group so descendant processes
+ * (e.g., sudo, awf, docker) don't survive.
+ */
+function killBackground(child: ChildProcess): void {
+  const pid = child.pid;
+  if (!pid) return;
+
+  try {
+    // SIGTERM the process group to allow graceful shutdown
+    process.kill(-pid, "SIGTERM");
+  } catch {
+    // Process group may have already exited
+  }
+
+  try {
+    // SIGKILL the entire process group to ensure nothing survives
+    process.kill(-pid, "SIGKILL");
+  } catch {
+    // Process group may have already exited
+  }
+}
+
+async function benchmarkMemory(): Promise<BenchmarkResult> {
   console.error("  Benchmarking memory footprint...");
   const values: number[] = [];
 
   for (let i = 0; i < ITERATIONS; i++) {
     cleanup();
-    // Start containers, measure memory, then stop
+    let child: ChildProcess | null = null;
     try {
-      // Run a sleep command so containers stay up, then check memory
-      const output = exec(
-        `${AWF_CMD} --allow-domains ${ALLOWED_DOMAIN} --log-level error --keep-containers -- ` +
-          `echo measuring_memory`
+      // Start awf with a long-running command in the background so containers stay alive.
+      // Derive spawn args from AWF_CMD to stay consistent with the rest of the script.
+      const awfParts = AWF_CMD.split(/\s+/);
+      child = spawn(
+        awfParts[0],
+        [...awfParts.slice(1), "--allow-domains", ALLOWED_DOMAIN, "--log-level", "error", "--", "sleep", "30"],
+        {
+          detached: true,
+          stdio: "ignore",
+        }
       );
-      // Get memory stats for both containers
+      // Unref so the parent process won't be kept alive if cleanup fails
+      child.unref();
+
+      // Wait for both containers to be running (up to 30s)
+      await waitForContainers(["awf-squid", "awf-agent"], 30_000);
+
+      // Give containers a moment to stabilize memory usage
+      await new Promise((resolve) => setTimeout(resolve, 2000));
+
+      // Get memory stats while containers are alive
       const squidMem = exec(
         "sudo docker stats awf-squid --no-stream --format '{{.MemUsage}}' 2>/dev/null || echo '0MiB'"
       );
@@ -180,24 +273,18 @@ function benchmarkMemory(): BenchmarkResult {
         "sudo docker stats awf-agent --no-stream --format '{{.MemUsage}}' 2>/dev/null || echo '0MiB'"
       );
 
-      // Parse memory values (format: "123.4MiB / 7.773GiB")
-      const parseMb = (s: string): number => {
-        const match = s.match(/([\d.]+)\s*(MiB|GiB|KiB)/i);
-        if (!match) return 0;
-        const val = parseFloat(match[1]);
-        const unit = match[2].toLowerCase();
-        if (unit === "gib") return val * 1024;
-        if (unit === "kib") return val / 1024;
-        return val;
-      };
-
       const totalMb = Math.round(parseMb(squidMem) + parseMb(agentMem));
       values.push(totalMb);
       console.error(`    Iteration ${i + 1}/${ITERATIONS}: ${totalMb}MB (squid: ${squidMem}, agent: ${agentMem})`);
-    } catch {
-      console.error(`    Iteration ${i + 1}/${ITERATIONS}: failed (skipped)`);
+    } catch (err) {
+      console.error(`    Iteration ${i + 1}/${ITERATIONS}: failed (skipped) - ${err}`);
+    } finally {
+      // Always clean up the background process and containers
+      if (child) {
+        killBackground(child);
+      }
+      cleanup();
     }
-    cleanup();
   }
 
   if (values.length === 0) {
@@ -247,22 +334,14 @@ async function main(): Promise<void> {
   results.push(benchmarkNetworkCreation());
   results.push(benchmarkWarmStart());
   results.push(benchmarkColdStart());
-  results.push(benchmarkHttpsLatency());
-  results.push(benchmarkMemory());
+  results.push(await benchmarkHttpsLatency());
+  results.push(await benchmarkMemory());
 
   // Final cleanup
   cleanup();
 
   // Check for regressions against critical thresholds
-  const regressions: string[] = [];
-  for (const r of results) {
-    const threshold = THRESHOLDS[r.metric];
-    if (threshold && r.p95 > threshold.critical) {
-      regressions.push(
-        `${r.metric}: p95=${r.p95}${r.unit} exceeds critical threshold of ${threshold.critical}${r.unit}`
-      );
-    }
-  }
+  const regressions = checkRegressions(results, THRESHOLDS);
 
   const report: BenchmarkReport = {
     timestamp: new Date().toISOString(),

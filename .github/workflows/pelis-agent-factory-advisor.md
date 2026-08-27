@@ -4,255 +4,157 @@ on:
   schedule: daily
   workflow_dispatch:
 permissions:
+  copilot-requests: write
   contents: read
   actions: read
   issues: read
   pull-requests: read
   discussions: read
+max-turns: 4
+model: claude-haiku-4.5
+engine:
+  id: copilot
 imports:
-  - shared/mcp-pagination.md
+  - uses: shared/mcp/gh-aw.md
 tools:
   agentic-workflows:
-  github:
-    toolsets: [default, actions]
   bash:
-    - "*"
-  web-fetch:
+    - "cat"
+    - "find"
+    - "ls"
+    - "grep"
   cache-memory: true
+  github:
+    toolsets: [context]
+sandbox:
+  agent:
+    id: awf
 network:
   allowed:
-    - github
     - "github.github.io"
+
 safe-outputs:
+  threat-detection:
+    enabled: false
   create-discussion:
     title-prefix: "[Pelis Agent Factory Advisor] "
     category: "general"
 timeout-minutes: 30
+steps:
+  - name: Fetch Pelis Agent Factory Docs
+    id: fetch-docs
+    run: |
+      set -o pipefail
+      BASE="https://github.github.io/gh-aw"
+      OUTFILE="${GITHUB_WORKSPACE}/.pelis-agent-factory-docs.txt"
+      : > "$OUTFILE"
+      for PATH_SUFFIX in \
+        "/blog/2026-01-12-welcome-to-pelis-agent-factory/" \
+        "/introduction/overview/" \
+        "/guides/workflow-patterns/" \
+        "/guides/best-practices/"; do
+        echo "### ${BASE}${PATH_SUFFIX}" >> "$OUTFILE"
+        curl -sf "${BASE}${PATH_SUFFIX}" \
+          | python3 -c "import sys,html,re;t=sys.stdin.read();print(html.unescape(re.sub('<[^>]+>','',t))[:3500])" \
+          >> "$OUTFILE" 2>/dev/null \
+          || echo "(not found)" >> "$OUTFILE"
+        echo "" >> "$OUTFILE"
+      done
+  - name: Fetch Agentics Patterns
+    id: fetch-agentics
+    run: |
+      set -o pipefail
+      curl -sf "https://raw.githubusercontent.com/githubnext/agentics/main/README.md" \
+        | head -c 4000 > "${GITHUB_WORKSPACE}/.agentics-patterns.txt" \
+        || echo "(not available)" > "${GITHUB_WORKSPACE}/.agentics-patterns.txt"
+  - name: Compute Content Hashes
+    id: content-hashes
+    run: |
+      {
+        sha256sum "${GITHUB_WORKSPACE}/.pelis-agent-factory-docs.txt"
+        sha256sum "${GITHUB_WORKSPACE}/.agentics-patterns.txt"
+      } | sha256sum | cut -d' ' -f1 > "${GITHUB_WORKSPACE}/.content-hash.txt"
+  - name: Summarize Existing Workflows
+    id: workflow-summaries
+    run: |
+      {
+        echo "# Workflow Summaries (name | description | triggers)"
+        find .github/workflows -name "*.md" -type f | sort | while IFS= read -r f; do
+          name=$(basename "$f" .md)
+          desc=$(grep -m1 "^description:" "$f" 2>/dev/null | sed 's/^description: *//' | cut -c1-100)
+          triggers=$(grep -E "^  (schedule|workflow_dispatch|pull_request|push|issues|workflow_run|issue_comment|release|slash_command):" "$f" 2>/dev/null \
+            | sed 's/^  //' | tr -d ':' | tr '\n' ',' | sed 's/,$//')
+          printf "%-45s | %-100s | %s\n" "$name" "${desc:-(no description)}" "${triggers:-(none)}"
+        done
+      } > "${GITHUB_WORKSPACE}/.workflow-summaries.txt"
+  - name: Collect Repo Structure
+    id: repo-structure
+    run: |
+      {
+        echo "=== Root files ==="
+        ls -la
+        echo ""
+        echo "=== Tests ==="
+        ls -la tests/ 2>/dev/null || echo "(no tests/)"
+        echo ""
+        echo "=== Scripts ==="
+        ls -la scripts/ 2>/dev/null || echo "(no scripts/)"
+      } > "${GITHUB_WORKSPACE}/.repo-structure.txt"
 ---
 
 # Pelis Agent Factory Advisor
 
-You are an expert advisor on agentic workflows, specializing in patterns and best practices from the Pelis Agent Factory. Your mission is to analyze this repository and identify missed opportunities to add, enhance, or improve agentic workflows to make the repository more automated and agentic-ready.
+You are an expert advisor on agentic workflows specializing in Pelis Agent Factory patterns. Your mission: identify the top opportunities to add, enhance, or improve agentic workflows in this repository.
 
-## Phase 1: Learn Pelis Agent Factory Patterns
+> **Batch all independent operations into a single turn.** Never read files one at a time when you can read them in parallel.
 
-### Step 1.1: Crawl the Pelis Agent Factory Documentation Site
+## Phase 1: Learn Patterns (cache-gated)
 
-**IMPORTANT**: You must thoroughly crawl and read the Pelis Agent Factory documentation site to understand the common patterns and best practices for agentic workflows.
+**First turn**: read `.content-hash.txt` and `.workflow-summaries.txt` in parallel (both are always read on every run).
 
-Start from the main blog post and explore ALL linked pages:
-- Start at: https://github.github.io/gh-aw/blog/2026-01-12-welcome-to-pelis-agent-factory/
-- Use `web-fetch` to retrieve each page
-- Follow ALL internal links to other pages on the site
-- Read the documentation sections, guides, and examples
-- Pay special attention to:
-  - Workflow patterns and templates
-  - Best practices for agentic automation
-  - Common use cases and implementations
-  - Integration patterns with GitHub
-  - Safe outputs and permissions models
-  - Caching and state management
+Compare `.content-hash.txt` to cached `pelis_docs_hash` in cache-memory.
+- **Cache hit** (hash unchanged): skip reading doc files; use cached patterns and proceed directly to Phase 2.
+- **Cache miss**: read `.pelis-agent-factory-docs.txt` and `.agentics-patterns.txt` in a single parallel batch, then update `pelis_docs_hash` and store a bullet-point summary of key patterns in cache-memory (`pelis_patterns_summary`).
 
-### Step 1.2: Explore the Agentics Repository
+Key things to extract from docs: workflow templates, safe-outputs patterns, caching strategies, permission models, integration patterns.
 
-Clone knowledge from the agentics repository to understand reference implementations:
-- Repository: https://github.com/githubnext/agentics
-- Use the GitHub tools to explore the repository structure
-- Read key workflow files and configurations
-- Understand the patterns used in that repository
-- Note any interesting automation patterns that could apply here
+## Phase 2: Analyze Repository
 
-### Step 1.3: Document Learned Patterns
+All repository context is pre-computed — avoid reading individual workflow files unless you need specific configuration details.
 
-In your cache-memory, document:
-- Key patterns you discovered
-- Best practices that stood out
-- Interesting workflow configurations
-- Reusable templates or approaches
+**In one turn**, do all of the following in parallel:
+1. `agentic-workflows status` — check recent run health
+2. `agentic-workflows audit` — check security/config issues
+3. `bash:cat .repo-structure.txt` — root files, tests, scripts
 
-## Phase 2: Analyze This Repository
+The pre-computed `.workflow-summaries.txt` (read in Phase 1 first turn) gives you a one-line inventory of every workflow (name | description | triggers). Use it as your primary inventory — **do not read individual workflow `.md` files** unless a specific recommendation requires detailed configuration review.
 
-### Step 2.1: Inventory Current Agentic Workflows
-
-Use the `agentic-workflows` tool to get the status of all workflow files:
-
-```bash
-# List all workflow files
-ls -la .github/workflows/
-
-# Find all agentic workflow definitions (*.md files in workflows)
-find .github/workflows -name "*.md" -type f
-```
-
-For each agentic workflow found:
-- Understand its purpose
-- Review its configuration (triggers, permissions, tools)
-- Assess its effectiveness
-- Identify potential improvements
-
-### Step 2.2: Analyze Repository Structure
-
-Examine the repository to understand what could benefit from automation:
-
-```bash
-# Understand the project structure
-ls -la
-
-# Check for documentation
-ls -la docs/ 2>/dev/null || echo "No docs directory"
-ls -la *.md
-
-# Check for tests
-ls -la tests/ 2>/dev/null || echo "No tests directory"
-
-# Check for CI/CD configuration
-ls -la .github/workflows/
-
-# Check for scripts
-ls -la scripts/ 2>/dev/null || echo "No scripts directory"
-```
-
-### Step 2.3: Review Recent Activity
-
-Use GitHub tools to understand recent repository activity:
-- Recent pull requests and their review patterns
-- Recent issues and their resolution patterns
-- Recent workflow runs and their success/failure rates
+Assess automation coverage: what triggers exist, what's missing, where there are gaps.
 
 ## Phase 3: Identify Opportunities
 
-Based on your knowledge of Pelis Agent Factory patterns and your analysis of this repository, identify opportunities in these categories:
+Identify top opportunities across these categories (focus on highest value for a security/firewall tool):
 
-### 3.1: Missing Workflows
+- **Missing workflows**: security automation, test quality, release automation, documentation, monitoring
+- **Enhancement opportunities**: caching, triggers, tool utilization, error handling
+- **Integration opportunities**: chaining workflows, shared state, event-driven patterns
 
-Workflows that don't exist but would add significant value:
-- Documentation automation
-- Release automation enhancements
-- Code quality agents
-- Knowledge management
-- Onboarding assistance
-- Dependency management
-- Performance monitoring
-- Security automation beyond existing workflows
-- Community engagement
+For each opportunity: Impact (H/M/L) · Effort (H/M/L) · Risk (H/M/L).
+Priority: P0=High impact+Low effort, P1=High impact+Medium effort, P2=Medium, P3=Nice-to-have.
 
-### 3.2: Enhancement Opportunities
+## Phase 4: Report
 
-Existing workflows that could be improved:
-- Better caching strategies
-- More sophisticated triggers
-- Enhanced output formats
-- Better tool utilization
-- Improved error handling
-- More comprehensive coverage
+Create a discussion using `create_discussion` with:
 
-### 3.3: Integration Opportunities
-
-Ways to connect workflows for greater automation:
-- Chaining workflows together
-- Shared state and memory
-- Cross-workflow coordination
-- Event-driven automation
-
-## Phase 4: Prioritize and Report
-
-### Prioritization Criteria
-
-For each opportunity, assess:
-
-1. **Impact** (High/Medium/Low): How much value would this add?
-2. **Effort** (High/Medium/Low): How complex is the implementation?
-3. **Risk** (High/Medium/Low): What could go wrong?
-4. **Dependencies**: What needs to be in place first?
-
-### Priority Levels
-
-- **P0 - Critical**: High impact, low effort, should be implemented immediately
-- **P1 - High**: High impact, medium effort, plan for near-term
-- **P2 - Medium**: Medium impact, worth considering
-- **P3 - Low**: Nice to have, future consideration
-
-## Output Format
-
-Create a discussion with the following structure:
-
-### 📊 Executive Summary
-
-Brief overview of your findings (2-3 sentences on overall agentic workflow maturity and top opportunities).
-
-### 🎓 Patterns Learned from Pelis Agent Factory
-
-Summarize the key patterns and best practices you learned from:
-- The documentation site
-- The agentics repository
-- How they compare to current implementations in this repo
-
-### 📋 Current Agentic Workflow Inventory
-
-Table of existing agentic workflows:
-| Workflow | Purpose | Trigger | Assessment |
-|----------|---------|---------|------------|
-| ... | ... | ... | ... |
-
-### 🚀 Actionable Recommendations
-
-For each recommendation, provide:
-
-#### [Priority] Recommendation Title
-
-**What**: Clear description of the opportunity
-
-**Why**: Reasoning and expected benefits
-
-**How**: High-level implementation approach
-
-**Effort**: Estimated complexity (Low/Medium/High)
-
-**Example**: Code snippet or configuration example if applicable
-
----
-
-Group recommendations by priority:
-
-#### P0 - Implement Immediately
-(List P0 items)
-
-#### P1 - Plan for Near-Term
-(List P1 items)
-
-#### P2 - Consider for Roadmap
-(List P2 items)
-
-#### P3 - Future Ideas
-(List P3 items)
-
-### 📈 Maturity Assessment
-
-Rate the repository's agentic workflow maturity:
-- **Current Level**: (1-5 scale with description)
-- **Target Level**: What level should it aim for?
-- **Gap Analysis**: What's needed to get there?
-
-### 🔄 Comparison with Best Practices
-
-How does this repository compare to Pelis Agent Factory best practices?
-- What it does well
-- What it could improve
-- Unique opportunities given the repository's domain (firewall/security)
-
-### 📝 Notes for Future Runs
-
-Document in cache-memory:
-- Patterns you observed
-- Changes since last run (if applicable)
-- Items to track over time
+1. **📊 Executive Summary** — 2–3 sentences on maturity and top opportunities
+2. **📋 Workflow Inventory** — Table from `.workflow-summaries.txt`: `| Workflow | Purpose | Trigger | Assessment |`
+3. **🚀 Recommendations** — Grouped P0→P3, each with: What / Why / How / Effort
+4. **📈 Maturity Assessment** — Current/Target level (1–5), gap analysis
+5. **📝 Cache Update** — Update cache-memory with observed patterns and items to track next run
 
 ## Guidelines
 
-- **Be specific and actionable**: Each recommendation should be implementable
-- **Leverage domain knowledge**: This is a security/firewall tool - suggest security-relevant automations
-- **Think holistically**: Consider how workflows can work together
-- **Prioritize ruthlessly**: Focus on high-impact, low-effort wins first
-- **Learn continuously**: Use cache-memory to build knowledge over time
-- **Be practical**: Consider the maintainers' time and resources
-- **Cite sources**: Reference specific patterns from Pelis Agent Factory when applicable
+- Specific and actionable — every recommendation must be implementable
+- Security-focused — this is a firewall tool; prioritize security-relevant automations
+- Ruthlessly prioritize — top 5 wins over exhaustive lists
+- Use cached knowledge — avoid re-reading docs and files already summarized

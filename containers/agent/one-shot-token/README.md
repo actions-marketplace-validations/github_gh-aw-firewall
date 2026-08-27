@@ -46,10 +46,14 @@ By default, the library protects these token variables:
 
 **Anthropic/Claude:**
 - `ANTHROPIC_API_KEY`
+- `ANTHROPIC_AUTH_TOKEN`
 - `CLAUDE_API_KEY`
 
 **Codex:**
 - `CODEX_API_KEY`
+
+**Copilot BYOK provider:**
+- `COPILOT_PROVIDER_API_KEY`
 
 ### Custom Token List
 
@@ -170,8 +174,8 @@ exec capsh --drop=$CAPS_TO_DROP -- -c "exec gosu awfuser $COMMAND"
 
 In chroot mode, the library must be accessible from within the chroot (host filesystem). The entrypoint:
 
-1. Copies the library from container to `/host/tmp/awf-lib/one-shot-token.so`
-2. Sets `LD_PRELOAD=/tmp/awf-lib/one-shot-token.so` inside the chroot
+1. Copies the library from container to `/host/run/awf-lib/one-shot-token.so`
+2. Sets `LD_PRELOAD=/run/awf-lib/one-shot-token.so` inside the chroot
 3. Cleans up the library on exit
 
 ## Building
@@ -182,11 +186,19 @@ The Dockerfile compiles the library during image build with hardened flags:
 
 ```dockerfile
 RUN gcc -shared -fPIC -fvisibility=hidden -O2 -Wall -s \
+    -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
     -o /usr/local/lib/one-shot-token.so \
     /tmp/one-shot-token.c \
     -ldl -lpthread && \
     strip --strip-unneeded /usr/local/lib/one-shot-token.so
 ```
+
+The `-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0` flags disable glibc's fortified I/O
+wrappers (e.g. `__fprintf_chk`), which avoids that specific missing-symbol
+failure on musl-based hosts such as Alpine Linux (used by ARC self-hosted
+runners). Loading may still depend on host compatibility (for example,
+`gcompat` availability), and without these flags the dynamic linker can fail
+with `symbol not found: __fprintf_chk`.
 
 ### Locally (for testing)
 
@@ -352,7 +364,7 @@ This library is one layer in AWF's security model:
 ## Limitations
 
 - **Linux only**: The library is compiled for Linux (x86_64 and potentially other architectures via Rust cross-compilation)
-- **glibc programs only**: Programs using musl libc or statically linked programs are not affected
+- **glibc programs only**: Programs using musl libc or statically linked programs are not affected by the interception (they do not load the library); AWF degrades gracefully by falling back to tokens remaining in the environment
 - **Single process**: Child processes inherit the LD_PRELOAD but have their own token state and cache (each starts fresh)
 
 ## Files

@@ -180,10 +180,20 @@ In chroot mode, selective paths are mounted for security instead of the entire f
 | `/opt` | `/host/opt:ro` | Tool cache (Python, Node, Go) |
 | `/etc/ssl` | `/host/etc/ssl:ro` | SSL certificates |
 | `/etc/ca-certificates` | `/host/etc/ca-certificates:ro` | CA certificates |
+| `/etc/pki/ca-trust/extracted` | `/host/etc/pki/ca-trust/extracted:ro` | RHEL/Amazon Linux extracted CA bundle roots |
+| `/etc/pki/tls/certs` | `/host/etc/pki/tls/certs:ro` | RHEL/Amazon Linux CA certificate directory |
 | `/etc/passwd` | `/host/etc/passwd:ro` | User lookup |
 | `/etc/group` | `/host/etc/group:ro` | Group lookup |
 
+When `chroot.binariesSourcePath` is set in stdin config, AWF also mounts:
+
+| Host Path | Container Path | Purpose |
+|-----------|----------------|---------|
+| `chroot.binariesSourcePath` | `/host/tmp/awf-runner-bin:ro` | Overlay runner-installed binaries in chroot PATH (prepended as `/tmp/awf-runner-bin`) |
+
 **Note:** As of v0.13.13, `/proc` is no longer bind-mounted. Instead, a fresh container-scoped procfs is mounted at `/host/proc` during entrypoint initialization. This provides dynamic `/proc/self/exe` resolution required by Java and .NET runtimes.
+
+**System CA Bundle Detection:** The entrypoint automatically detects the host system CA bundle from common locations (Debian/Ubuntu `/etc/ssl/certs/ca-certificates.crt`, RHEL/Amazon Linux `/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem`, `/etc/pki/tls/certs/ca-bundle.crt`, `/etc/pki/tls/cert.pem`, macOS `/etc/ssl/cert.pem`). If the bundle is not already accessible in the chroot via the mounted CA paths, it is copied to `/run/awf-lib/system-ca-certificates.crt` and `SSL_CERT_FILE`, `NODE_EXTRA_CA_CERTS`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE`, and `GIT_SSL_CAINFO` are set to point at it.
 
 ### Read-Write Mounts
 
@@ -299,10 +309,14 @@ sudo mv /etc/resolv.conf.awf-backup-* /etc/resolv.conf
 
 | Requirement | Description |
 |-------------|-------------|
+| glibc-based host userspace | Required for chroot execution chain (`capsh` + `bash`) |
 | `capsh` | Must be installed on host (usually in `libcap2-bin` package) |
-| User by UID | Host user must exist in `/etc/passwd` |
+| `/bin/bash` | Must exist and be executable on host |
+| User by UID | Host user should exist in `/etc/passwd` (auto-synthesized in DinD mode if missing) |
 | Docker | Standard Docker requirement |
 | sudo | Required for iptables manipulation |
+
+**Important:** Alpine/musl daemon hosts are not currently supported in chroot mode. AWF now fails fast with a clear startup error when musl/Alpine is detected under `/host`.
 
 ### Installing capsh
 
@@ -324,6 +338,47 @@ sudo dnf install libcap
 ```
 
 **Fix**: Install the `libcap2-bin` package on the host.
+
+### Error: Alpine/musl host detected
+
+```
+[entrypoint][ERROR] AWF chroot mode requires a glibc-based daemon host ...
+```
+
+**Cause**: The Docker daemon host filesystem mounted at `/host` is Alpine/musl-based. Chroot mode currently expects glibc-compatible host binaries for `capsh` and `/bin/bash`.
+
+**Fix**: Run AWF on a glibc-based daemon host (for example Ubuntu/Debian/RHEL-family).
+
+### DinD Identity Synthesis
+
+In ARC (Actions Runner Controller) environments using the DinD (Docker-in-Docker) sidecar pattern, the Docker daemon's filesystem is separate from the runner's. This means `/etc/passwd` and `/etc/group` may not exist or may not contain the runner's UID/GID.
+
+AWF handles this automatically at two layers:
+
+1. **Mount staging** (`etc-mounts.ts`): When `--docker-host-path-prefix` uses a `/tmp/...` prefix (the DinD staging path) and `/etc/passwd` or `/etc/group` cannot be staged from the runner, AWF synthesizes minimal identity files containing `root` and a `runner` entry matching the host UID/GID. If staging succeeds but the staged files are missing the runner UID/GID, AWF supplements them before mounting.
+
+2. **Runtime fallback** (`entrypoint.sh`): If `getent passwd $UID` fails inside the chroot (user not found), the entrypoint attempts to synthesize `/etc/passwd` and `/etc/group` entries. If `/host/etc` is read-only (e.g. ARC/DinD with a tmpfs-backed daemon root), it copies the existing file to `/tmp/awf-etc/`, appends the synthesized entry, and bind-mounts the result over the read-only original. This requires `CAP_SYS_ADMIN`, which is still held at entrypoint time and is dropped by `capsh` before user code runs. If even the bind-mount fails, it falls back to running with numeric `UID:GID` directly.
+
+No configuration is required — synthesis is triggered automatically when user lookup fails.
+
+### Chroot Identity Override (ARC/DinD)
+
+On split-filesystem ARC/DinD runners, you can explicitly override chroot identity values via stdin config:
+
+```json
+{
+  "chroot": {
+    "identity": {
+      "home": "/tmp/gh-aw/home",
+      "user": "runner",
+      "uid": 1001,
+      "gid": 1001
+    }
+  }
+}
+```
+
+AWF forwards these values to the agent entrypoint and applies them **after** `chroot /host`, overriding default `HOME`, `USER`, and `LOGNAME` values for the chrooted command runtime.
 
 ### Error: Working directory does not exist
 

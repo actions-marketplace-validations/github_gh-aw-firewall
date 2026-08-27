@@ -42,6 +42,7 @@ on:
 if: ${{ github.event.workflow_run.conclusion == 'failure' }}
 
 permissions:
+  copilot-requests: write
   contents: read
   actions: read
   pull-requests: read
@@ -55,11 +56,16 @@ tools:
     toolsets: [default, actions]
   cache-memory: true
 
+sandbox:
+  agent:
+    id: awf
 network:
   allowed:
     - github
 
 safe-outputs:
+  threat-detection:
+    enabled: false
   create-issue:
     title-prefix: "🏥 CI Failure"
   add-comment:

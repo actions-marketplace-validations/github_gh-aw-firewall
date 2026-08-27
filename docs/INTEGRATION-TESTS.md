@@ -54,6 +54,20 @@ The test suite is organized in three tiers:
 | Smoke Tests | 4 | N/A | Per-workflow (scheduled + PR) |
 | Build-Test | 8 | N/A | Per-workflow (PR + dispatch) |
 
+### Unified enclave coverage
+
+Legacy bounded smoke and runtime-matrix assets were removed from the owned workflow surface. Until a unified gh-aw enclave smoke workflow exists, coverage for the enclave MCP server and executor contracts stays local/unit-focused:
+
+- `src/services/enclave-mcp-service.test.ts`
+- `src/services/enclave-agent-service.test.ts`
+- `src/enclave/script-runner-spec.test.ts`
+- `src/enclave/agent-runner-spec.test.ts`
+- `src/enclave/manager.test.ts`
+- `src/enclave/mcp-server.test.ts`
+- `src/enclave/agent-mcp-server.test.ts`
+
+These cover the shared tool contract, gVisor routing assumptions, fail-closed `sbx` behavior, and the mcpg-only topology.
+
 ---
 
 ## What's Covered
@@ -178,3 +192,56 @@ Each document provides per-test-case analysis with plain-language descriptions, 
 - **[Container & Operations Tests](test-analysis/container-ops.md)** — Workdir, volumes, git, env vars, logging, Docker availability
 - **[CI & Smoke Tests](test-analysis/ci-smoke.md)** — All 27 CI/smoke/build-test workflows analyzed
 - **[Test Infrastructure](test-analysis/test-infra.md)** — Runner architecture, batch pattern, cleanup strategy, limitations
+
+## Cloud Hypervisor preview integration tests
+
+The Cloud Hypervisor backend has its own separate CI workflow
+(`test-cloud-hypervisor.yml`), scoped to Cloud Hypervisor paths and
+**GitHub-hosted Ubuntu x86_64 runners only**. Self-hosted runners are explicitly
+rejected.
+
+**Trigger:** `workflow_dispatch`, or pull request open/synchronize/reopen/label
+scoped to `guest/cloud-hypervisor/**`, `src/cloud-hypervisor/**`,
+`src/microvm/**`, and the related scripts/docs/workflow files. Only label
+`cloud-hypervisor-kvm` enables the live job. It does **not** run on push or
+schedule.
+
+**Build job** (`ubuntu-24.04`): Builds deterministic guest artifacts — Cloud
+Hypervisor v53.0 binary, the pinned Linux 6.1.141 kernel config, BusyBox 1.36.1
+rootfs, and the shared AWF guest supervisor —
+from pinned, SHA-256 verified sources. Attests provenance. Uploads as a
+7-day workflow artifact (`cloud-hypervisor-test-x86_64`).
+
+**Live job** (`ubuntu-24.04`): Downloads the build artifact, verifies all four
+SHA-256 digests plus GitHub-hosted-only host eligibility (`GITHUB_ACTIONS`,
+`RUNNER_ENVIRONMENT`, `ImageOS`) and Landlock LSM availability, then runs the
+live smoke/security suite. The preflight requires usable KVM and fails closed
+if `/dev/kvm` or another required host capability is unavailable.
+
+Live assertions (see `scripts/ci/cloud-hypervisor-live-smoke.sh`) cover the
+following behavior:
+
+| Case | What it proves |
+|------|---------------|
+| `allowed-https` | Allowed domains reach the internet through Squid |
+| `blocked-domain` | Non-allowlisted domains are blocked |
+| `direct-egress` | Bypassing proxy env vars does not enable direct egress |
+| `arbitrary-tcp` | Raw TCP to arbitrary IPs is blocked |
+| `dns-denial` | Direct DNS (8.8.8.8:53) is blocked from the guest |
+| `metadata-denial` | Instance metadata IP (`169.254.169.254`) is unreachable |
+| `api-proxy-reflect` | API proxy `/reflect` reachable; secret sentinel not in output |
+| `workspace-copyback` | Guest file writes, permission changes, and symlinks survive copy-back |
+| `exit-code` | Agent exit code propagates faithfully (37 → 37) |
+| `timeout-124` | Timed-out agent exits 124 |
+| `device-assumptions` **(CH-only)** | `/dev/vda`/`/dev/vdb` and `eth0` guest device assumptions hold |
+| `partial-start-cleanup` | Corrupt rootfs causes clean failure; no residue |
+| `cancellation` | `SIGTERM` cleans up residue within a non-flaky time ceiling; exits 143 |
+| `keep` | `--keep-containers` preserves namespace/run-directory; diagnostics ≤1 MiB |
+| `security-assertions` **(CH-only)** | Live jailer-replacement boundary: non-root uid, `CapEff` limited to `CAP_NET_ADMIN` alone, `no_new_privs`, active seccomp filter, per-run cgroup membership/bounded memory, `landlock_enable` + exactly-minimal disk/net/vsock topology via `vm.info` |
+
+After every case, the suite asserts no `awfvm-*` namespaces,
+`vmh*`/`vmn*`/`vmt*` interfaces, `awf-cloud-hypervisor` cgroup entries, or
+`cloud-hypervisor` processes remain. The suite also scans output for the secret
+sentinel (`awf-cloud-hypervisor-real-secret-do-not-expose`). See
+[Cloud Hypervisor integration (preview)](../docs/cloud-hypervisor-foundation.md#part-14--ci-workflow)
+for the full CI workflow specification.

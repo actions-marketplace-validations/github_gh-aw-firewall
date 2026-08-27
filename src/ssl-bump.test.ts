@@ -2,10 +2,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
 import execa from 'execa';
-import { parseUrlPatterns, generateSessionCa, initSslDb, isOpenSslAvailable, secureWipeFile, cleanupSslKeyMaterial, chownRecursive, unmountSslTmpfs } from './ssl-bump';
-
-// Pattern constant for the safer URL character class (matches the implementation)
-const URL_CHAR_PATTERN = '[^\\s]*';
+import { generateSessionCa, initSslDb, isOpenSslAvailable, cleanupSslKeyMaterial, unmountSslTmpfs } from './ssl-bump';
 
 // Mock execa for testing OpenSSL operations
 jest.mock('execa');
@@ -53,71 +50,6 @@ beforeEach(() => {
 });
 
 describe('SSL Bump', () => {
-  describe('parseUrlPatterns', () => {
-    it('should escape regex special characters except wildcards', () => {
-      const patterns = parseUrlPatterns(['https://github.com/user']);
-      expect(patterns).toEqual(['^https://github\\.com/user$']);
-    });
-
-    it('should convert * wildcard to safe regex pattern', () => {
-      const patterns = parseUrlPatterns(['https://github.com/myorg/*']);
-      expect(patterns).toEqual([`^https://github\\.com/myorg/${URL_CHAR_PATTERN}`]);
-    });
-
-    it('should handle multiple wildcards', () => {
-      const patterns = parseUrlPatterns(['https://api-*.example.com/*']);
-      expect(patterns).toEqual([`^https://api-${URL_CHAR_PATTERN}\\.example\\.com/${URL_CHAR_PATTERN}`]);
-    });
-
-    it('should remove trailing slash for consistency', () => {
-      const patterns = parseUrlPatterns(['https://github.com/']);
-      expect(patterns).toEqual(['^https://github\\.com$']);
-    });
-
-    it('should handle exact match patterns', () => {
-      const patterns = parseUrlPatterns(['https://api.example.com/v1/users']);
-      expect(patterns).toEqual(['^https://api\\.example\\.com/v1/users$']);
-    });
-
-    it('should handle query parameters', () => {
-      const patterns = parseUrlPatterns(['https://api.example.com/v1?key=value']);
-      expect(patterns).toEqual(['^https://api\\.example\\.com/v1\\?key=value$']);
-    });
-
-    it('should escape dots in domain names', () => {
-      const patterns = parseUrlPatterns(['https://sub.domain.example.com/path']);
-      expect(patterns).toEqual(['^https://sub\\.domain\\.example\\.com/path$']);
-    });
-
-    it('should handle multiple patterns', () => {
-      const patterns = parseUrlPatterns([
-        'https://github.com/myorg/*',
-        'https://api.example.com/v1/*',
-      ]);
-      expect(patterns).toHaveLength(2);
-      expect(patterns[0]).toBe(`^https://github\\.com/myorg/${URL_CHAR_PATTERN}`);
-      expect(patterns[1]).toBe(`^https://api\\.example\\.com/v1/${URL_CHAR_PATTERN}`);
-    });
-
-    it('should handle empty array', () => {
-      const patterns = parseUrlPatterns([]);
-      expect(patterns).toEqual([]);
-    });
-
-    it('should anchor patterns correctly for exact matches', () => {
-      const patterns = parseUrlPatterns(['https://github.com/exact']);
-      // Should have both start and end anchors for exact matches
-      expect(patterns[0]).toBe('^https://github\\.com/exact$');
-    });
-
-    it('should not add end anchor for wildcard patterns', () => {
-      const patterns = parseUrlPatterns(['https://github.com/*']);
-      // Should only have start anchor for patterns ending with the URL char pattern
-      expect(patterns[0]).toBe(`^https://github\\.com/${URL_CHAR_PATTERN}`);
-      expect(patterns[0]).not.toContain('$');
-    });
-  });
-
   describe('generateSessionCa', () => {
     let tempDir: string;
 
@@ -330,34 +262,6 @@ describe('SSL Bump', () => {
 
   });
 
-  describe('chownRecursive', () => {
-    let tempDir: string;
-
-    beforeEach(() => {
-      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'chown-test-'));
-    });
-
-    afterEach(() => {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    });
-
-    it('should attempt to chown a directory and its contents', () => {
-      // Create directory structure
-      const subDir = path.join(tempDir, 'subdir');
-      fs.mkdirSync(subDir);
-      fs.writeFileSync(path.join(tempDir, 'file1.txt'), 'test');
-      fs.writeFileSync(path.join(subDir, 'file2.txt'), 'test');
-
-      // chownRecursive will throw EPERM when not root, but it should
-      // attempt to chown the root directory first
-      expect(() => chownRecursive(tempDir, 13, 13)).toThrow(/EPERM/);
-    });
-
-    it('should throw for non-existent directory', () => {
-      expect(() => chownRecursive('/tmp/nonexistent-chown-test', 13, 13)).toThrow();
-    });
-  });
-
   describe('isOpenSslAvailable', () => {
     it('should return true when OpenSSL is available', async () => {
       const result = await isOpenSslAvailable();
@@ -371,41 +275,6 @@ describe('SSL Bump', () => {
 
       const result = await isOpenSslAvailable();
       expect(result).toBe(false);
-    });
-  });
-
-  describe('secureWipeFile', () => {
-    let tempDir: string;
-
-    beforeEach(() => {
-      tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wipe-test-'));
-    });
-
-    afterEach(() => {
-      fs.rmSync(tempDir, { recursive: true, force: true });
-    });
-
-    it('should overwrite and delete a file', () => {
-      const filePath = path.join(tempDir, 'secret.key');
-      fs.writeFileSync(filePath, 'SECRET KEY DATA');
-
-      secureWipeFile(filePath);
-
-      expect(fs.existsSync(filePath)).toBe(false);
-    });
-
-    it('should handle non-existent files gracefully', () => {
-      const filePath = path.join(tempDir, 'nonexistent.key');
-      expect(() => secureWipeFile(filePath)).not.toThrow();
-    });
-
-    it('should handle empty files', () => {
-      const filePath = path.join(tempDir, 'empty.key');
-      fs.writeFileSync(filePath, '');
-
-      secureWipeFile(filePath);
-
-      expect(fs.existsSync(filePath)).toBe(false);
     });
   });
 

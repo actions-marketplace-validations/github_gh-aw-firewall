@@ -11,7 +11,7 @@ import * as yaml from 'js-yaml';
 /**
  * A single domain rule within a ruleset
  */
-export interface Rule {
+interface Rule {
   /** Domain name to allow (e.g., "github.com") */
   domain: string;
   /**
@@ -25,7 +25,7 @@ export interface Rule {
 /**
  * Top-level structure of a YAML ruleset file
  */
-export interface RuleSet {
+interface RuleSet {
   /** Schema version (must be 1) */
   version: number;
   /** Array of domain rules */
@@ -39,7 +39,7 @@ export interface RuleSet {
  * @returns Parsed and validated RuleSet
  * @throws Error if the file doesn't exist, contains invalid YAML, or fails validation
  */
-export function loadRuleSet(filePath: string): RuleSet {
+function loadRuleSet(filePath: string): RuleSet {
   if (!fs.existsSync(filePath)) {
     throw new Error(`Ruleset file not found: ${filePath}`);
   }
@@ -145,7 +145,7 @@ export function loadRuleSet(filePath: string): RuleSet {
  * @param rule - A single domain rule
  * @returns Array of domain strings
  */
-export function expandRule(rule: Rule): string[] {
+function expandRule(rule: Rule): string[] {
   // The existing system already handles subdomain matching when a plain
   // domain is provided (e.g., "github.com" matches both github.com and
   // *.github.com in Squid config). So we just return the domain.
@@ -158,7 +158,7 @@ export function expandRule(rule: Rule): string[] {
  * @param ruleSets - Array of parsed RuleSet objects
  * @returns Array of unique domain strings
  */
-export function mergeRuleSets(ruleSets: RuleSet[]): string[] {
+function mergeRuleSets(ruleSets: RuleSet[]): string[] {
   const domains = new Set<string>();
 
   for (const ruleSet of ruleSets) {

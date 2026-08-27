@@ -6,6 +6,7 @@
 sudo awf [options] -- <command>
 
 Options:
+  --config <path>              Path to AWF JSON/YAML config file (use "-" to read from stdin)
   -d, --allow-domains <domains>  Comma-separated list of allowed domains. Supports wildcards and protocol prefixes:
                              - github.com: exact domain + subdomains (HTTP & HTTPS)
                              - *.github.com: any subdomain of github.com
@@ -36,32 +37,60 @@ Options:
                                  ghcr.io/catthehacker/ubuntu:full-XX.XX
   --image-registry <registry>  Container image registry (default: ghcr.io/github/gh-aw-firewall)
   --image-tag <tag>            Container image tag (default: latest)
-                               Image name varies by --agent-image preset:
-                                 default → agent:<tag>
-                                 act     → agent-act:<tag>
+                               Optional digest metadata:
+                                 <tag>,squid=sha256:...,agent=sha256:...,agent-act=sha256:...,api-proxy=sha256:...,cli-proxy=sha256:...
+                                 Supported digest metadata keys: squid, agent, agent-act, api-proxy, cli-proxy
+                                 Image name varies by --agent-image preset:
+                                   default → agent:<tag>
+                                   act     → agent-act:<tag>
   --skip-pull                  Use local images without pulling from registry (requires images to be
-                               pre-downloaded) (default: false)
+                                pre-downloaded) (default: false)
+  --docker-host <socket>       Docker socket for AWF's own containers (default: auto-detect from
+                               DOCKER_HOST env). Example: unix:///run/user/1000/docker.sock
   -e, --env <KEY=VALUE>        Additional environment variables to pass to container (can be
-                               specified multiple times)
+                                specified multiple times)
   --env-all                    Pass all host environment variables to container (excludes system vars
-                               like PATH) (default: false)
-  -v, --mount <path:path>      Volume mount (can be specified multiple times). Format:
-                               host_path:container_path[:ro|rw]
+                                like PATH) (default: false)
+  --exclude-env <name>         Exclude a specific environment variable from --env-all passthrough
+                               (can be specified multiple times)
+  --env-file <path>            Read environment variables from a file (KEY=VALUE format, one per line)
+  -v, --mount <host_path:container_path[:ro|rw]>  Volume mount (can be specified multiple times). Format:
+                                host_path:container_path[:ro|rw]
   --container-workdir <dir>    Working directory inside the container (should match GITHUB_WORKSPACE
                                for path consistency)
   --dns-servers <servers>      Comma-separated list of trusted DNS servers. DNS traffic is ONLY
-                               allowed to these servers (default: 8.8.8.8,8.8.4.4)
+                               allowed to these servers (default: auto-detected from host resolvers,
+                               falls back to 8.8.8.8,8.8.4.4)
+  --upstream-proxy <url>       Upstream (corporate) proxy URL for Squid to chain through.
+                               Auto-detected from host https_proxy/http_proxy if not set.
   --proxy-logs-dir <path>      Directory to save Squid proxy logs to (writes access.log directly to
-                               this directory)
+                                this directory)
+  --audit-dir <path>           Directory for firewall audit artifacts (configs, policy manifest,
+                               iptables state)
+  --session-state-dir <path>   Directory to save Copilot CLI session state (events.jsonl, session
+                                data). Writes directly during execution (timeout-safe, predictable
+                                path). Also configurable via AWF_SESSION_STATE_DIR env var.
   --enable-host-access         Enable access to host services via host.docker.internal. Security
                                warning: When combined with --allow-domains host.docker.internal,
                                containers can access ANY service on the host machine. (default: false)
+  --network-isolation          Experimental: enforce egress via Docker network topology (an
+                               internal network with no internet route plus a dual-homed Squid
+                               proxy) instead of host iptables. Requires no sudo / NET_ADMIN, so it
+                               works inside ARC / Kubernetes DinD runners. Not yet supported with
+                               --dns-over-https or --enable-host-access. (default: false)
+  --topology-attach <name>     With --network-isolation, attach an externally-launched trusted
+                               container (by name) to the internal network so the agent can reach
+                               it without giving it an egress path. Repeatable. Example:
+                               --topology-attach mcp-gateway --topology-attach difc-proxy
   --allow-host-ports <ports>   Comma-separated list of ports or port ranges to allow when using
-                               --enable-host-access. By default, only ports 80 and 443 are allowed.
-                               Example: --allow-host-ports 3000 or --allow-host-ports 3000,8080 or
-                               --allow-host-ports 3000-3010,8000-8090
+                                --enable-host-access. By default, only ports 80 and 443 are allowed.
+                                Example: --allow-host-ports 3000 or --allow-host-ports 3000,8080 or
+                                --allow-host-ports 3000-3010,8000-8090
+  --allow-host-service-ports <ports> Comma-separated ports to allow ONLY to host gateway
+                               (for GitHub Actions services). Auto-enables host access.
+                               Example: --allow-host-service-ports 5432,6379
   --ssl-bump                   Enable SSL Bump for HTTPS content inspection (allows URL path
-                               filtering for HTTPS) (default: false)
+                                filtering for HTTPS) (default: false)
   --allow-urls <urls>          Comma-separated list of allowed URL patterns for HTTPS (requires --ssl-bump).
                                Supports wildcards: https://github.com/myorg/*
   --enable-api-proxy           Enable API proxy sidecar for holding authentication credentials.
@@ -70,22 +99,47 @@ Options:
   --copilot-api-target <host>  Target hostname for Copilot API requests
                                (default: api.githubcopilot.com)
   --openai-api-target <host>   Target hostname for OpenAI API requests (default: api.openai.com)
+  --openai-api-base-path <path> Base path prefix for OpenAI API requests
   --anthropic-api-target <host> Target hostname for Anthropic API requests
-                               (default: api.anthropic.com)
+                                (default: api.anthropic.com)
+  --anthropic-api-base-path <path> Base path prefix for Anthropic API requests
+  --gemini-api-target <host>   Target hostname for Gemini API requests
+                               (default: generativelanguage.googleapis.com)
+  --gemini-api-base-path <path> Base path prefix for Gemini API requests
+  --anthropic-auto-cache       Enable Anthropic prompt-cache optimizations in the API proxy
+                               (requires --enable-api-proxy). Injects cache breakpoints on
+                               tools/system/messages, upgrades TTL to 1h, and strips ANSI codes
+                               — typically saves ~90% on Anthropic API input costs. (default: false)
+  --anthropic-cache-tail-ttl <5m|1h>
+                               TTL for the rolling-tail cache breakpoint when
+                               --anthropic-auto-cache is enabled. Use "5m" (default) for fast
+                               interactive sessions, "1h" for long agentic tasks.
   --rate-limit-rpm <n>         Max requests per minute per provider (requires --enable-api-proxy)
   --rate-limit-rph <n>         Max requests per hour per provider (requires --enable-api-proxy)
   --rate-limit-bytes-pm <n>    Max request bytes per minute per provider (requires --enable-api-proxy)
   --no-rate-limit              Disable rate limiting in the API proxy (requires --enable-api-proxy)
+  --difc-proxy-host <host:port> Connect to an external DIFC proxy (Multi-Cloud Proxy Gateway, "mcpg")
+                               and enable the CLI proxy sidecar for gh command routing
+  --difc-proxy-ca-cert <path>  Path to TLS CA cert written by external DIFC proxy
   --ruleset-file <path>        YAML rule file for domain allowlisting (repeatable).
-                               Schema: version: 1, rules: [{domain, subdomains}]
+                                Schema: version: 1, rules: [{domain, subdomains}]
   --dns-over-https [url]       Enable DNS-over-HTTPS via sidecar proxy
                                (default: https://dns.google/dns-query)
-  --memory-limit <limit>       Memory limit for the agent container (default: 2g)
-                               Examples: 1g, 4g, 512m
+  --memory-limit <limit>       Memory limit for the agent container (default: 6g)
+                                Examples: 1g, 4g, 512m
+  --pids-limit <limit>         Process/thread ceiling for the agent container (default: 1000)
+                                Increase for JVM-heavy builds (javac, Android manifest
+                                merger) that hit "unable to create native thread" errors
   --enable-dind                Enable Docker-in-Docker by exposing host Docker socket.
                                WARNING: allows firewall bypass via docker run (default: false)
+  --docker-host-path-prefix <prefix>  Prefix bind-mount source paths so the Docker daemon can
+                               resolve runner filesystem paths. Required for split
+                               runner/daemon filesystems (e.g. ARC DinD sidecars).
+                               Example: --docker-host-path-prefix /host
   --enable-dlp                 Enable DLP (Data Loss Prevention) scanning to block credential
-                               exfiltration in outbound request URLs. (default: false)
+                                exfiltration in outbound request URLs. (default: false)
+  --diagnostic-logs            Collect container logs, exit state, and sanitized config on non-zero
+                               exit. Written to <workDir>/diagnostics/ (or <audit-dir>/diagnostics/)
   -V, --version                Output the version number
   -h, --help                   Display help for command
 
@@ -93,6 +147,13 @@ Arguments:
   command                      Command to execute (wrap in quotes, use -- separator)
 
 Commands:
+  predownload [options]        Pre-download Docker images for offline use or faster startup
+    --image-registry <registry> Container image registry (default: ghcr.io/github/gh-aw-firewall)
+    --image-tag <tag>          Container image tag (default: latest)
+    --agent-image <value>      Agent image preset (default, act) or custom image
+    --enable-api-proxy         Also download the API proxy image
+    --difc-proxy               Also download the CLI proxy image (for --difc-proxy-host)
+
   logs [options]               View and analyze Squid proxy logs
     -f, --follow               Follow log output in real-time (like tail -f)
     --format <format>          Output format: raw, pretty (colorized), json
@@ -107,6 +168,13 @@ Commands:
   logs summary [options]       Generate summary report (markdown by default)
     --format <format>          Output format: json, markdown, pretty
     --source <path>            Path to log directory or "running" for live container
+
+  logs audit [options]         Show firewall audit with policy rule matching
+    --format <format>          Output format: json, markdown, pretty
+    --source <path>            Path to log directory or "running" for live container
+    --rule <id>                Filter to specific rule ID
+    --domain <domain>          Filter to specific domain
+    --decision <decision>      Filter to "allowed" or "denied"
 ```
 
 ## Basic Examples
@@ -394,6 +462,28 @@ sudo awf \
 **Note:** When `--enable-host-access` is enabled without `--allow-host-ports`, all ports on `host.docker.internal` are currently allowed. Use `--allow-host-ports` to explicitly restrict which ports can be accessed (e.g., `--allow-host-ports 80,443,8080` for web services and an MCP gateway).
 
 > **Security Note:** A future update will change the default behavior to only allow ports 80 and 443 unless `--allow-host-ports` is specified. Explicitly set `--allow-host-ports` now to ensure consistent behavior across versions.
+
+### Example: GitHub Actions `services:` Container in Strict Mode
+
+`--allow-host-ports` works standalone with `--enable-host-access` in strict
+security mode (the default, without `--legacy-security`/`--network-isolation`
+disabled). Direct raw-protocol access to a GitHub Actions `services:` container
+is not available in strict (`--network-isolation`) mode: the isolated agent has
+no `host.docker.internal` route, and clients such as `psql` cannot use Squid's
+HTTP proxy protocol. Use legacy security or a separately verified tunnel. For
+example, to reach a Postgres service container with legacy security:
+
+```bash
+# GitHub Actions services: postgres:
+#   ports: ["5432:5432"]
+
+awf \
+  --legacy-security \
+  --enable-host-access \
+  --allow-host-ports 5432 \
+  --allow-domains host.docker.internal \
+  -- psql -h host.docker.internal -p 5432 -U postgres -c 'select 1'
+```
 
 ### CONNECT Method on Port 80
 
@@ -786,6 +876,48 @@ sudo awf --allow-domains echo.websocket.events "wscat -c wss://echo.websocket.ev
 sudo awf --allow-domains github.com "npm install -g wscat && wscat -c wss://echo.websocket.events"
 ```
 
+### Workflow-Scope DinD Incompatibility
+
+Setting `DOCKER_HOST` to an external TCP daemon (e.g. a DinD service container) at
+**workflow scope** is incompatible with AWF and will be rejected at startup with an
+error like:
+
+```
+❌ DOCKER_HOST is set to an external daemon (tcp://localhost:2375). AWF requires the
+local Docker daemon (default socket). Workflow-scope DinD is incompatible with AWF's
+network isolation model.
+```
+
+**Why it is incompatible:**
+
+AWF manages its own Docker network (`172.30.0.0/24`) and iptables NAT rules that must
+run on the host runner's network namespace.  When `DOCKER_HOST` points at a DinD TCP
+daemon, `docker compose` routes all container creation through that daemon's isolated
+network namespace, which breaks:
+
+- AWF's fixed subnet routing (the subnet is inside the DinD namespace, unreachable from the runner)
+- The iptables DNAT rules configured by `awf-iptables-init` (they run in the wrong namespace)
+- Port-binding expectations used for container-to-container communication
+
+**Workaround:**
+
+If the agent command itself needs to run Docker, use `--enable-dind` to mount the host
+Docker socket into the agent container rather than configuring DinD at workflow scope:
+
+```bash
+# ✓ Use --enable-dind to allow docker commands inside the agent
+sudo awf --enable-dind --allow-domains registry-1.docker.io -- docker run hello-world
+```
+
+> **⚠️ Security warning:** `--enable-dind` allows the agent to bypass firewall
+> restrictions by spawning containers that are not subject to the firewall's network
+> rules.  Only enable it for trusted workloads that genuinely need Docker access.
+
+> **ARC/DinD (split runner/daemon filesystem):** If you are running AWF on an ARC
+> runner where the runner pod and the Docker daemon have separate filesystems, see
+> [docs/arc-dind.md](arc-dind.md) for the correct configuration using
+> `--docker-host-path-prefix`, `runner.topology: arc-dind`, and sysroot staging.
+
 ## IP-Based Access
 
 Direct IP access (without domain names) is blocked:
@@ -845,6 +977,15 @@ sudo awf \
 - Location: `/tmp/awf-agent-logs-<timestamp>/`
 - View with: `cat /tmp/awf-agent-logs-<timestamp>/*.log`
 
+**Agent Session State:**
+- Contains structured conversation data written by Copilot CLI (e.g., `events.jsonl`)
+- Default location: `/tmp/awf-agent-session-state-<timestamp>/`
+- View with: `cat /tmp/awf-agent-session-state-<timestamp>/events.jsonl`
+- Useful for triage dashboards, benchmarking, and debugging Copilot CLI runs
+- Use `--session-state-dir <path>` (or `AWF_SESSION_STATE_DIR`) to write session state to a
+  predictable path during execution — ideal for artifact upload in GitHub Actions where the
+  runner may time out before cleanup completes
+
 **Squid Logs:**
 - Contains all HTTP/HTTPS traffic (allowed and denied)
 - Location: `/tmp/squid-logs-<timestamp>/`
@@ -859,9 +1000,15 @@ sudo cat /tmp/squid-logs-<timestamp>/access.log
 ```
 
 **How it works:**
-- GitHub Copilot CLI writes to `~/.copilot/logs/`, Squid writes to `/var/log/squid/`
-- Volume mounts map these to `${workDir}/agent-logs/` and `${workDir}/squid-logs/`
-- Before cleanup, logs are automatically moved to `/tmp/awf-agent-logs-<timestamp>/` and `/tmp/squid-logs-<timestamp>/` (if they exist)
+- GitHub Copilot CLI writes to `~/.copilot/logs/` and `~/.copilot/session-state/`; Squid writes to `/var/log/squid/`
+- Volume mounts map container paths to:
+  - `${workDir}/agent-logs/` → `~/.copilot/logs/`
+  - `${workDir}/agent-session-state/` → `~/.copilot/session-state/`
+  - `${workDir}/squid-logs/` → `/var/log/squid/`
+- Before cleanup, non-empty directories are automatically moved to timestamped `/tmp` paths:
+  - `/tmp/awf-agent-logs-<timestamp>/`
+  - `/tmp/awf-agent-session-state-<timestamp>/`
+  - `/tmp/squid-logs-<timestamp>/`
 - Empty log directories are not preserved (avoids cluttering /tmp)
 
 ### Keep Containers for Inspection
@@ -1055,6 +1202,32 @@ awf logs summary >> $GITHUB_STEP_SUMMARY
 ```
 
 This creates a collapsible summary in your GitHub Actions workflow output showing all allowed and blocked domains.
+
+### Using `awf logs audit` (Policy Rule Matching)
+
+Enrich firewall logs with policy rule matching to see which specific rule caused each allow/deny decision. Requires a `policy-manifest.json` generated alongside the log files (available when using `--audit-dir`):
+
+```bash
+# Pretty terminal output (default)
+awf logs audit
+
+# JSON format for scripting
+awf logs audit --format json
+
+# Markdown format (for GitHub Actions step summaries)
+awf logs audit --format markdown
+
+# Filter by rule ID
+awf logs audit --rule domain-allowlist
+
+# Filter by domain
+awf logs audit --domain github.com
+
+# Show only denied requests
+awf logs audit --decision denied
+```
+
+> **Note**: `awf logs audit` requires a `policy-manifest.json` file. Run awf with `--audit-dir <path>` to generate audit artifacts, then point `--source` at that directory.
 
 ### Manual Log Queries
 

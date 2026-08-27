@@ -47,17 +47,23 @@ The firewall uses a containerized architecture with Squid proxy for L7 (HTTP/HTT
 
 ### 2. Configuration Generation
 - **`src/squid-config.ts`**: Generates Squid proxy configuration with domain ACL rules
-- **`src/docker-manager.ts`**: Generates Docker Compose YAML with two services (squid-proxy, agent)
+- **`src/compose-generator.ts`**: Generates Docker Compose YAML with two services (squid-proxy, agent)
 - All configs are written to a temporary work directory (default: `/tmp/awf-<timestamp>`)
 
-### 3. Docker Management (`src/docker-manager.ts`)
-- Manages container lifecycle using `execa` to run docker-compose commands
+### 3. Docker Management
+- **`src/container-lifecycle.ts`**: Manages container startup and agent command execution using `execa`
+- **`src/container-cleanup.ts`**: Handles container teardown, log collection, and cleanup
+- **`src/host-env.ts`**: Host environment utilities (UID/GID mapping, env passthrough, filesystem helpers)
+- **`src/services/`**: Service classes for each container (Squid, agent, API proxy, CLI proxy, DoH proxy)
 - Fixed network topology: `172.30.0.0/24` subnet, Squid at `172.30.0.10`, Agent at `172.30.0.20`
 - Squid container uses healthcheck; Agent waits for Squid to be healthy before starting
+- `src/docker-manager.ts` re-exports the public API from the above modules for backward compatibility
 
-### 4. Type Definitions (`src/types.ts`)
-- `WrapperConfig`: Main configuration interface
-- `SquidConfig`, `DockerComposeConfig`: Typed configuration objects
+### 4. Type Definitions (`src/types/`)
+- `WrapperConfig`: Main configuration interface (`src/types/wrapper-config.ts`)
+- API/CLI proxy port constants (`src/types/ports.ts`)
+- Docker Compose types (`src/types/docker.ts`)
+- Logging, policy, and PID types in separate modules
 
 ### 5. Logging (`src/logger.ts`)
 - Singleton logger with configurable log levels (debug, info, warn, error)
@@ -67,7 +73,7 @@ The firewall uses a containerized architecture with Squid proxy for L7 (HTTP/HTT
 ## Container Architecture
 
 ### Squid Container (`containers/squid/`)
-- Based on `ubuntu/squid:latest`
+- Based on `alpine:3.24` with Squid installed from Alpine packages
 - Mounts dynamically-generated `squid.conf` from work directory
 - Exposes port 3128 for proxy traffic
 - Logs to shared volume `squid-logs:/var/log/squid`
@@ -88,6 +94,17 @@ The firewall uses a containerized architecture with Squid proxy for L7 (HTTP/HTT
   - Allow DNS queries
   - Allow traffic to Squid proxy itself
   - Redirect all HTTP (port 80) and HTTPS (port 443) to Squid via DNAT (NAT table)
+
+### gVisor Startup Crash Recovery
+
+When the firewall is running with gVisor runtime, it implements automatic recovery for transient startup crashes:
+
+- **Retryable Exit Codes:** Exit codes 134 (abort) and 139 (segmentation fault) are treated as startup crashes
+- **Startup Window:** Only eligible exits from containers whose measured runtime is less than 30 seconds are retried; runtime is used as a heuristic for an initialization crash and does not prove that user code has not started
+- **Retry Limit:** The container will be restarted once (maximum 1 retry attempt per command execution)
+- **Implementation:** Located in `src/container-lifecycle.ts`
+
+This recovery mechanism retries likely transient initialization failures. If a retry occurs, the command's final exit code is taken from the restarted attempt.
 
 ## Traffic Flow
 
@@ -121,6 +138,11 @@ The wrapper generates:
 1. **Squid proxy starts first** with healthcheck
 2. **Agent container waits** for Squid to be healthy
 3. **iptables rules applied** in agent container to redirect all HTTP/HTTPS traffic
+4. **gVisor Startup Crash Recovery** (when using gVisor runtime):
+   - If the agent container exits during startup with crash codes (134, 139), the firewall will retry once
+   - Only retries if the container crashed within 30 seconds (before any agent work began)
+   - Prevents transient crashes during V8/Node.js initialization from failing the entire workflow
+   - Exit codes 134 (abort) and 139 (segfault) are considered retryable startup crashes
 
 ### 3. Traffic Routing
 - All HTTP (port 80) and HTTPS (port 443) traffic → Squid proxy
@@ -217,3 +239,23 @@ Use `--keep-containers` to preserve containers and files after execution for deb
 - `execa`: Subprocess execution (docker-compose commands)
 - `js-yaml`: YAML generation for Docker Compose config
 - TypeScript 5.x, compiled to ES2020 CommonJS
+
+## Cloud Hypervisor microVM runtime (preview)
+
+With `--container-runtime cloud-hypervisor --cloud-hypervisor-preview`, AWF
+runs the agent in a hardware-isolated microVM:
+
+- Squid and the API proxy remain Docker Compose services on the host.
+- A sandboxed `virtiofsd` exports the workspace read-write to `/workspace`.
+- A dedicated `awfvm-<runId>` network namespace contains `vmh*`, `vmn*`, and
+  `vmt*` veth/TAP interfaces. nftables permits access only to Squid and the API
+  proxy.
+- The mandatory API proxy keeps provider credentials out of the guest
+  environment.
+- The VMM runs as a non-root identity with `no_new_privs`, a minimal capability
+  set, Landlock filesystem rules, seccomp, and explicit cgroup v2 limits.
+- The preview supports only GitHub-hosted Ubuntu x86_64 KVM runners and fails
+  closed on unsupported hosts or missing artifacts.
+
+See [Cloud Hypervisor integration](./cloud-hypervisor-foundation.md) for the
+complete architecture, trust model, and operator guide.

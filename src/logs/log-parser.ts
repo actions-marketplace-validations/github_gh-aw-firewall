@@ -105,7 +105,7 @@ export function parseLogLine(line: string): ParsedLogEntry | null {
  * @param method - HTTP method
  * @returns Extracted domain name without port
  */
-export function extractDomain(url: string, host: string, method: string): string {
+function extractDomain(url: string, host: string, method: string): string {
   if (method === 'CONNECT') {
     // For CONNECT, URL is domain:port
     const colonIndex = url.lastIndexOf(':');
@@ -143,29 +143,11 @@ export function extractDomain(url: string, host: string, method: string): string
 }
 
 /**
- * Extracts the port from a domain:port string or URL
- *
- * @param url - URL field or domain:port string
- * @param method - HTTP method
- * @returns Port number string or undefined
- */
-export function extractPort(url: string, method: string): string | undefined {
-  if (method === 'CONNECT') {
-    const colonIndex = url.lastIndexOf(':');
-    if (colonIndex !== -1) {
-      const possiblePort = url.substring(colonIndex + 1);
-      if (/^\d+$/.test(possiblePort)) {
-        return possiblePort;
-      }
-    }
-  }
-  return undefined;
-}
-
-/**
  * Parses a single line from the JSONL audit log (audit.jsonl).
  *
- * Format: {"ts":1761074374.646,"client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}
+ * Format:
+ * - Current: {"timestamp":"2026-05-25T09:00:00.000Z","event":"http_access","client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}
+ * - Legacy:  {"ts":1761074374.646,"client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}
  *
  * @param line - Raw JSONL line
  * @returns Parsed log entry or null if parsing failed
@@ -228,8 +210,21 @@ export function parseAuditJsonlLine(line: string): ParsedLogEntry | null {
     const host = obj.host || '-';
     const domain = extractDomain(url, host, method);
 
+    let timestamp = 0;
+    if (typeof obj.timestamp === 'string') {
+      const parsed = Date.parse(obj.timestamp);
+      if (!Number.isNaN(parsed)) {
+        timestamp = parsed / 1000;
+      } else if (typeof obj.ts === 'number') {
+        // timestamp string present but invalid; fall back to legacy epoch field
+        timestamp = obj.ts;
+      }
+    } else if (typeof obj.ts === 'number') {
+      timestamp = obj.ts;
+    }
+
     return {
-      timestamp: obj.ts || 0,
+      timestamp,
       clientIp: obj.client || '-',
       clientPort: '-', // Not in JSONL format
       host,

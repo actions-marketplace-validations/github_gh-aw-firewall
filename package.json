@@ -24,7 +24,10 @@
     "docs:dev": "cd docs-site && npm run dev",
     "docs:build": "cd docs-site && npm run build",
     "docs:preview": "cd docs-site && npm run preview",
-    "benchmark": "npx tsx scripts/ci/benchmark-performance.ts"
+    "benchmark": "npx tsx scripts/ci/benchmark-performance.ts",
+    "benchmark:trend": "npx tsx scripts/ci/benchmark-trend.ts",
+    "build:bundle": "npm run build && node scripts/build-bundle.mjs",
+    "generate:schema": "node scripts/generate-schema.mjs"
   },
   "keywords": [
     "agentic-workflows",
@@ -43,48 +46,53 @@
   "author": "GitHub",
   "license": "MIT",
   "dependencies": {
+    "ajv": "8.20.0",
     "chalk": "^4.1.2",
-    "commander": "^12.0.0",
+    "commander": "^12.1.0",
     "execa": "^5.1.1",
-    "js-yaml": "^4.1.1"
+    "js-yaml": "^5.4.0"
   },
   "devDependencies": {
-    "@babel/core": "^7.29.0",
-    "@babel/preset-env": "^7.29.0",
-    "@commitlint/cli": "^20.4.1",
-    "@commitlint/config-conventional": "^20.4.1",
-    "@eslint/compat": "^2.0.0",
-    "@eslint/js": "^10.0.0",
+    "@babel/core": "^7.29.7",
+    "@babel/preset-env": "^7.29.7",
+    "@commitlint/cli": "^20.5.3",
+    "@commitlint/config-conventional": "^20.5.3",
+    "@eslint/compat": "^2.1.0",
+    "@eslint/js": "^10.0.1",
     "@types/glob": "^9.0.0",
     "@types/jest": "^30.0.0",
-    "@types/js-yaml": "^4.0.5",
-    "@types/node": "^25.2.3",
-    "@typescript-eslint/eslint-plugin": "^8.55.0",
-    "@typescript-eslint/parser": "^8.55.0",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^25.9.5",
+    "@typescript-eslint/eslint-plugin": "^8.68.0",
+    "@typescript-eslint/parser": "^8.68.0",
     "babel-jest": "^30.2.0",
-    "eslint": "^10.0.0",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.9.1",
     "eslint-plugin-security": "^3.0.1",
-    "glob": "^13.0.1",
-    "globals": "^17.0.0",
+    "glob": "^13.0.6",
+    "globals": "^17.9.0",
     "husky": "^9.1.7",
-    "jest": "^30.2.0",
-    "markdownlint-cli2": "^0.21.0",
-    "ts-jest": "^29.4.6",
-    "typescript": "^5.0.0",
-    "typescript-eslint": "^8.0.0"
+    "jest": "^30.4.2",
+    "markdownlint-cli2": "^0.23.2",
+    "ts-jest": "^29.4.12",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0"
   },
   "overrides": {
     "test-exclude": "^7.0.1",
-    "minimatch": ">=10.2.1"
+    "minimatch": ">=10.2.1",
+    "brace-expansion": ">=5.0.7",
+    "js-yaml": "$js-yaml"
   },
   "engines": {
-    "node": ">=20.12.0"
+    "node": ">=20.19.0"
   },
   "pkg": {
     "scripts": "dist/**/*.js",
     "assets": [
       "node_modules/chalk/**/*",
-      "containers/agent/seccomp-profile.json"
+      "containers/agent/seccomp-profile.json",
+      "dist/awf-config-schema.json"
     ],
     "targets": [
       "node18-linux-x64",

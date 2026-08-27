@@ -15,7 +15,7 @@
 /**
  * A DLP credential pattern definition
  */
-export interface DlpPattern {
+interface DlpPattern {
   /** Human-readable name for the pattern */
   name: string;
   /** Description of what this pattern detects */
@@ -37,7 +37,7 @@ export interface DlpPattern {
  * - Use case-insensitive matching where appropriate
  * - Avoid overly broad patterns that would block legitimate traffic
  */
-export const DLP_PATTERNS: DlpPattern[] = [
+const DLP_PATTERNS: DlpPattern[] = [
   // GitHub tokens
   {
     name: 'GitHub Personal Access Token (classic)',
@@ -52,7 +52,7 @@ export const DLP_PATTERNS: DlpPattern[] = [
   {
     name: 'GitHub App Installation Token',
     description: 'GitHub App installation access token (ghs_)',
-    regex: 'ghs_[a-zA-Z0-9]{36}',
+    regex: 'ghs_[A-Za-z0-9._-]{36,}',
   },
   {
     name: 'GitHub App User-to-Server Token',
@@ -127,23 +127,6 @@ export const DLP_PATTERNS: DlpPattern[] = [
     regex: 'PRIVATE(%20|\\+|%2B)KEY',
   },
 ];
-
-/**
- * Checks if a given string contains any DLP credential patterns.
- *
- * @param input - The string to scan (URL, query parameter, etc.)
- * @returns Array of matched pattern names, empty if no matches
- */
-export function scanForCredentials(input: string): string[] {
-  const matches: string[] = [];
-  for (const pattern of DLP_PATTERNS) {
-    const regex = new RegExp(pattern.regex, 'i');
-    if (regex.test(input)) {
-      matches.push(pattern.name);
-    }
-  }
-  return matches;
-}
 
 /**
  * Generates Squid ACL configuration lines for DLP credential scanning.

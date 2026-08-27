@@ -45,9 +45,12 @@ const DEFAULT_SENSITIVE_TOKENS: &[&str] = &[
     "OPENAI_KEY",
     // Anthropic/Claude tokens
     "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_API_KEY",
     // Codex tokens
     "CODEX_API_KEY",
+    // Copilot BYOK provider tokens
+    "COPILOT_PROVIDER_API_KEY",
 ];
 
 /// State for tracking tokens and their cached values

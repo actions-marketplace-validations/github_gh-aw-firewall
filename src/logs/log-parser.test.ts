@@ -2,7 +2,7 @@
  * Unit tests for log-parser.ts
  */
 
-import { parseLogLine, extractDomain, extractPort, parseAuditJsonlLine } from './log-parser';
+import { parseLogLine, parseAuditJsonlLine } from './log-parser';
 
 describe('log-parser', () => {
   describe('parseLogLine', () => {
@@ -190,63 +190,55 @@ describe('log-parser', () => {
     });
   });
 
-  describe('extractDomain', () => {
-    it('should extract domain from CONNECT URL with port', () => {
-      expect(extractDomain('api.github.com:443', 'host', 'CONNECT')).toBe('api.github.com');
-      expect(extractDomain('example.com:8443', 'host', 'CONNECT')).toBe('example.com');
-    });
+  describe('domain extraction via parseLogLine', () => {
+    it('should extract domain from CONNECT URL with and without ports', () => {
+      const withPort = parseLogLine(
+        '1761074374.646 172.30.0.20:39748 api.github.com:443 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com:443 "-"',
+      );
+      const withoutPort = parseLogLine(
+        '1761074374.646 172.30.0.20:39748 api.github.com 140.82.114.22:443 1.1 CONNECT 200 TCP_TUNNEL:HIER_DIRECT api.github.com "-"',
+      );
 
-    it('should return URL as-is for CONNECT without port', () => {
-      expect(extractDomain('api.github.com', 'host', 'CONNECT')).toBe('api.github.com');
+      expect(withPort!.domain).toBe('api.github.com');
+      expect(withoutPort!.domain).toBe('api.github.com');
     });
 
     it('should extract domain from host header for non-CONNECT', () => {
-      expect(extractDomain('http://example.com/', 'example.com:80', 'GET')).toBe('example.com');
-      expect(extractDomain('http://test.com/path', 'test.com', 'GET')).toBe('test.com');
+      const withPort = parseLogLine(
+        '1760994429.358 172.30.0.20:36274 example.com:80 93.184.216.34:80 1.1 GET 200 TCP_MISS:HIER_DIRECT http://example.com/ "Mozilla/5.0"',
+      );
+      const withoutPort = parseLogLine(
+        '1760994429.358 172.30.0.20:36274 test.com 93.184.216.34:80 1.1 GET 200 TCP_MISS:HIER_DIRECT http://test.com/path "Mozilla/5.0"',
+      );
+
+      expect(withPort!.domain).toBe('example.com');
+      expect(withoutPort!.domain).toBe('test.com');
     });
 
-    it('should handle host header without port for non-CONNECT', () => {
-      expect(extractDomain('http://example.com/', 'example.com', 'GET')).toBe('example.com');
+    it('should fall back to URL parsing when host is dash', () => {
+      const withProtocol = parseLogLine(
+        '1760994429.358 172.30.0.20:36274 - 93.184.216.34:80 1.1 GET 200 TCP_MISS:HIER_DIRECT http://example.com/path "Mozilla/5.0"',
+      );
+      const withoutProtocol = parseLogLine(
+        '1760994429.358 172.30.0.20:36274 - 93.184.216.34:80 1.1 GET 200 TCP_MISS:HIER_DIRECT example.com/path "Mozilla/5.0"',
+      );
+
+      expect(withProtocol!.domain).toBe('example.com');
+      expect(withoutProtocol!.domain).toBe('example.com');
     });
 
-    it('should fallback to URL parsing when host is empty or dash', () => {
-      expect(extractDomain('http://example.com/', '-', 'GET')).toBe('example.com');
-      expect(extractDomain('http://example.com/path', '', 'GET')).toBe('example.com');
-    });
+    it('should return original URL if fallback URL parsing fails', () => {
+      const result = parseLogLine(
+        '1760994429.358 172.30.0.20:36274 - 93.184.216.34:80 1.1 GET 200 TCP_MISS:HIER_DIRECT :::invalid "Mozilla/5.0"',
+      );
 
-    it('should handle URL without protocol in fallback', () => {
-      expect(extractDomain('example.com/path', '-', 'GET')).toBe('example.com');
-    });
-
-    it('should return original URL if parsing fails', () => {
-      // Invalid URL that can't be parsed
-      expect(extractDomain(':::invalid', '-', 'GET')).toBe(':::invalid');
-    });
-  });
-
-  describe('extractPort', () => {
-    it('should extract port from CONNECT URL', () => {
-      expect(extractPort('api.github.com:443', 'CONNECT')).toBe('443');
-      expect(extractPort('example.com:8080', 'CONNECT')).toBe('8080');
-    });
-
-    it('should return undefined for CONNECT URL without port', () => {
-      expect(extractPort('api.github.com', 'CONNECT')).toBeUndefined();
-    });
-
-    it('should return undefined for non-CONNECT methods', () => {
-      expect(extractPort('http://example.com:80/', 'GET')).toBeUndefined();
-      expect(extractPort('http://example.com/', 'POST')).toBeUndefined();
-    });
-
-    it('should not extract non-numeric port', () => {
-      expect(extractPort('api.github.com:abc', 'CONNECT')).toBeUndefined();
+      expect(result!.domain).toBe(':::invalid');
     });
   });
 
   describe('parseAuditJsonlLine', () => {
     it('should parse a valid JSONL CONNECT entry', () => {
-      const line = '{"ts":1761074374.646,"client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}';
+      const line = '{"timestamp":"2025-10-21T19:19:34.646Z","event":"http_access","client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}';
       const entry = parseAuditJsonlLine(line);
 
       expect(entry).not.toBeNull();
@@ -260,8 +252,24 @@ describe('log-parser', () => {
       expect(entry!.isHttps).toBe(true);
     });
 
+    it('should continue to parse legacy records with ts epoch timestamp', () => {
+      const line = '{"ts":1761074374.646,"client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}';
+      const entry = parseAuditJsonlLine(line);
+
+      expect(entry).not.toBeNull();
+      expect(entry!.timestamp).toBeCloseTo(1761074374.646);
+    });
+
+    it('should fall back to legacy ts when timestamp string is present but invalid', () => {
+      const line = '{"timestamp":"not-a-date","ts":1761074374.646,"client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.114.22:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}';
+      const entry = parseAuditJsonlLine(line);
+
+      expect(entry).not.toBeNull();
+      expect(entry!.timestamp).toBeCloseTo(1761074374.646);
+    });
+
     it('should parse a denied JSONL entry', () => {
-      const line = '{"ts":1760994429.358,"client":"172.30.0.20","host":"evil.com:443","dest":"-:-","method":"CONNECT","status":403,"decision":"TCP_DENIED","url":"evil.com:443"}';
+      const line = '{"timestamp":"2025-10-20T21:07:09.358Z","event":"http_access","client":"172.30.0.20","host":"evil.com:443","dest":"-:-","method":"CONNECT","status":403,"decision":"TCP_DENIED","url":"evil.com:443"}';
       const entry = parseAuditJsonlLine(line);
 
       expect(entry).not.toBeNull();
@@ -271,7 +279,7 @@ describe('log-parser', () => {
     });
 
     it('should parse a HTTP GET entry', () => {
-      const line = '{"ts":1700000000.000,"client":"172.30.0.20","host":"example.com","dest":"93.184.216.34:80","method":"GET","status":200,"decision":"TCP_MISS","url":"http://example.com/"}';
+      const line = '{"timestamp":"2023-11-14T22:13:20.000Z","event":"http_access","client":"172.30.0.20","host":"example.com","dest":"93.184.216.34:80","method":"GET","status":200,"decision":"TCP_MISS","url":"http://example.com/"}';
       const entry = parseAuditJsonlLine(line);
 
       expect(entry).not.toBeNull();
@@ -288,6 +296,20 @@ describe('log-parser', () => {
     it('should return null for invalid JSON', () => {
       expect(parseAuditJsonlLine('not json')).toBeNull();
       expect(parseAuditJsonlLine('{broken')).toBeNull();
+    });
+
+    it('should parse records that include the _schema field', () => {
+      const line = '{"_schema":"audit/v0.23.1","timestamp":"2026-03-23T18:35:08.910Z","event":"http_access","client":"172.30.0.20","host":"api.github.com:443","dest":"140.82.116.5:443","method":"CONNECT","status":200,"decision":"TCP_TUNNEL","url":"api.github.com:443"}';
+      const entry = parseAuditJsonlLine(line);
+
+      expect(entry).not.toBeNull();
+      expect(entry!.timestamp).toBeCloseTo(1774290908.910);
+      expect(entry!.clientIp).toBe('172.30.0.20');
+      expect(entry!.method).toBe('CONNECT');
+      expect(entry!.statusCode).toBe(200);
+      expect(entry!.decision).toBe('TCP_TUNNEL');
+      expect(entry!.domain).toBe('api.github.com');
+      expect(entry!.isAllowed).toBe(true);
     });
   });
 });

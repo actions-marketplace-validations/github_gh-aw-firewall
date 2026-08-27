@@ -8,10 +8,10 @@ import * as os from 'os';
 import {
   discoverLogSources,
   selectMostRecent,
-  isContainerRunning,
   validateSource,
   listLogSources,
 } from './log-discovery';
+import { logDiscoveryTestHelpers } from './log-discovery.test-utils';
 import execa from 'execa';
 import { glob } from 'glob';
 import { LogSource } from '../types';
@@ -20,14 +20,8 @@ import { LogSource } from '../types';
 jest.mock('execa');
 jest.mock('glob');
 jest.mock('fs');
-jest.mock('../logger', () => ({
-  logger: {
-    debug: jest.fn(),
-    info: jest.fn(),
-    warn: jest.fn(),
-    error: jest.fn(),
-  },
-}));
+// eslint-disable-next-line @typescript-eslint/no-require-imports
+jest.mock('../logger', () => require('../test-helpers/mock-logger.test-utils').loggerMockFactory());
 
 const mockedExeca = execa as jest.MockedFunction<typeof execa>;
 const mockedGlob = glob as jest.MockedFunction<typeof glob>;
@@ -48,7 +42,7 @@ describe('log-discovery', () => {
     it('should return true when container is running', async () => {
       mockedExeca.mockResolvedValue({ stdout: 'awf-squid', stderr: '' } as never);
 
-      const result = await isContainerRunning('awf-squid');
+      const result = await logDiscoveryTestHelpers.isContainerRunning('awf-squid');
 
       expect(result).toBe(true);
       expect(mockedExeca).toHaveBeenCalledWith('docker', [
@@ -63,7 +57,7 @@ describe('log-discovery', () => {
     it('should return false when container is not running', async () => {
       mockedExeca.mockResolvedValue({ stdout: '', stderr: '' } as never);
 
-      const result = await isContainerRunning('awf-squid');
+      const result = await logDiscoveryTestHelpers.isContainerRunning('awf-squid');
 
       expect(result).toBe(false);
     });
@@ -71,7 +65,7 @@ describe('log-discovery', () => {
     it('should return false when container name does not match exactly', async () => {
       mockedExeca.mockResolvedValue({ stdout: 'awf-squid-old', stderr: '' } as never);
 
-      const result = await isContainerRunning('awf-squid');
+      const result = await logDiscoveryTestHelpers.isContainerRunning('awf-squid');
 
       expect(result).toBe(false);
     });
@@ -79,7 +73,7 @@ describe('log-discovery', () => {
     it('should return false when docker command fails', async () => {
       mockedExeca.mockRejectedValue(new Error('Docker not available'));
 
-      const result = await isContainerRunning('awf-squid');
+      const result = await logDiscoveryTestHelpers.isContainerRunning('awf-squid');
 
       expect(result).toBe(false);
     });

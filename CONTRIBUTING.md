@@ -28,7 +28,7 @@ Thank you for your interest in contributing! We welcome contributions from the c
 
 ### Prerequisites
 - **Docker**: Must be running for integration tests
-- **Node.js**: v20.12.0+ and npm
+- **Node.js**: v20.19.0+ and npm
 - **Root/Sudo Access**: Required for testing iptables functionality
 - **Git**: For version control
 
@@ -102,6 +102,7 @@ logger.success('Operation completed successfully');
    - Run `npm run lint` to check code style
    - Run `npm test` to ensure all tests pass
    - Run `npm run build` to verify clean build
+   - Keep `--ignore-scripts` on all workflow lock-file `npm install -g` steps for engine CLIs (for example `@anthropic-ai/claude-code` and `@openai/codex`)
    - Test your changes manually
    - Update documentation if needed
 

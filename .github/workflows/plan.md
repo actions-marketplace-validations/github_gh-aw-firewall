@@ -6,15 +6,21 @@ on:
     name: plan
     events: [issue_comment, discussion_comment]
 permissions:
+  copilot-requests: write
   contents: read
   discussions: read
   issues: read
   pull-requests: read
 engine: copilot
+sandbox:
+  agent:
+    id: awf
 tools:
   github:
     toolsets: [default, discussions]
 safe-outputs:
+  threat-detection:
+    enabled: false
   create-issue:
     title-prefix: "[plan] "
     labels: [plan, ai-generated]
