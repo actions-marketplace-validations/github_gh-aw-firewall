@@ -49,6 +49,24 @@
    docker network rm awf-net
    ```
 
+### Network Name Collision
+
+**Problem:** Docker Compose repeatedly warns `a network with name awf-net exists but was not created for project "awf-<timestamp>"` and containers never start.
+
+**Cause:** A previous AWF run was killed (timeout, `SIGKILL`, runner eviction) before its Docker network was removed. Compose will not attach to a fixed-name network that belongs to a different project.
+
+**Solution:** AWF now reclaims these orphaned networks automatically before `docker compose up`. If the network still cannot be removed (for example, a live container from another tool is attached to it), remove it manually:
+```bash
+docker network inspect awf-net
+```
+Stop or force-disconnect each attached endpoint listed by the inspection, then remove
+the network:
+```bash
+docker stop <container>
+docker network disconnect -f awf-net <container>
+docker network rm awf-net
+```
+
 ## Self-Hosted Runner Issues
 
 ### ARC / DinD Split Filesystem
@@ -147,6 +165,22 @@
    ```
 4. Review [GitHub Enterprise Configuration](enterprise-configuration.md) for the expected endpoint derivation and allowlist behavior.
 
+### Codex `auto` Model Fails Under AWF
+
+**Problem:** A Codex run inside AWF fails with messages such as:
+- `Unknown model auto is used`
+- `The requested model is not supported`
+- `chatgpt authentication required for remote plugin catalog; api key auth is not supported`
+
+**Cause:** Codex's `auto` model alias relies on ChatGPT-authenticated remote
+model/plugin metadata. AWF's API proxy uses API-key credential injection, so the
+ChatGPT catalog lookup cannot be used even if `chatgpt.com` is on the network
+allowlist.
+
+**Solution:** Set an explicit Codex model instead of `auto`, for example
+`model: gpt-5.3-codex` in workflow frontmatter or `codex exec --model
+gpt-5.3-codex ...` for direct CLI usage.
+
 ## Permission Issues
 
 ### iptables Permission Denied
@@ -210,6 +244,35 @@
      ```
 
 **Note:** Debug output goes to stderr. Use `2>&1 | tee debug.log` to capture it.
+
+### Read-Only Filesystem (`EROFS`) Inside the Sandbox
+
+**Problem:** A command that writes to a path AWF normally exposes read-write — for
+example gh-aw's repo-memory directory `/tmp/gh-aw/repo-memory/default` — fails with
+`Read-only file system` / `EROFS`.
+
+**Cause:** In the Cloud Hypervisor repo-memory case, AWF's normal `/tmp` export
+is read-write. The read-only view of `/tmp/gh-aw/repo-memory` comes from a
+`filesystem.allowWrite` policy in the AWF config file: when that key is present,
+the writable export is narrowed to the listed guest-visible paths and everything
+else becomes read-only (see [awf-config-spec.md §4.1](./awf-config-spec.md#41-filesystem-write-boundary)).
+
+**Solution:**
+1. Find the effective boundary in the run log. For the Cloud Hypervisor runtime AWF
+   logs it before the guest boots:
+   ```
+   [cloud-hypervisor] stage=filesystem-write-policy boundary /workspace=ro /tmp/gh-aw=ro except /tmp/gh-aw/agent (writes outside these paths fail with EROFS; widen filesystem.allowWrite to permit them)
+   ```
+2. Add the directory the workload must write to `filesystem.allowWrite`:
+   ```json
+   { "filesystem": { "allowWrite": ["/tmp/gh-aw/agent", "/tmp/gh-aw/repo-memory"] } }
+   ```
+   Every listed path must already exist on the host before AWF starts, otherwise
+   planning fails closed with `filesystem.allowWrite path is not an existing path
+   within a writable ...`.
+3. When AWF is launched by the gh-aw compiler, the list is generated from the
+   workflow's `sandbox.agent.config.filesystem.allowWrite`; the directory has to be
+   declared there rather than passed to AWF directly.
 
 ## MCP Server Issues
 
