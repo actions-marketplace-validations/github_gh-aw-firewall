@@ -4,7 +4,7 @@ ARG VERSION=0.2.1
 
 # The builder runs on the build machine and cross-compiles, so multi-platform builds need no
 # emulation. The runtime image has no shell, so every check runs here.
-FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS build
+FROM --platform=$BUILDPLATFORM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS build
 
 ARG VERSION
 ARG OPENAPI_SHA256
