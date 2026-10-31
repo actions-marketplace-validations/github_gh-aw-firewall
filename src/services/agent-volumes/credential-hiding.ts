@@ -1,6 +1,7 @@
 import * as fs from 'fs';
+import * as path from 'path';
 import { logger } from '../../logger';
-import { credentialFilesToHide } from '../../config/mount-policy';
+import { credentialFilesToHide, gitLabCredentialFiles } from '../../config/mount-policy';
 import {
   LocalSourceResolver,
   ParsedMount,
@@ -8,6 +9,26 @@ import {
   innermostCoveringMount,
   parseMount,
 } from './mount-topology';
+
+function existingRealPath(candidate: string): string | undefined {
+  try {
+    fs.lstatSync(candidate);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+    throw error;
+  }
+  try {
+    return fs.realpathSync(candidate);
+  } catch (error) {
+    throw new Error(`Cannot safely resolve GitLab credential path ${candidate}: ${(error as Error).message}`);
+  }
+}
+
+function isWithin(parent: string, candidate: string): boolean {
+  const relative = path.relative(parent, candidate);
+  return relative === '' ||
+    (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
 
 /**
  * Builds the compose-mode `/dev/null` overlays that blank known on-disk
@@ -17,7 +38,12 @@ import {
  * Each credential file is masked twice: once at the real `$HOME` path and once
  * at the chroot `/host$HOME` path (the agent runs chrooted into `/host`).
  */
-export function buildCredentialHidingOverlays(effectiveHome: string): string[] {
+export function buildCredentialHidingOverlays(
+  effectiveHome: string,
+  volumes: string[] = [],
+  localSourceResolver: LocalSourceResolver = identityLocalSourceResolver,
+  env: NodeJS.ProcessEnv = process.env,
+): string[] {
   const credentialFiles = credentialFilesToHide().map((rel) => `${effectiveHome}/${rel}`);
 
   const mounts = credentialFiles.map((credFile) => `/dev/null:${credFile}:ro`);
@@ -28,27 +54,55 @@ export function buildCredentialHidingOverlays(effectiveHome: string): string[] {
   mounts.push(...chrootCredentialFiles);
   logger.debug(`Hidden ${chrootCredentialFiles.length} credential file(s) at /host paths`);
 
-  return mounts;
+  // Translate credential sources through every bind, including custom aliases.
+  // Never mount an otherwise unexposed config directory just to hide its file.
+  const gitLabFiles = gitLabCredentialFiles(effectiveHome, env);
+  const resolvedFiles = new Map(
+    gitLabFiles.map((file) => [path.resolve(file), existingRealPath(file)]),
+  );
+  const hasResolvedCredentials = [...resolvedFiles.values()].some((file) => file !== undefined);
+  for (const spec of volumes) {
+    const mount = parseMount(spec);
+    if (!mount || !path.isAbsolute(mount.source) || mount.source === '/dev/null') continue;
+    const source = localSourceResolver(mount.source);
+    const lexicalSource = source && path.resolve(source);
+    if (!lexicalSource) {
+      if (hasResolvedCredentials) {
+        throw new Error(`Cannot safely map bind source for GitLab credential masking: ${mount.source}`);
+      }
+      continue;
+    }
+    const canonicalSource = existingRealPath(lexicalSource);
+    for (const [file, canonicalFile] of resolvedFiles) {
+      const candidates = new Set([file]);
+      if (canonicalFile) candidates.add(canonicalFile);
+      for (const candidate of candidates) {
+        let relative: string | undefined;
+        if (isWithin(lexicalSource, candidate)) {
+          relative = path.relative(lexicalSource, candidate);
+        } else if (canonicalSource && canonicalFile && isWithin(canonicalSource, canonicalFile)) {
+          relative = path.relative(canonicalSource, canonicalFile);
+        }
+        if (relative === undefined) continue;
+        const target = path.join(mount.target, relative);
+        mounts.push(`/dev/null:${target}:ro`);
+      }
+    }
+  }
+
+  return [...new Set(mounts)];
 }
 
 /**
- * Drops `/dev/null` overlays whose mountpoint cannot physically be created.
+ * Drops `/dev/null` overlays whose target is missing behind a host bind.
  *
- * A bind mount requires its mountpoint to already exist; runc creates a missing
- * one with `openat`/`mkdirat` on the parent directory. That silently works
- * while every mount under `$HOME` is read-write, but once `filesystem.allowWrite`
- * narrows those binds to read-only, runc fails with EROFS and the agent
- * container dies before it starts.
+ * runc creates missing mountpoints on the underlying filesystem. Behind a
+ * writable bind this leaves empty files and directories on the host, owned by
+ * root when AWF runs under sudo. Behind a read-only bind it fails with EROFS.
  *
- * An overlay is kept unless its containing bind is read-only *and* the path it
- * masks does not exist behind that bind. Dropping those loses no protection:
- * the read-only bind is the only way the agent could reach the path, and there
- * is nothing there to read. Every credential that is actually reachable is
- * still masked, because mounting over a path that exists succeeds even inside a
- * read-only bind.
- *
- * This is a no-op unless a write policy is active, since every covering bind is
- * read-write otherwise.
+ * A missing credential has nothing to mask at startup. Existing credentials
+ * remain masked regardless of bind mode; paths that cannot be probed locally
+ * keep their overlays. A file created by the host after this check is not masked.
  */
 export function pruneUnmountableCredentialOverlays(
   volumes: string[],
@@ -62,11 +116,14 @@ export function pruneUnmountableCredentialOverlays(
     const overlay = parseMount(spec);
     if (!overlay || overlay.source !== '/dev/null') return true;
 
+    const exactBinds = binds.filter((bind) => bind.target === overlay.target);
+    const exactBind = exactBinds[exactBinds.length - 1];
+    if (exactBind) return true;
+
     const cover = innermostCoveringMount(binds, overlay.target);
     // No covering bind: the mountpoint lives on the container's own writable
     // rootfs, so runc can always create it.
     if (!cover) return true;
-    if (cover.mode !== 'ro') return true;
     // Named volumes and other non-path sources cannot be probed on the host.
     if (!cover.source.startsWith('/')) return true;
 
@@ -79,14 +136,15 @@ export function pruneUnmountableCredentialOverlays(
     const localCoverSource = localSourceResolver(cover.source);
     if (localCoverSource === undefined) return true;
 
-    return fs.existsSync(`${localCoverSource}${suffix}`);
+    const hostPath = `${localCoverSource}${suffix}`;
+    return fs.existsSync(hostPath);
   });
 
   const dropped = volumes.length - kept.length;
   if (dropped > 0) {
     logger.debug(
-      `Dropped ${dropped} credential overlay(s) whose target does not exist behind a read-only ` +
-      'mount; those paths are unreadable in the container, so nothing is left unmasked',
+      `Dropped ${dropped} credential overlay(s) whose target does not exist behind a host ` +
+      'bind; avoiding creation of credential placeholders on the host',
     );
   }
 

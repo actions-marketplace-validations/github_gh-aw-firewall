@@ -5,33 +5,110 @@
 #   - ghcr.io/catthehacker/ubuntu:full-22.04: Near-identical to GitHub Actions runner (~20GB compressed)
 # Use --build-arg BASE_IMAGE=<image> to customize
 # NOTE: ARG declared before first FROM is global and available in all FROM statements
-ARG BASE_IMAGE=ubuntu:22.04
+ARG BASE_IMAGE=default-base
 
-FROM golang:1.26.6-alpine@sha256:af8d6740070b8906d12eae1c3e3ea0957fb63f492051ea05e354c38ef9fe88df AS gh-build
+FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS gh-build
 
-ARG GH_VERSION=2.97.0
-ARG GH_SOURCE_SHA256=18cd1280f70911c9c16dd5965cdac0b9e6b16e54466f0c892ce2829ecdd339a6
-ARG GH_SOURCE_DATE_EPOCH=1785488640
+ENV GOTOOLCHAIN=go1.27.3
+
+ARG GH_VERSION=2.98.0
+ARG GH_SOURCE_SHA256=abada9e8b550547ac93f99250f3ad4d90ad623fa245cb54cb058f78030a6a5f6
+ARG GH_SOURCE_DATE_EPOCH=1787263311
+ARG GH_GRPC_VERSION=1.83.2
+ARG GH_X_CRYPTO_VERSION=0.57.0
+ARG GH_X_NET_VERSION=0.60.0
 RUN wget -q "https://github.com/cli/cli/archive/refs/tags/v${GH_VERSION}.tar.gz" -O /tmp/gh.tar.gz \
     && echo "${GH_SOURCE_SHA256}  /tmp/gh.tar.gz" | sha256sum -c - \
     && tar -xzf /tmp/gh.tar.gz -C /tmp \
     && cd "/tmp/cli-${GH_VERSION}" \
+    && go get "google.golang.org/grpc@v${GH_GRPC_VERSION}" "golang.org/x/crypto@v${GH_X_CRYPTO_VERSION}" "golang.org/x/net@v${GH_X_NET_VERSION}" \
     && CGO_ENABLED=0 GH_VERSION="${GH_VERSION}" SOURCE_DATE_EPOCH="${GH_SOURCE_DATE_EPOCH}" \
          go run ./script/build.go bin/gh \
+    && go version -m bin/gh | head -n 1 | grep -Eq ': go1\.27\.3$' \
+    && go version -m bin/gh | awk -v version="v${GH_GRPC_VERSION}" \
+         '$1 == "dep" && $2 == "google.golang.org/grpc" && $3 == version { found=1 } END { exit !found }' \
+    && go version -m bin/gh | awk -v version="v${GH_X_CRYPTO_VERSION}" \
+         '$1 == "dep" && $2 == "golang.org/x/crypto" && $3 == version { found=1 } END { exit !found }' \
+    && go version -m bin/gh | awk -v version="v${GH_X_NET_VERSION}" \
+         '$1 == "dep" && $2 == "golang.org/x/net" && $3 == version { found=1 } END { exit !found }' \
     && /tmp/cli-${GH_VERSION}/bin/gh --version
+
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7 AS default-base
+
+# Chroot libraries must target the oldest supported runner, not BASE_IMAGE.
+# Never bundle libc or its loader: those belong to the runner's runtime.
+FROM ubuntu:22.04@sha256:0a9887931b0e38af2e3487ed39e29436b0535c4f3f52e57745baaf79d1898956 AS browser-libs
+
+RUN set -eux; \
+    BROWSER_PKGS="libasound2 libatk-bridge2.0-0 libatk1.0-0 libatspi2.0-0 libcairo2 libcups2 libdbus-1-3 libdrm2 libexpat1 libgbm1 libglib2.0-0 libnspr4 libnss3 libpango-1.0-0 libpangocairo-1.0-0 libudev1 libx11-6 libxcb1 libxcomposite1 libxdamage1 libxext6 libxfixes3 libxkbcommon0 libxrandr2 libxrender1 libxshmfence1 fonts-liberation"; \
+    apt-get -o Acquire::Retries=3 update && \
+    apt-get -o Acquire::Retries=3 install -y --no-install-recommends $BROWSER_PKGS && \
+    apt-get -o Acquire::Retries=3 upgrade -y --no-install-recommends && \
+    # Include dependencies already in the base image (e.g. libpcre3), not just
+    # newly installed packages: newer runners may no longer provide them.
+    apt-cache depends --recurse --installed --no-recommends --no-suggests \
+      --no-conflicts --no-breaks --no-replaces --no-enhances $BROWSER_PKGS \
+      | grep -E '^[a-zA-Z0-9][a-zA-Z0-9+.:_-]*$' \
+      | sort -u | grep -Ev '^(libc6|libgcc-s1|libstdc\+\+6)$' > /tmp/browser-pkgs-installed.txt && \
+    mkdir -p /usr/local/share/awf/browser-libs && \
+    printf '%s\n' "$BROWSER_PKGS" > /usr/local/share/awf/browser-packages.txt && \
+    dpkg -L $(cat /tmp/browser-pkgs-installed.txt) \
+      | while IFS= read -r f; do [ -f "$f" ] && printf '%s\n' "$f"; done \
+      | grep -E '\.so(\.[0-9]+)*$' \
+      | sort -u > /usr/local/share/awf/browser-libs.manifest && \
+    while IFS= read -r lib; do \
+      mkdir -p "/usr/local/share/awf/browser-libs$(dirname "$lib")"; \
+      cp -L "$lib" "/usr/local/share/awf/browser-libs$lib"; \
+    done < /usr/local/share/awf/browser-libs.manifest && \
+    rm -rf /var/lib/apt/lists/*
 
 FROM ${BASE_IMAGE} AS one-shot-token-build
 
 COPY one-shot-token/one-shot-token.c /tmp/one-shot-token.c
-RUN apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
-    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
-      install -y --no-install-recommends gcc libc6-dev binutils && \
+RUN set -eux; \
+    force_archive_mirror() { \
+      echo "Falling back to archive.ubuntu.com mirror..." >&2; \
+      if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list; \
+        sed -i 's|http://security.ubuntu.com|http://archive.ubuntu.com|g' /etc/apt/sources.list 2>/dev/null || true; \
+      fi; \
+      if [ -d /etc/apt/sources.list.d ]; then \
+        find /etc/apt/sources.list.d -name '*.sources' -exec \
+          sed -i -e 's|http://azure.archive.ubuntu.com|http://archive.ubuntu.com|g' \
+                 -e 's|http://security.ubuntu.com|http://archive.ubuntu.com|g' {} + 2>/dev/null || true; \
+      fi; \
+      rm -rf /var/lib/apt/lists/* && \
+        apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update; \
+    }; \
+    apt_install_retry() { \
+      apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends "$@" && return 0; \
+      echo "apt-get install failed (likely mirror fetch timeout), forcing archive.ubuntu.com and retrying..." >&2; \
+      force_archive_mirror; \
+      apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 \
+        install -y --no-install-recommends "$@"; \
+    }; \
+    if getent hosts azure.archive.ubuntu.com >/dev/null 2>&1; then \
+      if [ -f /etc/apt/sources.list ]; then \
+        sed -i 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list; \
+        sed -i 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' /etc/apt/sources.list; \
+      fi; \
+      if [ -d /etc/apt/sources.list.d ]; then \
+        find /etc/apt/sources.list.d -name '*.sources' -exec \
+          sed -i -e 's|http://archive.ubuntu.com|http://azure.archive.ubuntu.com|g' \
+                 -e 's|http://security.ubuntu.com|http://azure.archive.ubuntu.com|g' {} +; \
+      fi; \
+    fi && \
+    apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=30 -o Acquire::https::Timeout=30 update && \
+    apt_install_retry gcc libc6-dev binutils && \
     gcc -shared -fPIC -fvisibility=hidden -O2 -Wall -s \
         -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
         -o /tmp/one-shot-token.so /tmp/one-shot-token.c -ldl -lpthread && \
     strip --strip-unneeded /tmp/one-shot-token.so
 
 FROM ${BASE_IMAGE}
+
+COPY --from=browser-libs /usr/local/share/awf/ /usr/local/share/awf/
 
 # Optionally switch to Azure apt mirror for faster package fetches in CI
 # Only rewrite if azure.archive.ubuntu.com is resolvable (BuildKit DNS can fail)
@@ -53,7 +130,7 @@ RUN if getent hosts azure.archive.ubuntu.com >/dev/null 2>&1; then \
     fi
 
 # Install required and runner-parity packages, apply security upgrades, then install
-# Node.js 22.23.2 and npm 11.18.0. Keeping apt work in one layer avoids repeatedly
+# Node.js 22.23.2 and npm 12.2.1. Keeping apt work in one layer avoids repeatedly
 # downloading package indexes during cold CI builds.
 # Note: Some packages may already exist in runner-like base images, apt handles this gracefully
 # apt_update_retry: retries up to 3 times with backoff; if all fail, reverts to archive.ubuntu.com
@@ -105,7 +182,23 @@ RUN set -eux; \
     PKGS="iptables curl ca-certificates git gnupg dnsutils net-tools netcat-openbsd libcap2-bin libgdiplus libev-dev libssl-dev php-intl php-gd python3"; \
     apt_update_retry && \
     apt_install_retry $PKGS && \
+    # Native packages serve non-chroot execution. Chroot execution uses the
+    # independent Ubuntu 22.04 payload above, never these newer image libraries.
+    BROWSER_PKGS="$(cat /usr/local/share/awf/browser-packages.txt)"; \
+    # Ubuntu 24.04 renamed several of these to time_t-64 variants (e.g. libasound2t64),
+    # and the old names became ambiguous virtual packages. Prefer the t64 package when
+    # the base image provides one, otherwise keep the 22.04 name.
+    BROWSER_ACTUAL_PKGS=""; \
+    for pkg in $BROWSER_PKGS; do \
+      if apt-cache show "${pkg}t64" >/dev/null 2>&1; then \
+        BROWSER_ACTUAL_PKGS="$BROWSER_ACTUAL_PKGS ${pkg}t64"; \
+      else \
+        BROWSER_ACTUAL_PKGS="$BROWSER_ACTUAL_PKGS $pkg"; \
+      fi; \
+    done && \
+    apt_install_retry $BROWSER_ACTUAL_PKGS && \
     apt_upgrade_retry && \
+    rm -f /usr/bin/pebble && \
     # Raw sockets are unavailable to the agent; remove stale file capabilities
     # inherited from runner-like base images so they cannot be reactivated.
     for binary in /usr/bin/ping /usr/bin/mtr-packet; do \
@@ -193,32 +286,49 @@ RUN set -eux; \
         node --version | grep -qE '^v22\.23\.2' || (echo "ERROR: Node.js 22.23.2 not installed correctly" && exit 1) && \
         npx --version || (echo "ERROR: npx not found" && exit 1); \
     fi && \
-    # Replace Node's bundled npm 10.x with npm 11.18.0
+    # Replace Node's bundled npm 10.x with npm 12.2.1
     # Download the tarball and verify its SHA-256 before installing
-    NPM_TGZ_URL="https://registry.npmjs.org/npm/-/npm-11.18.0.tgz" && \
-    NPM_TGZ_SHA256="73f6155215ebabf4ed96dca1f567c2372cc713c33af2e5b9b62fde4e92373e2e" && \
-    curl -fsSL "$NPM_TGZ_URL" -o /tmp/npm-11.18.0.tgz && \
-    echo "${NPM_TGZ_SHA256}  /tmp/npm-11.18.0.tgz" | sha256sum -c - && \
+    NPM_TGZ_URL="https://registry.npmjs.org/npm/-/npm-12.2.1.tgz" && \
+    NPM_TGZ_SHA256="228bd64aaef23270dbdbd2cf3d5ef5c467602ef38c4066246cef1984adab9a67" && \
+    curl -fsSL --retry 3 --retry-all-errors --retry-max-time 120 --connect-timeout 15 --max-time 60 \
+        "$NPM_TGZ_URL" -o /tmp/npm-12.2.1.tgz && \
+    echo "${NPM_TGZ_SHA256}  /tmp/npm-12.2.1.tgz" | sha256sum -c - && \
     # Remove stale npm 10.x trees so scanners do not retain them
     rm -rf /usr/lib/node_modules/npm /usr/local/lib/node_modules/npm && \
     rm -f /usr/bin/npm /usr/bin/npx /usr/local/bin/npm /usr/local/bin/npx && \
-    # Extract npm 11.18.0 manually — avoids executing node under QEMU (node segfaults there)
+    # Extract npm 12.2.1 manually — avoids executing node under QEMU (node segfaults there)
     mkdir -p /usr/local/lib/node_modules/npm && \
-    tar -xzf /tmp/npm-11.18.0.tgz -C /usr/local/lib/node_modules/npm --strip-components=1 && \
+    tar -xzf /tmp/npm-12.2.1.tgz -C /usr/local/lib/node_modules/npm --strip-components=1 && \
     chmod +x /usr/local/lib/node_modules/npm/bin/npm-cli.js \
              /usr/local/lib/node_modules/npm/bin/npx-cli.js && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && \
     ln -sf /usr/local/lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && \
     # Verify version on non-QEMU builds (node segfaults under QEMU)
     if [ "$UNDER_QEMU" = "false" ]; then \
-        npm --version | grep -qE '^11\.18\.0' || (echo "ERROR: npm 11.18.0 not installed correctly" && exit 1); \
+        npm --version | grep -qE '^12\.2\.1' || (echo "ERROR: npm 12.2.1 not installed correctly" && exit 1); \
     fi && \
-    rm -f /tmp/npm-11.18.0.tgz && \
+    rm -f /tmp/npm-12.2.1.tgz && \
+    npm_dir=/usr/local/lib/node_modules/npm/node_modules && \
+    curl -fsSL --retry 3 --retry-all-errors --retry-max-time 120 --connect-timeout 15 --max-time 60 \
+        https://registry.npmjs.org/undici/-/undici-6.29.1.tgz -o /tmp/undici-6.29.1.tgz && \
+    echo "29c4b8e0b2d86cb8795571c1959012ce057a14ecfd34858335f47c31e770a04f  /tmp/undici-6.29.1.tgz" | sha256sum -c - && \
+    curl -fsSL --retry 3 --retry-all-errors --retry-max-time 120 --connect-timeout 15 --max-time 60 \
+        https://registry.npmjs.org/brace-expansion/-/brace-expansion-5.0.12.tgz -o /tmp/brace-expansion-5.0.12.tgz && \
+    echo "ef8448ec78f20b692f04fa6d01f39b5ab34c66404bea3429f5a39c6c9e0be8b4  /tmp/brace-expansion-5.0.12.tgz" | sha256sum -c - && \
+    curl -fsSL --retry 3 --retry-all-errors --retry-max-time 120 --connect-timeout 15 --max-time 60 \
+        https://registry.npmjs.org/ip-address/-/ip-address-10.7.1.tgz -o /tmp/ip-address-10.7.1.tgz && \
+    echo "7f99ac7abda701afe1fd1e36de462236fb4d1eb8c595d7ae0267bba7d8ee55f8  /tmp/ip-address-10.7.1.tgz" | sha256sum -c - && \
+    rm -rf "$npm_dir/undici" "$npm_dir/brace-expansion" "$npm_dir/ip-address" && \
+    mkdir -p "$npm_dir/undici" "$npm_dir/brace-expansion" "$npm_dir/ip-address" && \
+    tar -xzf /tmp/undici-6.29.1.tgz -C "$npm_dir/undici" --strip-components=1 && \
+    tar -xzf /tmp/brace-expansion-5.0.12.tgz -C "$npm_dir/brace-expansion" --strip-components=1 && \
+    tar -xzf /tmp/ip-address-10.7.1.tgz -C "$npm_dir/ip-address" --strip-components=1 && \
+    node -e 'const root="/usr/local/lib/node_modules/npm/node_modules"; const expected={undici:"6.29.1","brace-expansion":"5.0.12","ip-address":"10.7.1"}; for (const [name, version] of Object.entries(expected)) { const actual=require(`${root}/${name}/package.json`).version; if (actual !== version) throw new Error(`${name}: expected ${version}, got ${actual}`); }' && \
+    rm -f /tmp/undici-6.29.1.tgz /tmp/brace-expansion-5.0.12.tgz /tmp/ip-address-10.7.1.tgz && \
     rm -rf /var/lib/apt/lists/*
-
 # Build the pinned GitHub CLI release with the patched Go toolchain.
-COPY --from=gh-build /tmp/cli-2.97.0/bin/gh /usr/local/bin/gh
-RUN gh --version | grep -qE '^gh version 2\.97\.0'
+COPY --from=gh-build /tmp/cli-2.98.0/bin/gh /usr/local/bin/gh
+RUN gh --version | grep -qE '^gh version 2\.98\.0'
 
 # Create non-root user with UID/GID matching host user
 # This allows the user command to run with appropriate permissions
@@ -269,4 +379,8 @@ RUN chmod +x /usr/bin/docker
 WORKDIR /workspace
 
 # Use entrypoint to setup iptables and run command
+COPY trust/ /opt/awf/trust/
+RUN sh /opt/awf/trust/install-system-trust.sh \
+    && sh /opt/awf/trust/install-node-trust.sh
+
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

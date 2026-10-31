@@ -17,6 +17,8 @@ const {
   normalizeBasePath,
   makeProviderNotConfiguredResponse,
   makeUnconfiguredHealthResponse,
+  getTargetScheme,
+  stripTargetScheme,
 } = require('./proxy-utils');
 
 /**
@@ -133,6 +135,8 @@ function createAdapterMethods(opts) {
   } = opts;
 
   const resolveValue = (value) => (typeof value === 'function' ? value() : value);
+  const targetScheme = getTargetScheme(rawTarget);
+  const targetHost = stripTargetScheme(rawTarget);
 
   const builtValidationProbe = getValidationProbe || (() => {
     const skip = validationSkip ? validationSkip() : null;
@@ -142,7 +146,7 @@ function createAdapterMethods(opts) {
       return { skip: true, reason: 'Custom target; validation skipped' };
     }
     return {
-      url: `https://${rawTarget}${validationPath}`,
+      url: `${targetScheme}://${targetHost}${validationPath}`,
       opts: {
         method: validationMethod,
         headers: resolveValue(validationHeaders),
@@ -160,7 +164,7 @@ function createAdapterMethods(opts) {
     const modelsPrefix = basePath === '/' ? '' : basePath;
     const path = modelsPrefix ? `${modelsPrefix}/models` : modelsPath;
     return {
-      url: `https://${rawTarget}${path}`,
+      url: `${targetScheme}://${targetHost}${path}`,
       opts: { method: 'GET', headers: resolveValue(modelsFetchHeaders) },
       cacheKey: modelsCacheKey,
     };
@@ -177,7 +181,8 @@ function createAdapterMethods(opts) {
   }));
 
   return {
-    getTargetHost() { return rawTarget; },
+    getTargetHost() { return targetHost; },
+    getTargetScheme() { return targetScheme; },
     getBasePath() { return basePath; },
     participatesInValidation,
     getValidationProbe: builtValidationProbe,
@@ -214,6 +219,81 @@ function createProviderAuthScaffold(env, deps = {}, { keyEnvVar, targetEnvVar, b
   });
   const bodyTransform = (deps != null && deps.bodyTransform != null) ? deps.bodyTransform : null;
   return { apiKey, rawTarget, basePath, bodyTransform };
+}
+
+/**
+ * Bootstrap a standard API-key/OIDC provider adapter.
+ *
+ * Provider hooks receive the prepared credential scaffold together with the
+ * resolved OIDC context and header builders. They only need to supply behavior
+ * that differs from the shared credential, validation, and reflection wiring.
+ *
+ * @param {Record<string, string|undefined>} env
+ * @param {object} deps
+ * @param {object} opts
+ * @returns {import('./providers/index').ProviderAdapter}
+ */
+function createStandardProviderAdapter(env, deps = {}, {
+  envVars,
+  name,
+  port,
+  defaultTarget,
+  isManagementPort = false,
+  prepareConfig = (config) => config,
+  createOidcAuthOptions,
+  createHeaderBuilders,
+  createAdapterMethodsOptions = {},
+  buildAdapterOptions = {},
+  getAuthHeaders,
+}) {
+  const config = prepareConfig(createProviderAuthScaffold(env, deps, {
+    ...envVars,
+    defaultTarget,
+  }));
+  const headerBuilders = createHeaderBuilders(config);
+  const oidcAuthOptions = {
+    staticAuthToken: config.apiKey,
+    ...(createOidcAuthOptions ? createOidcAuthOptions(config) : {}),
+  };
+  const resolveOptions = (options, context) => (
+    typeof options === 'function' ? options(context) : options
+  );
+
+  return createOidcAwareProviderAdapter({
+    env,
+    oidcAuthOptions,
+    ...headerBuilders,
+    createAdapterMethodsOptions: (oidcContext) => {
+      const context = { ...config, ...headerBuilders, ...oidcContext };
+      const credentialConfigured = !!config.apiKey || oidcContext.oidcConfigured;
+      return {
+        apiKey: config.apiKey,
+        rawTarget: config.rawTarget,
+        basePath: config.basePath,
+        provider: name,
+        port,
+        defaultTarget,
+        credentialConfigured,
+        reflectionConfigured: credentialConfigured,
+        validationSkip: oidcContext.validationSkip,
+        skipModelsFetch: oidcContext.skipModelsFetch,
+        ...resolveOptions(createAdapterMethodsOptions, context),
+      };
+    },
+    buildAdapterOptions: (oidcContext) => {
+      const context = { ...config, ...headerBuilders, ...oidcContext };
+      return {
+        name,
+        port,
+        isManagementPort,
+        bodyTransform: config.bodyTransform,
+        ...resolveOptions(buildAdapterOptions, context),
+      };
+    },
+    getAuthHeaders: getAuthHeaders
+      ? (oidcContext) => getAuthHeaders({ ...config, ...headerBuilders, ...oidcContext })
+      : undefined,
+  });
 }
 
 /**
@@ -412,6 +492,7 @@ function buildProviderAdapter({
 module.exports = {
   createBaseAdapterConfig,
   createProviderAuthScaffold,
+  createStandardProviderAdapter,
   createOidcAwareProviderAdapter,
   createAdapterMethods,
   buildProviderAdapter,

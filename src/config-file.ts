@@ -3,33 +3,78 @@ import * as path from 'path';
 import * as yaml from 'js-yaml';
 import { validateWithSchema } from './schema-validator';
 import type { RawEnclavesConfig } from './types/enclave-options';
-import type { CloudHypervisorArtifactDigests } from './types/runtime-options';
+import type {
+  CloudHypervisorArtifactDigests,
+  CloudHypervisorMountPolicy,
+} from './types/runtime-options';
+import type { ModelRoutingConfig } from './types/api-proxy-routing-options';
+import type { ClaudeHostedWebConfig } from './claude-hosted-web-policy';
+import type { CodexHostedWebConfig } from './codex-hosted-web-policy';
+import type { ModelCatalogueOptions } from './types/rate-limit-options';
 
 /** @internal Used only by config-file helpers — not part of public API */
 // ts-prune-ignore-next
 export interface AwfFileConfig {
   $schema?: string;
+  experimental?: {
+    modelRouting?: boolean;
+  };
   network?: {
     allowDomains?: string[];
     blockDomains?: string[];
     dnsServers?: string[];
+    subnet?: string;
     upstreamProxy?: string;
     isolation?: boolean;
+    verifySbxEgress?: boolean;
     topologyAttach?: string[];
   };
   filesystem?: {
     allowWrite?: string[];
   };
   apiProxy?: {
+    modelCatalogue?: ModelCatalogueOptions;
     enabled?: boolean;
     caCert?: string;
     enableTokenSteering?: boolean;
     anthropicAutoCache?: boolean;
     anthropicCacheTailTtl?: string;
-    maxEffectiveTokens?: number;
+    hostedWeb?: {
+      claude?: ClaudeHostedWebConfig;
+      codex?: CodexHostedWebConfig;
+    };
     maxAiCredits?: number;
-    defaultAiCreditsPricing?: { input: number; output: number; cachedInput?: number; cacheWrite?: number | null };
+    defaultAiCreditsPricing?: {
+      input: number;
+      output: number;
+      cachedInput?: number;
+      cacheWrite?: number | null;
+      reasoning?: number;
+    };
     providers?: Record<string, unknown>;
+    modelPricingCatalog?: {
+      schemaVersion: 1;
+      unit: 'USD_PER_1M_TOKENS';
+      catalogId: string;
+      version: string;
+      providers: Record<string, {
+        models: Record<string, {
+          input: number;
+          output: number;
+          cachedInput: number;
+          cacheWrite: number | null;
+          reasoning: number;
+          longContext?: {
+            threshold: number;
+            input: number;
+            output: number;
+            cachedInput: number;
+            cacheWrite: number | null;
+            reasoning: number;
+          };
+        }>;
+      }>;
+    };
     modelMultipliers?: Record<string, number>;
     defaultModelMultiplier?: number;
     maxModelMultiplierCap?: number;
@@ -44,10 +89,12 @@ export interface AwfFileConfig {
       strategy?: 'middle_power';
       excludeEngines?: string[];
     };
+    fallbackModels?: string[];
     modelRouter?: {
       providerType?: string;
       baseUrl?: string;
     };
+    routing?: ModelRoutingConfig;
     targets?: {
       openai?: { host?: string; basePath?: string; authHeader?: string; baseUrlEnv?: string };
       anthropic?: { host?: string; basePath?: string; authHeader?: string };
@@ -110,7 +157,7 @@ export interface AwfFileConfig {
   };
   container?: {
     images?: Partial<Record<
-      'squid' | 'agent' | 'apiProxy' | 'cliProxy' | 'buildTools' | 'dohProxy' |
+      'squid' | 'agent' | 'apiProxy' | 'router' | 'cliProxy' | 'buildTools' | 'dohProxy' |
       'enclaveScript' | 'enclaveAgent' | 'enclaveMcpServer' | 'dindStaging',
       string
     >>;
@@ -140,14 +187,41 @@ export interface AwfFileConfig {
    */
   cloudHypervisor?: {
     previewEnabled?: boolean;
+    mountPolicy?: CloudHypervisorMountPolicy;
     cloudHypervisorBinary?: string;
     kernelPath?: string;
     rootfsPath?: string;
     supervisorPath?: string;
+    artifactManifestPath?: string;
+    artifactManifestBundlePath?: string;
+    artifactReleaseTag?: string;
+    developmentAllowUnattestedArtifacts?: boolean;
+    enclaveDebugPublic?: boolean;
     vcpuCount?: number;
     memoryMib?: number;
+    scratchMib?: number;
     apiTimeoutMs?: number;
     sha256?: CloudHypervisorArtifactDigests;
+  };
+  /**
+   * NVX preview one-shot microVM runtime.
+   * Selectable via `container.containerRuntime: "nvx"`, gated behind
+   * `previewEnabled`/`--nvx-preview`. Supported only on Linux x86_64 KVM hosts.
+   */
+  nvx?: {
+    previewEnabled?: boolean;
+    mountPolicy?: 'workspace-only' | 'workspace-and-tool-cache';
+    layerPath?: string;
+    artifactManifestPath?: string;
+    artifactManifestBundlePath?: string;
+    signerWorkflow?: string;
+    openvmmPath?: string;
+    kernelPath?: string;
+    initramfsPath?: string;
+    memoryMib?: number;
+    memoryMaxBytes?: number;
+    pidsMax?: number;
+    scratchBytes?: number;
   };
   chroot?: {
     binariesSourcePath?: string;
@@ -184,6 +258,9 @@ export interface AwfFileConfig {
     requestsPerMinute?: number;
     requestsPerHour?: number;
     bytesPerMinute?: number;
+    maxGithubApiPointsRest?: number;
+    maxGithubApiPointsGraphql?: number;
+    maxNumToolCalls?: number;
   };
   platform?: {
     type?: 'github.com' | 'ghes' | 'ghec' | 'ghec-self-hosted';

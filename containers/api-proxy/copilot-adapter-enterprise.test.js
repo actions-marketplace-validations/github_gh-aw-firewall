@@ -4,7 +4,7 @@ const bearerByokKey = ['Bearer', 'sk-byok-key'].join(' ');
 const bearerStandardToken = ['Bearer', 'ghu_standard_token_123'].join(' ');
 const bearerCustomToken = ['Bearer', 'ghu_standard_token_123'].join(' ');
 const bearerGithubComOverrideToken = ['Bearer', 'ghu_token_123'].join(' ');
-const tokenGhecToken = ['token', 'ghu_ghec_token_123'].join(' ');
+const bearerGhecToken = ['Bearer', 'ghu_ghec_token_123'].join(' ');
 
 describe('createCopilotAdapter — GHE enterprise auth format', () => {
   const fakeReq = { url: '/v1/chat/completions', method: 'POST', headers: {} };
@@ -56,32 +56,32 @@ describe('createCopilotAdapter — GHE enterprise auth format', () => {
     expect(headers['Authorization']).toBe(bearerStandardToken);
   });
 
-  it('uses "token" prefix for a derived GHEC data-residency target', () => {
+  it('uses "Bearer" prefix for a derived GHEC data-residency target', () => {
     const adapter = createCopilotAdapter({
       COPILOT_GITHUB_TOKEN: 'ghu_ghec_token_123',
       GITHUB_SERVER_URL: 'https://mycompany.ghe.com',
     });
     const headers = adapter.getAuthHeaders(fakeReq);
-    expect(headers['Authorization']).toBe(tokenGhecToken);
+    expect(headers['Authorization']).toBe(bearerGhecToken);
   });
 
-  it('uses "token" prefix for /models on a derived GHEC data-residency target', () => {
+  it('uses "Bearer" prefix for /models on a derived GHEC data-residency target', () => {
     const adapter = createCopilotAdapter({
       COPILOT_GITHUB_TOKEN: 'ghu_ghec_token_123',
       GITHUB_SERVER_URL: 'https://mycompany.ghe.com',
     });
     const headers = adapter.getAuthHeaders(fakeModelsReq);
-    expect(headers['Authorization']).toBe(tokenGhecToken);
+    expect(headers['Authorization']).toBe(bearerGhecToken);
   });
 
-  it('uses "token" prefix for a GHEC target when AWF_PLATFORM_TYPE=ghec', () => {
+  it('uses "Bearer" prefix for a GHEC target when AWF_PLATFORM_TYPE=ghec', () => {
     const adapter = createCopilotAdapter({
       COPILOT_GITHUB_TOKEN: 'ghu_ghec_token_123',
       AWF_PLATFORM_TYPE: 'ghec',
       GITHUB_SERVER_URL: 'https://mycompany.ghe.com',
     });
     const headers = adapter.getAuthHeaders(fakeReq);
-    expect(headers['Authorization']).toBe(tokenGhecToken);
+    expect(headers['Authorization']).toBe(bearerGhecToken);
   });
 
   it('strips "token " prefix from COPILOT_GITHUB_TOKEN before re-prefixing for GHES', () => {
@@ -197,6 +197,59 @@ describe('createCopilotAdapter — Copilot Business auth format', () => {
     });
     const headers = adapter.getAuthHeaders(fakeModelsReq);
     expect(headers['Authorization']).toBe('token ghu_business_token_123');
+  });
+
+  it('uses ****** fine-grained PAT for inference and /models on a GHEC target', () => {
+    const adapter = createCopilotAdapter({
+      COPILOT_GITHUB_TOKEN: 'github_pat_fine_grained',
+      COPILOT_API_TARGET: 'copilot-api.myorg.ghe.com',
+    });
+    expect(adapter.getAuthHeaders(fakeReq)['Authorization']).toBe(['Bearer', 'github_pat_fine_grained'].join(' '));
+    const modelHeaders = adapter.getAuthHeaders(fakeModelsReq);
+    expect(modelHeaders['Authorization']).toBe(['Bearer', 'github_pat_fine_grained'].join(' '));
+    expect(modelHeaders['X-GitHub-Api-Version']).toBe('2026-07-01');
+  });
+
+  it('treats a canonical GHEC target as GitHub-hosted for startup model discovery', () => {
+    const adapter = createCopilotAdapter({
+      COPILOT_GITHUB_TOKEN: 'github_pat_fine_grained',
+      COPILOT_API_TARGET: 'copilot-api.myorg.ghe.com',
+      GITHUB_COPILOT_INTEGRATION_ID: 'copilot-developer-cli',
+    });
+    const config = adapter.getModelsFetchConfig();
+    expect(config.url).toBe('https://copilot-api.myorg.ghe.com/models');
+    expect(config.opts.headers).toEqual(expect.objectContaining({
+      'Authorization': ['Bearer', 'github_pat_fine_grained'].join(' '),
+      'X-GitHub-Api-Version': '2026-07-01',
+      'Copilot-Integration-Id': 'copilot-developer-cli',
+    }));
+    expect(adapter.getReflectionInfo()).toEqual(expect.objectContaining({
+      credential_kind: 'fine_grained_pat',
+      selected_scheme: 'Bearer',
+      inference_credential_source: 'github_token',
+      inference_selected_scheme: 'Bearer',
+      integration_id_source: 'github_copilot_integration_id',
+    }));
+  });
+
+  it('prefers COPILOT_INTEGRATION_ID over GITHUB_COPILOT_INTEGRATION_ID', () => {
+    const adapter = createCopilotAdapter({
+      COPILOT_GITHUB_TOKEN: 'github_pat_fine_grained',
+      COPILOT_API_TARGET: 'copilot-api.myorg.ghe.com',
+      COPILOT_INTEGRATION_ID: 'copilot-developer-cli',
+      GITHUB_COPILOT_INTEGRATION_ID: 'fallback-integration',
+    });
+    expect(adapter.getAuthHeaders(fakeReq)['Copilot-Integration-Id']).toBe('copilot-developer-cli');
+    expect(adapter.getReflectionInfo().integration_id_source).toBe('copilot_integration_id');
+  });
+
+  it('ignores the legacy placeholder and uses the GitHub PAT for inference', () => {
+    const adapter = createCopilotAdapter({
+      COPILOT_GITHUB_TOKEN: 'github_pat_fine_grained',
+      COPILOT_PROVIDER_API_KEY: 'placeholder-token-for-credential-isolation',
+      COPILOT_API_TARGET: 'copilot-api.myorg.ghe.com',
+    });
+    expect(adapter.getAuthHeaders(fakeReq)['Authorization']).toBe(['Bearer', 'github_pat_fine_grained'].join(' '));
   });
 
   it('uses "Bearer" prefix for a BYOK key even on the Business target', () => {

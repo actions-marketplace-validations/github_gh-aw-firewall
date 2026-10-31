@@ -56,7 +56,7 @@ export const DANGEROUS_PORTS = [
  * enricher skips them and attributes those denials to "unknown".
  */
 export function generatePolicyManifest(config: SquidConfig): PolicyManifest {
-  const { domains, blockedDomains, sslBump, enableHostAccess, allowHostPorts, enableDlp, dnsServers, apiProxyIp, topologyPeers } = config;
+  const { domains, blockedDomains, sslBump, enableHostAccess, allowHostPorts, enableDlp, dnsServers, apiProxyIp, topologyPeers, networkSubnet } = config;
 
   // Parse, deduplicate, and group domains by protocol (shared logic with generateSquidConfig)
   const { domainsByProto, patternsByProto } = parseDomainConfig(domains);
@@ -68,6 +68,20 @@ export function generatePolicyManifest(config: SquidConfig): PolicyManifest {
   // even though port 8080 is not in Safe_ports. This mirrors the rule ordering
   // in generateSquidConfig / generateTopologyPeersSection.
   addTopologyPeerAllowRules(state, topologyPeers);
+  if (apiProxyIp) {
+    for (const [index, endpoint] of (config.apiProxyUpstreams ?? []).entries()) {
+      if (endpoint.port === 80 || endpoint.port === 443) continue;
+      state.rules.push({
+        id: `allow-api-proxy-upstream-${index}`,
+        order: ++state.order,
+        action: 'allow',
+        aclName: `api_upstream_source api_upstream_${index}_host api_upstream_${index}_port`,
+        protocol: 'both',
+        domains: [],
+        description: `Allow trusted API proxy ${apiProxyIp} to ${endpoint.hostname}:${endpoint.port}, subject to blocklist and DLP`,
+      });
+    }
+  }
   addPortSafetyRules(state);
   addApiProxyAllowRules(state, apiProxyIp);
   addAllowedIpRules(state, domains);
@@ -85,9 +99,11 @@ export function generatePolicyManifest(config: SquidConfig): PolicyManifest {
     dangerousPorts: DANGEROUS_PORTS,
     dnsServers: dnsServers || DEFAULT_DNS_SERVERS,
     sslBumpEnabled: sslBump ?? false,
+    tlsSniGuardEnabled: true,
     dlpEnabled: enableDlp ?? false,
     hostAccessEnabled: enableHostAccess ?? false,
     allowHostPorts: allowHostPorts ?? null,
     ...(topologyPeers && topologyPeers.length > 0 ? { topologyPeers } : {}),
+    ...(networkSubnet ? { networkSubnet } : {}),
   };
 }

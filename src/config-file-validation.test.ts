@@ -11,6 +11,62 @@ describe('validateAwfFileConfig', () => {
     expect(errors).toEqual([]);
   });
 
+  it('validates the versioned provider-scoped pricing catalog contract', () => {
+    const validCatalog = {
+      schemaVersion: 1,
+      unit: 'USD_PER_1M_TOKENS',
+      catalogId: 'github/gh-aw/model-pricing',
+      version: 'sha256:catalog-v1',
+      providers: {
+        copilot: {
+          models: {
+            'gpt-6.1-sol': {
+              input: 10,
+              output: 50,
+              cachedInput: 1,
+              cacheWrite: null,
+              reasoning: 50,
+              longContext: {
+                threshold: 100000,
+                input: 20,
+                output: 100,
+                cachedInput: 2,
+                cacheWrite: 25,
+                reasoning: 100,
+              },
+            },
+          },
+        },
+      },
+    };
+    expect(validateAwfFileConfig({ apiProxy: { modelPricingCatalog: validCatalog } })).toEqual([]);
+    expect(validateAwfFileConfig({
+      apiProxy: {
+        modelPricingCatalog: {
+          ...validCatalog,
+          providers: {
+            copilot: {
+              models: {
+                'gpt-6.1-sol': {
+                  ...validCatalog.providers.copilot.models['gpt-6.1-sol'],
+                  longContext: { threshold: 100000, input: 20 },
+                },
+              },
+            },
+          },
+        },
+      },
+    })).not.toEqual([]);
+    expect(validateAwfFileConfig({
+      apiProxy: {
+        modelPricingCatalog: {
+          ...validCatalog,
+          unit: 'USD_PER_TOKEN',
+        },
+      },
+    })).not.toEqual([]);
+  });
+
   it('reports unknown keys and invalid value types', () => {
     const errors = validateAwfFileConfig({
       network: { allowDomains: 'github.com' },
@@ -115,10 +171,9 @@ describe('validateAwfFileConfig', () => {
     expect(errors).toContain('config.apiProxy.anthropicCacheTailTtl must be one of: 5m, 1h');
   });
 
-  it('validates effective-token guard fields in apiProxy', () => {
+  it('validates AI-credit and model multiplier fields in apiProxy', () => {
     expect(validateAwfFileConfig({
       apiProxy: {
-        maxEffectiveTokens: 5000,
         maxAiCredits: 1.5,
         modelMultipliers: { 'gpt-4o': 2, 'claude-sonnet-4': 1.5 },
         defaultModelMultiplier: 27,
@@ -126,14 +181,19 @@ describe('validateAwfFileConfig', () => {
       },
     })).toEqual([]);
 
-    expect(validateAwfFileConfig({ apiProxy: { maxEffectiveTokens: 0 } }))
-      .toContain('config.apiProxy.maxEffectiveTokens must be a positive integer');
-    expect(validateAwfFileConfig({ apiProxy: { maxAiCredits: 0 } }))
-      .toContain('config.apiProxy.maxAiCredits must be > 0');
+    expect(validateAwfFileConfig({ apiProxy: { maxEffectiveTokens: 0 } })).not.toEqual([]);
     expect(validateAwfFileConfig({ apiProxy: { modelMultipliers: { 'gpt-4o': 0 } } }))
       .toContain('config.apiProxy.modelMultipliers.gpt-4o must be > 0');
     expect(validateAwfFileConfig({ apiProxy: { defaultModelMultiplier: 0 } }))
       .toContain('config.apiProxy.defaultModelMultiplier must be > 0');
+  });
+
+  it.each([-1, 0, 0.5, 10000, 10001])('accepts apiProxy.maxAiCredits of %s', (maxAiCredits) => {
+    expect(validateAwfFileConfig({ apiProxy: { maxAiCredits } })).toEqual([]);
+  });
+
+  it.each([-2, -0.5, '0', '-1', null, true])('rejects invalid apiProxy.maxAiCredits of %s', (maxAiCredits) => {
+    expect(validateAwfFileConfig({ apiProxy: { maxAiCredits } })).not.toEqual([]);
   });
 
   it('validates maxModelMultiplierCap in apiProxy', () => {
@@ -171,6 +231,53 @@ describe('validateAwfFileConfig', () => {
       .toContain('config.apiProxy.modelRouter.providerType must be a string');
     expect(validateAwfFileConfig({ apiProxy: { modelRouter: { baseUrl: 456 } } }))
       .toContain('config.apiProxy.modelRouter.baseUrl must be a string');
+  });
+
+  it('validates closed apiProxy.routing fields', () => {
+    const valid = {
+      candidateModels: ['gpt-5.6-luna'],
+      objective: { goal: 'cost', mode: 'auto' },
+      task: { conversationFile: '/tmp/gh-aw/conversation.json' },
+    };
+
+    expect(validateAwfFileConfig({ experimental: { modelRouting: true }, apiProxy: { routing: valid } })).toEqual([]);
+    expect(validateAwfFileConfig({
+      experimental: { modelRouting: true },
+      apiProxy: { routing: { ...valid, provider: 'anthropic' } },
+    })).toEqual([]);
+    expect(validateAwfFileConfig({
+      experimental: { modelRouting: true },
+      apiProxy: { routing: { ...valid, provider: 'gemini' } },
+    })).toContain('config.apiProxy.routing.provider must be one of: copilot, openai, anthropic');
+    expect(validateAwfFileConfig({
+      experimental: { modelRouting: true },
+      apiProxy: { routing: { ...valid, objective: { ...valid.objective, goal: 'quality' } } },
+    })).toContain('config.apiProxy.routing.objective.goal must be one of: cost, cost-speed');
+    expect(validateAwfFileConfig({
+      experimental: { modelRouting: true },
+      apiProxy: { routing: { ...valid, objective: { ...valid.objective, mode: 'fast' } } },
+    })).toContain(
+      'config.apiProxy.routing.objective.mode must be one of: economy, balanced, robust, auto',
+    );
+    expect(validateAwfFileConfig({
+      experimental: { modelRouting: true },
+      apiProxy: { routing: { ...valid, unexpected: true } },
+    })).toContain('config.apiProxy.routing.unexpected is not supported');
+    expect(validateAwfFileConfig({
+      experimental: { modelRouting: true },
+      apiProxy: { routing: { ...valid, candidateModels: [] } },
+    })).toContain('config.apiProxy.routing.candidateModels must NOT have fewer than 1 items');
+    for (const experimental of [undefined, { modelRouting: false }, {}]) {
+      expect(validateAwfFileConfig({ experimental, apiProxy: { routing: valid } }))
+        .toContain('config.apiProxy.routing requires experimental.modelRouting: true');
+    }
+    expect(validateAwfFileConfig({ experimental: { modelRouting: true } })).toEqual([]);
+    expect(validateAwfFileConfig({ experimental: { modelRouting: false } })).toEqual([]);
+    expect(validateAwfFileConfig({})).toEqual([]);
+    expect(validateAwfFileConfig({ experimental: { modelRouting: 'yes' } }))
+      .toContain('config.experimental.modelRouting must be a boolean');
+    expect(validateAwfFileConfig({ experimental: { unknown: true } }))
+      .toContain('config.experimental.unknown is not supported');
   });
 
   it('rejects non-object apiProxy.targets', () => {
@@ -571,9 +678,26 @@ describe('validateAwfFileConfig', () => {
     expect(errors).toContain('config.rateLimiting.bytesPerMinute must be a positive integer');
   });
 
+  it('rejects non-positive GitHub API point budgets', () => {
+    const errors = validateAwfFileConfig({
+      rateLimiting: { maxGithubApiPointsRest: 0, maxGithubApiPointsGraphql: -1 },
+    });
+    expect(errors).toContain('config.rateLimiting.maxGithubApiPointsRest must be a positive integer');
+    expect(errors).toContain('config.rateLimiting.maxGithubApiPointsGraphql must be a positive integer');
+  });
+
+  it('rejects a non-positive enclave tool-call cap', () => {
+    const errors = validateAwfFileConfig({ rateLimiting: { maxNumToolCalls: 0 } });
+    expect(errors).toContain('config.rateLimiting.maxNumToolCalls must be a positive integer');
+    expect(validateAwfFileConfig({ rateLimiting: { maxNumToolCalls: 10 } })).toEqual([]);
+  });
+
   it('accepts valid rateLimiting values', () => {
     const errors = validateAwfFileConfig({
-      rateLimiting: { enabled: true, requestsPerMinute: 60, requestsPerHour: 3600, bytesPerMinute: 1048576 },
+      rateLimiting: {
+        enabled: true, requestsPerMinute: 60, requestsPerHour: 3600, bytesPerMinute: 1048576,
+        maxGithubApiPointsRest: 2000, maxGithubApiPointsGraphql: 2000,
+      },
     });
     expect(errors).toEqual([]);
   });

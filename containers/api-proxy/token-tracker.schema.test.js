@@ -20,6 +20,7 @@ const {
   incrementTokenMetrics,
   validateTokenDiagRecord,
   TOKEN_DIAG_SCHEMA,
+  TOKEN_USAGE_SCHEMA,
 } = require('./token-persistence');
 const { EventEmitter } = require('events');
 const { buildAnthropicUsageFrames } = require('./test-helpers/websocket-frame-helpers');
@@ -127,6 +128,9 @@ describe('shared token usage helpers', () => {
       streaming: false,
       duration: 123,
       responseBytes: 456,
+      steering: { type: 'ai_credit', threshold: 90 },
+      requestedEndpoint: '/chat/completions',
+      upstreamEndpoint: '/responses',
     });
 
     expect(record).toMatchObject({
@@ -143,8 +147,125 @@ describe('shared token usage helpers', () => {
       cache_write_tokens: 1,
       duration_ms: 123,
       response_bytes: 456,
+      steering: { type: 'ai_credit', threshold: 90 },
+      requested_endpoint: '/chat/completions',
+      upstream_endpoint: '/responses',
     });
     expect(validateTokenUsageRecord(record)).toBe(true);
+  });
+
+  test('buildTokenUsageRecord persists a trusted request purpose and omits it otherwise', () => {
+    const usage = { input_tokens: 1, output_tokens: 2, cache_read_tokens: 0, cache_write_tokens: 0 };
+    const opts = {
+      requestId: 'purpose-record-test',
+      provider: 'copilot',
+      model: 'gpt-5.4',
+      reqPath: '/chat/completions',
+      status: 200,
+      streaming: false,
+      duration: 12,
+      responseBytes: 34,
+    };
+
+    const routingRecord = buildTokenUsageRecord(usage, { ...opts, purpose: 'routing_classification' });
+    expect(routingRecord.purpose).toBe('routing_classification');
+    expect(validateTokenUsageRecord(routingRecord)).toBe(true);
+
+    const agentRecord = buildTokenUsageRecord(usage, opts);
+    expect(agentRecord).not.toHaveProperty('purpose');
+    expect(validateTokenUsageRecord(agentRecord)).toBe(true);
+
+    const schema = JSON.parse(fs.readFileSync(require('path').join(__dirname, '..', '..', 'schemas', 'token-usage.schema.json'), 'utf8'));
+    expect(schema.properties.purpose.enum).toContain('routing_classification');
+  });
+
+  describe('caller attribution', () => {
+    const { parseCallerHeader } = require('./caller-header');
+    const schema = JSON.parse(fs.readFileSync(require('path').join(__dirname, '..', '..', 'schemas', 'token-usage.schema.json'), 'utf8'));
+    const usage = { input_tokens: 7, output_tokens: 3, cache_read_tokens: 1, cache_write_tokens: 0 };
+    const opts = {
+      requestId: 'caller-record-test',
+      provider: 'copilot',
+      model: 'gpt-5.4',
+      reqPath: '/chat/completions',
+      status: 200,
+      streaming: true,
+      duration: 42,
+      responseBytes: 99,
+    };
+
+    function expectSchemaCompatible(record) {
+      expect(validateTokenUsageRecord(record)).toBe(true);
+      if ('purpose' in record) expect(schema.properties.purpose.enum).toContain(record.purpose);
+      if ('caller_source' in record) expect(schema.properties.caller_source.enum).toContain(record.caller_source);
+      if ('agent_name' in record) {
+        expect(record.agent_name).toMatch(new RegExp(schema.properties.agent_name.pattern));
+        expect(record.agent_name.length).toBeLessThanOrEqual(schema.properties.agent_name.maxLength);
+      }
+    }
+
+    test('buildTokenUsageRecord records a sub-agent caller', () => {
+      const record = buildTokenUsageRecord(usage, { ...opts, caller: parseCallerHeader('subagent/file-summarizer') });
+      expect(record).toMatchObject({
+        purpose: 'subagent',
+        agent_name: 'file-summarizer',
+        caller_source: 'caller_header',
+      });
+      expectSchemaCompatible(record);
+    });
+
+    test('buildTokenUsageRecord records the main-agent caller without agent_name', () => {
+      const record = buildTokenUsageRecord(usage, { ...opts, caller: parseCallerHeader('main') });
+      expect(record).toMatchObject({ purpose: 'agent', caller_source: 'caller_header' });
+      expect(record).not.toHaveProperty('agent_name');
+      expectSchemaCompatible(record);
+    });
+
+    test('buildTokenUsageRecord is unchanged when no caller is present', () => {
+      jest.useFakeTimers({ now: new Date('2026-01-02T03:04:05.678Z') });
+      try {
+        const expected = {
+          _schema: TOKEN_USAGE_SCHEMA,
+          timestamp: '2026-01-02T03:04:05.678Z',
+          event: 'token_usage',
+          request_id: 'caller-record-test',
+          provider: 'copilot',
+          model: 'gpt-5.4',
+          path: '/chat/completions',
+          status: 200,
+          streaming: true,
+          input_tokens: 7,
+          output_tokens: 3,
+          cache_read_tokens: 1,
+          cache_write_tokens: 0,
+          duration_ms: 42,
+          response_bytes: 99,
+        };
+        expect(buildTokenUsageRecord(usage, opts)).toStrictEqual(expected);
+        expect(buildTokenUsageRecord(usage, { ...opts, caller: null })).toStrictEqual(expected);
+        for (const value of ['x'.repeat(129), 'subagent/file summarizer', 'subagent/', 'admin', 'main, main']) {
+          expect(buildTokenUsageRecord(usage, { ...opts, caller: parseCallerHeader(value) })).toStrictEqual(expected);
+        }
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    test('buildTokenUsageRecord prefers the AWF purpose over a caller header', () => {
+      const classifier = buildTokenUsageRecord(usage, { ...opts, purpose: 'routing_classification' });
+      expect(classifier).toMatchObject({ purpose: 'routing_classification', caller_source: 'awf' });
+      expect(classifier).not.toHaveProperty('agent_name');
+      expectSchemaCompatible(classifier);
+
+      const spoofed = buildTokenUsageRecord(usage, {
+        ...opts,
+        purpose: 'routing_classification',
+        caller: parseCallerHeader('subagent/x'),
+      });
+      expect(spoofed).toMatchObject({ purpose: 'routing_classification', caller_source: 'awf' });
+      expect(spoofed).not.toHaveProperty('agent_name');
+      expectSchemaCompatible(spoofed);
+    });
   });
 
   test('incrementTokenMetrics is a no-op when metrics sink is missing', () => {
@@ -361,6 +482,58 @@ describe('token-usage JSONL record schema field', () => {
     }, 20);
   });
 
+  test('trackTokenUsage HTTP path persists the caller fields', (done) => {
+    const { parseCallerHeader } = require('./caller-header');
+    const proxyRes = new EventEmitter();
+    proxyRes.headers = { 'content-type': 'application/json' };
+    proxyRes.statusCode = 200;
+
+    trackTokenUsage(proxyRes, {
+      requestId: 'caller-http',
+      provider: 'openai',
+      path: '/v1/chat/completions',
+      startTime: Date.now(),
+      metrics: null,
+      caller: parseCallerHeader('subagent/file-summarizer'),
+    });
+
+    proxyRes.emit('data', Buffer.from(JSON.stringify({
+      model: 'gpt-4o',
+      usage: { prompt_tokens: 10, completion_tokens: 5, total_tokens: 15 },
+    })));
+    proxyRes.emit('end');
+
+    setTimeout(() => {
+      const [parsed] = mockStream.writtenRecords.filter(r => r.request_id === 'caller-http');
+      expect(parsed).toMatchObject({ purpose: 'subagent', agent_name: 'file-summarizer', caller_source: 'caller_header' });
+      done();
+    }, 20);
+  });
+
+  test('trackWebSocketTokenUsage path persists the caller fields', (done) => {
+    const { parseCallerHeader } = require('./caller-header');
+    const socket = new EventEmitter();
+
+    trackWebSocketTokenUsage(socket, {
+      requestId: 'caller-ws',
+      provider: 'anthropic',
+      path: '/v1/messages',
+      startTime: Date.now(),
+      metrics: null,
+      caller: parseCallerHeader('main'),
+    });
+
+    socket.emit('data', buildAnthropicUsageFrames());
+    socket.emit('close');
+
+    setTimeout(() => {
+      const [parsed] = mockStream.writtenRecords.filter(r => r.request_id === 'caller-ws');
+      expect(parsed).toMatchObject({ purpose: 'agent', caller_source: 'caller_header' });
+      expect(parsed).not.toHaveProperty('agent_name');
+      done();
+    }, 20);
+  });
+
   test('trackTokenUsage HTTP path persists optional budget fields returned by onUsage', (done) => {
     const proxyRes = new EventEmitter();
     proxyRes.headers = { 'content-type': 'application/json' };
@@ -373,11 +546,10 @@ describe('token-usage JSONL record schema field', () => {
       startTime: Date.now(),
       metrics: null,
       onUsage: () => ({
-        effective_tokens_this_response: 40,
-        effective_tokens_total: 140,
-        model_multiplier: 2,
         ai_credits_this_response: 0.01,
         ai_credits_total: 0.05,
+        ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
+        ai_credits_pricing_catalog_version: 'sha256:test-http-catalog',
       }),
     });
 
@@ -393,12 +565,12 @@ describe('token-usage JSONL record schema field', () => {
       const parsed = usageRecords[0];
       expect(parsed).toMatchObject({
         request_id: 'budget-fields-http',
-        effective_tokens_this_response: 40,
-        effective_tokens_total: 140,
-        model_multiplier: 2,
         ai_credits_this_response: 0.01,
         ai_credits_total: 0.05,
+        ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
+        ai_credits_pricing_catalog_version: 'sha256:test-http-catalog',
       });
+      expect(validateTokenUsageRecord(parsed)).toBe(true);
       done();
     }, 20);
   });
@@ -427,11 +599,10 @@ describe('token-usage JSONL record schema field', () => {
       const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
-      expect(parsed.effective_tokens_this_response).toBeUndefined();
-      expect(parsed.effective_tokens_total).toBeUndefined();
-      expect(parsed.model_multiplier).toBeUndefined();
       expect(parsed.ai_credits_this_response).toBeUndefined();
       expect(parsed.ai_credits_total).toBeUndefined();
+      expect(parsed.ai_credits_pricing_catalog_id).toBeUndefined();
+      expect(parsed.ai_credits_pricing_catalog_version).toBeUndefined();
       done();
     }, 20);
   });
@@ -446,11 +617,10 @@ describe('token-usage JSONL record schema field', () => {
       startTime: Date.now(),
       metrics: null,
       onUsage: () => ({
-        effective_tokens_this_response: 112,
-        effective_tokens_total: 224,
-        model_multiplier: 4,
         ai_credits_this_response: 0.02,
         ai_credits_total: 0.08,
+        ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
+        ai_credits_pricing_catalog_version: 'sha256:test-ws-catalog',
       }),
     });
 
@@ -463,12 +633,12 @@ describe('token-usage JSONL record schema field', () => {
       const parsed = usageRecords[0];
       expect(parsed).toMatchObject({
         request_id: 'budget-fields-ws',
-        effective_tokens_this_response: 112,
-        effective_tokens_total: 224,
-        model_multiplier: 4,
         ai_credits_this_response: 0.02,
         ai_credits_total: 0.08,
+        ai_credits_pricing_catalog_id: 'github/gh-aw/model-pricing',
+        ai_credits_pricing_catalog_version: 'sha256:test-ws-catalog',
       });
+      expect(validateTokenUsageRecord(parsed)).toBe(true);
       done();
     }, 20);
   });
@@ -492,11 +662,10 @@ describe('token-usage JSONL record schema field', () => {
       const usageRecords = mockStream.writtenRecords.filter(r => r._schema);
       expect(usageRecords).toHaveLength(1);
       const parsed = usageRecords[0];
-      expect(parsed.effective_tokens_this_response).toBeUndefined();
-      expect(parsed.effective_tokens_total).toBeUndefined();
-      expect(parsed.model_multiplier).toBeUndefined();
       expect(parsed.ai_credits_this_response).toBeUndefined();
       expect(parsed.ai_credits_total).toBeUndefined();
+      expect(parsed.ai_credits_pricing_catalog_id).toBeUndefined();
+      expect(parsed.ai_credits_pricing_catalog_version).toBeUndefined();
       done();
     }, 20);
   });
@@ -518,6 +687,57 @@ describe('token-usage file sentinel', () => {
       expect(fs.existsSync(isolated.TOKEN_LOG_FILE)).toBe(true);
     } finally {
       await isolated.closeLogStream();
+    }
+  });
+
+  test('creates audit records with owner-only permissions', async () => {
+    const originalDir = process.env.AWF_TOKEN_LOG_DIR;
+    const auditDir = fs.mkdtempSync('/tmp/awf-audit-permissions-');
+    process.env.AWF_TOKEN_LOG_DIR = auditDir;
+    let isolated;
+    jest.isolateModules(() => {
+      isolated = require('./token-persistence');
+    });
+
+    try {
+      isolated.auditTrack('UPSTREAM_ERROR_RESPONSE', { response_body: 'redacted' });
+      await isolated.closeLogStream();
+      expect(fs.statSync(isolated.AUDIT_LOG_FILE).mode & 0o777).toBe(0o600);
+    } finally {
+      if (originalDir === undefined) delete process.env.AWF_TOKEN_LOG_DIR;
+      else process.env.AWF_TOKEN_LOG_DIR = originalDir;
+      fs.rmSync(auditDir, { recursive: true, force: true });
+    }
+  });
+
+  test('creates upstream error records with owner-only permissions', async () => {
+    const originalDir = process.env.AWF_TOKEN_LOG_DIR;
+    const auditDir = fs.mkdtempSync('/tmp/awf-upstream-error-permissions-');
+    process.env.AWF_TOKEN_LOG_DIR = auditDir;
+    let isolated;
+    jest.isolateModules(() => {
+      isolated = require('./token-persistence');
+    });
+
+    try {
+      isolated.auditUpstreamErrorResponse({ request_id: 'req-1', response_body: 'redacted' });
+      await isolated.closeLogStream();
+      const fd = fs.openSync(isolated.UPSTREAM_ERROR_LOG_FILE, 'r');
+      try {
+        expect(fs.fstatSync(fd).mode & 0o777).toBe(0o600);
+        const record = JSON.parse(fs.readFileSync(fd, 'utf8'));
+        expect(record).toMatchObject({
+          event: 'UPSTREAM_ERROR_RESPONSE',
+          request_id: 'req-1',
+          response_body: 'redacted',
+        });
+      } finally {
+        fs.closeSync(fd);
+      }
+    } finally {
+      if (originalDir === undefined) delete process.env.AWF_TOKEN_LOG_DIR;
+      else process.env.AWF_TOKEN_LOG_DIR = originalDir;
+      fs.rmSync(auditDir, { recursive: true, force: true });
     }
   });
 });

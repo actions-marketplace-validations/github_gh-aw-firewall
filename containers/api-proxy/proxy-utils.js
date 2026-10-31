@@ -11,14 +11,23 @@
 const { URL } = require('url');
 
 /**
- * Normalizes an API target value to a bare hostname.
- * Accepts either a hostname or a full URL and extracts only the hostname,
- * discarding any scheme, path, query, fragment, credentials, or port.
- * Path configuration must be provided separately via the existing
+ * Normalizes an API target value to a host (including its port), optionally prefixed with an
+ * explicit `http://` scheme.
+ * Accepts either a hostname or a full URL and extracts the host,
+ * discarding any path, query, fragment, or credentials. Path
+ * configuration must be provided separately via the existing
  * *_API_BASE_PATH environment variables.
  *
+ * A bare hostname or an explicit `https://` URL both normalize to the bare
+ * hostname (HTTPS is the implicit default, matching existing behavior).
+ * An explicit `http://` URL preserves the `http://` prefix so that
+ * downstream consumers (see getTargetScheme/stripTargetScheme) can dial the
+ * target in cleartext instead of always assuming HTTPS —
+ * this mirrors the runner-side allowlist, which already treats `http://`
+ * targets as a supported, explicitly opted-in configuration.
+ *
  * @param {string|undefined} value - Raw env var value
- * @returns {string|undefined} Bare hostname, the original falsy value if input is falsy (e.g. '' stays ''), or undefined if parsing fails
+ * @returns {string|undefined} Hostname (optionally `http://`-prefixed), the original falsy value if input is falsy (e.g. '' stays ''), or undefined if parsing fails
  */
 function normalizeApiTarget(value) {
   if (!value) return value;
@@ -26,22 +35,65 @@ function normalizeApiTarget(value) {
   const parsed = parseApiTargetUrl(value);
   if (parsed.kind === 'empty') return undefined;
   if (parsed.kind === 'invalid') {
-    console.warn(`Invalid API target ${parsed.safe}; expected a hostname (e.g. 'api.example.com') or URL`);
+    console.warn('Invalid API target; expected a hostname (e.g. \'api.example.com\') or URL');
     return undefined;
   }
 
   if (parsed.kind === 'ok') {
-    if (parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password || parsed.port) {
+    if (parsed.pathname !== '/' || parsed.search || parsed.hash || parsed.username || parsed.password) {
+      const displayTarget = parsed.hostname
+        ? `${parsed.protocol}//${parsed.hostname}${parsed.port ? `:${parsed.port}` : ''}`
+        : '<unknown target>';
       console.warn(
-        `Ignoring unsupported API target URL components in ${parsed.safe}; ` +
+        `Ignoring unsupported API target URL components in ${displayTarget}; ` +
         'configure path prefixes via the corresponding *_API_BASE_PATH environment variable.'
       );
     }
 
-    return parsed.hostname || undefined;
+    if (!parsed.hostname) return undefined;
+    return formatApiTarget(parsed);
   }
 
   return undefined;
+}
+
+function formatApiTarget(parsed) {
+  const host = parsed.hostname + (parsed.port ? `:${parsed.port}` : '');
+  return parsed.protocol === 'http:' ? `http://${host}` : host;
+}
+
+/** Return only the hostname for provider identity checks, excluding scheme/port. */
+function getTargetHostname(value) {
+  if (!value) return undefined;
+  const parsed = parseApiTargetUrl(value);
+  return parsed.kind === 'ok' ? parsed.hostname : undefined;
+}
+
+/**
+ * Returns the scheme implied by a normalized API target (see normalizeApiTarget):
+ * 'http' when the target carries the explicit `http://` prefix, 'https' otherwise
+ * (the default).
+ *
+ * @param {string|undefined} rawTarget - Value returned by normalizeApiTarget (or a default hostname)
+ * @returns {'http'|'https'}
+ */
+function getTargetScheme(rawTarget) {
+  return typeof rawTarget === 'string' && rawTarget.startsWith('http://') ? 'http' : 'https';
+}
+
+/**
+ * Strips the explicit `http://` scheme prefix added by normalizeApiTarget (if
+ * present), recovering the host (including its port) for use in Host headers, request
+ * signing, logging, and other places that must never see a scheme prefix.
+ *
+ * @param {string|undefined} rawTarget - Value returned by normalizeApiTarget (or a default hostname)
+ * @returns {string|undefined} Host including any non-default port
+ */
+function stripTargetScheme(rawTarget) {
+  if (typeof rawTarget === 'string' && rawTarget.startsWith('http://')) {
+    return rawTarget.slice('http://'.length);
+  }
+  return rawTarget;
 }
 
 /**
@@ -58,7 +110,7 @@ function parseApiTargetAndBasePath(value) {
   if (parsed.kind !== 'ok') return { target: undefined, basePath: '' };
 
   return {
-    target: parsed.hostname || undefined,
+    target: parsed.hostname ? formatApiTarget(parsed) : undefined,
     basePath: normalizeBasePath(parsed.pathname),
   };
 }
@@ -70,14 +122,13 @@ function parseApiTargetUrl(value) {
   const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed)
     ? trimmed
     : `https://${trimmed}`;
-  const safe = trimmed.replace(/[\x00-\x1f\x7f]/g, '?');
 
   try {
     const parsed = new URL(candidate);
     return {
       kind: 'ok',
-      safe,
       hostname: parsed.hostname,
+      protocol: parsed.protocol,
       pathname: parsed.pathname,
       search: parsed.search,
       hash: parsed.hash,
@@ -86,7 +137,7 @@ function parseApiTargetUrl(value) {
       port: parsed.port,
     };
   } catch {
-    return { kind: 'invalid', safe };
+    return { kind: 'invalid' };
   }
 }
 
@@ -180,6 +231,8 @@ const STRIPPED_HEADERS = new Set([
   'x-goog-api-key',
   'forwarded',
   'via',
+  // Caller attribution metadata for AWF only; never forwarded, valid or not.
+  'x-awf-caller',
 ]);
 
 /** Returns true if the header name should be stripped (case-insensitive). */
@@ -206,11 +259,11 @@ function composeBodyTransforms(first, second) {
   if (!first) return second;
   if (!second) return first;
   const isPromise = (v) => v && typeof v.then === 'function';
-  return (body) => {
-    const a = first(body);
+  return (body, ...args) => {
+    const a = first(body, ...args);
     if (isPromise(a)) {
       return Promise.resolve(a).then((aResolved) => {
-        const b = second(aResolved !== null ? aResolved : body);
+        const b = second(aResolved !== null ? aResolved : body, ...args);
         if (isPromise(b)) {
           return Promise.resolve(b).then((bResolved) => {
             if (bResolved !== null) return bResolved;
@@ -224,7 +277,7 @@ function composeBodyTransforms(first, second) {
       });
     }
 
-    const b = second(a !== null ? a : body);
+    const b = second(a !== null ? a : body, ...args);
     if (isPromise(b)) {
       return Promise.resolve(b).then((bResolved) => {
         if (bResolved !== null) return bResolved;
@@ -309,6 +362,9 @@ function sanitizeAcceptEncoding(value) {
 
 module.exports = {
   normalizeApiTarget,
+  getTargetScheme,
+  getTargetHostname,
+  stripTargetScheme,
   parseApiTargetAndBasePath,
   normalizeBasePath,
   buildUpstreamPath,

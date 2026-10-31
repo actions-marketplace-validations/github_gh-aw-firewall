@@ -1,4 +1,9 @@
 import { generateDockerCompose, WrapperConfig, baseConfig, mockNetworkConfig, useTempWorkDir } from './service-test-setup.test-utils';
+import { SQUID_LOG_FILES } from './squid-service';
+import { generateSquidConfig } from '../squid-config';
+import { execFileSync } from 'child_process';
+import * as fs from 'fs';
+import * as path from 'path';
 
 // Create mock functions (must remain per-file — jest.mock() is hoisted before imports)
 
@@ -42,6 +47,17 @@ describe('squid service', () => {
       expect(squid.stop_grace_period).toBe('2s');
     });
 
+    it('should set a bounded restart policy so a transient crash self-heals', () => {
+      // Squid runs as PID 1 in the foreground; without a restart policy, a
+      // transient crash tears down its network endpoint and peers see a bare
+      // EHOSTUNREACH on their next connection attempt instead of Docker
+      // bringing it back up. The retry count stays bounded so persistent
+      // startup failures still surface via didContainerFailStartup().
+      const result = generateDockerCompose(mockConfig, mockNetworkConfig);
+      const squid = result.services['squid-proxy'] as any;
+      expect(squid.restart).toBe('on-failure:3');
+    });
+
     it('should inject squid config via base64 env var when content is provided', () => {
       const squidConfig = 'http_port 3128\nacl allowed_domains dstdomain .github.com\n';
       const result = generateDockerCompose(mockConfig, mockNetworkConfig, undefined, squidConfig);
@@ -55,7 +71,54 @@ describe('squid service', () => {
       // Should override entrypoint to decode config before starting squid
       expect(squid.entrypoint).toBeDefined();
       expect(squid.entrypoint[2]).toContain('base64 -d > /etc/squid/squid.conf');
+      expect(squid.entrypoint[2]).toContain('Generating ephemeral TLS SNI guard certificate');
+      expect(squid.entrypoint[2]).toContain('/var/run/squid/awf-sni-guard-cert.pem');
+      expect(squid.entrypoint[2]).toContain('openssl req -x509');
       expect(squid.entrypoint[2]).toContain('entrypoint.sh');
+    });
+
+    it.each([true, false])('preserves the log umask when SNI guard is enabled: %s', (enabled) => {
+      const squidConfig = generateSquidConfig({ domains: [], port: 3128 });
+      const squidUmask = squidConfig.match(/^umask ([0-7]{3,4})$/m)?.[1];
+      expect(squidUmask).toBe('022');
+      const result = generateDockerCompose(mockConfig, mockNetworkConfig, undefined, squidConfig);
+      const inlineScript: string = result.services['squid-proxy'].entrypoint![2];
+      const guard = inlineScript.match(/if grep -Fq .*?; fi/)![0];
+      const keyFile = path.join(mockConfig.workDir, 'guard-key.pem');
+      const certFile = path.join(mockConfig.workDir, 'guard-cert.pem');
+      const env = {
+        ...process.env,
+        KEY_FILE: keyFile,
+        CERT_FILE: certFile,
+        LOG_DIR: mockConfig.workDir,
+      };
+      const setup = `umask 027; umask ${squidUmask}; grep() { return ${enabled ? 0 : 1}; }; ` +
+        'openssl() { : > "$KEY_FILE"; : > "$CERT_FILE"; }; ';
+
+      execFileSync('/bin/bash', ['-c', setup + guard + ' && ' +
+        'for name in access.log audit.jsonl cache.log; do : > "$LOG_DIR/$name"; done'], { env });
+
+      for (const logFile of SQUID_LOG_FILES) {
+        const stat = fs.statSync(path.join(mockConfig.workDir, path.basename(logFile)));
+        expect(stat.mode & 0o777).toBe(0o644);
+      }
+      if (enabled) {
+        expect(fs.statSync(keyFile).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(certFile).mode & 0o777).toBe(0o600);
+      } else {
+        expect(fs.existsSync(keyFile)).toBe(false);
+        expect(fs.existsSync(certFile)).toBe(false);
+      }
+    });
+
+    it('does not start Squid if SNI guard certificate generation fails', () => {
+      const result = generateDockerCompose(mockConfig, mockNetworkConfig, undefined, 'http_port 3128\n');
+      const inlineScript: string = result.services['squid-proxy'].entrypoint![2];
+      const guard = inlineScript.match(/if grep -Fq .*?; fi/)![0];
+
+      expect(() => execFileSync('/bin/bash', ['-c',
+        'grep() { return 0; }; openssl() { return 42; }; ' + guard + ' && echo started',
+      ], { stdio: 'pipe' })).toThrow(expect.objectContaining({ status: 42 }));
     });
 
     // Regression: on split runner/Docker daemon filesystems (ARC + DinD), Docker
@@ -79,6 +142,9 @@ describe('squid service', () => {
       // does not traverse a potentially large user-supplied proxyLogsDir.
       expect(inlineScript).toMatch(/(^|[^R])chown proxy:proxy \/var\/log\/squid/);
       expect(inlineScript).not.toContain('chown -R');
+      expect(inlineScript).toContain(`for f in ${SQUID_LOG_FILES.join(' ')}`);
+      expect(inlineScript).toContain('if [ -L "$$f" ] || [ -e "$$f" ]; then chown -h proxy:proxy "$$f" 2>/dev/null || true; fi');
+      expect(inlineScript).not.toContain('chmod 0666 "$$f"');
       // The SSL DB chown is conditional on the dir existing so it is a no-op
       // when SSL Bump is disabled but engages automatically when it is enabled.
       // Falls back to chmod 0777 if chown is denied (tolerant, like config-writer.ts).
@@ -106,6 +172,8 @@ describe('squid service', () => {
       const inlineScript: string = squid.entrypoint[2];
       expect(inlineScript).toContain('chown proxy:proxy /var/log/squid');
       expect(inlineScript).not.toContain('chown -R');
+      expect(inlineScript).toContain(`for f in ${SQUID_LOG_FILES.join(' ')}`);
+      expect(inlineScript).toContain('chown -h proxy:proxy "$$f"');
       expect(inlineScript).toContain('exec su -s /bin/bash proxy -c');
       // Without injected config, the entrypoint should still hand off to the
       // image's original entrypoint script (which handles IPv6 stripping etc.).

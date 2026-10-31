@@ -1,11 +1,10 @@
 'use strict';
 
-const { applyEffectiveTokenUsage } = require('./guards/effective-token-guard');
 const { applyAiCreditsUsage } = require('./guards/ai-credits-guard');
 const { applyMaxCacheMissesUsage } = require('./guards/max-cache-misses-guard');
 
 /**
- * Apply effective-token and AI-credits usage guards, emit a token_budget_usage
+ * Apply the AI-credits usage guard, emit a token_budget_usage
  * log entry when AI credits are consumed, and return the budget fields to be
  * persisted in the token-usage JSONL record.
  *
@@ -17,10 +16,12 @@ const { applyMaxCacheMissesUsage } = require('./guards/max-cache-misses-guard');
  * @param {string|undefined} model
  * @returns {object|undefined} Budget fields for JSONL persistence, or undefined if neither guard is active.
  */
-function computeTokenBudgetUsage({ logRequest, requestId, provider }, normalizedUsage, model) {
-  const effectiveTokenUsage = applyEffectiveTokenUsage(normalizedUsage, model);
-  const aiCreditsUsage = applyAiCreditsUsage(normalizedUsage, model, provider);
-  applyMaxCacheMissesUsage(normalizedUsage);
+function computeTokenBudgetUsage(context, normalizedUsage, model) {
+  const { logRequest, requestId, provider, purpose } = context;
+  const options = Object.hasOwn(context, 'catalogue') ? { catalogue: context.catalogue } : {};
+  if (context.runtimeCatalog) options.runtimeCatalog = context.runtimeCatalog;
+  const aiCreditsUsage = applyAiCreditsUsage(normalizedUsage, model, provider, options);
+  if (purpose !== 'routing_classification') applyMaxCacheMissesUsage(normalizedUsage);
   if (aiCreditsUsage) {
     logRequest('info', 'token_budget_usage', {
       request_id: requestId,
@@ -30,22 +31,28 @@ function computeTokenBudgetUsage({ logRequest, requestId, provider }, normalized
       ai_credits_total: aiCreditsUsage.totalAiCredits,
       pricing_source: aiCreditsUsage.pricingSource,
       pricing_tier: aiCreditsUsage.pricingTier,
+      ...(aiCreditsUsage.pricingCatalogId ? { pricing_catalog_id: aiCreditsUsage.pricingCatalogId } : {}),
+      ...(aiCreditsUsage.pricingCatalogVersion
+        ? { pricing_catalog_version: aiCreditsUsage.pricingCatalogVersion }
+        : {}),
       accounting_policy: aiCreditsUsage.accountingPolicy,
       fallback_pricing_used: aiCreditsUsage.fallbackPricingUsed,
       dynamic_selector: aiCreditsUsage.dynamicSelector,
+      ...(purpose ? { purpose } : {}),
     });
   }
   const budgetFields = {};
-  if (effectiveTokenUsage) {
-    budgetFields.effective_tokens_this_response = effectiveTokenUsage.effectiveTokensThisResponse;
-    budgetFields.effective_tokens_total = effectiveTokenUsage.totalEffectiveTokens;
-    budgetFields.model_multiplier = effectiveTokenUsage.modelMultiplier;
-  }
   if (aiCreditsUsage) {
     budgetFields.ai_credits_this_response = aiCreditsUsage.aiCreditsThisResponse;
     budgetFields.ai_credits_total = aiCreditsUsage.totalAiCredits;
     budgetFields.ai_credits_pricing_source = aiCreditsUsage.pricingSource;
     budgetFields.ai_credits_pricing_tier = aiCreditsUsage.pricingTier;
+    if (aiCreditsUsage.pricingCatalogId) {
+      budgetFields.ai_credits_pricing_catalog_id = aiCreditsUsage.pricingCatalogId;
+    }
+    if (aiCreditsUsage.pricingCatalogVersion) {
+      budgetFields.ai_credits_pricing_catalog_version = aiCreditsUsage.pricingCatalogVersion;
+    }
     budgetFields.ai_credits_accounting_policy = aiCreditsUsage.accountingPolicy;
     budgetFields.ai_credits_fallback_pricing_used = aiCreditsUsage.fallbackPricingUsed;
     budgetFields.ai_credits_dynamic_selector = aiCreditsUsage.dynamicSelector;

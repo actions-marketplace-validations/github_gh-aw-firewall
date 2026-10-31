@@ -12,7 +12,7 @@
  */
 
 const { InMemorySpanExporter, SimpleSpanProcessor } = require('@opentelemetry/sdk-trace-node');
-const { SpanKind, SpanStatusCode } = require('@opentelemetry/api');
+const { SpanKind, SpanStatusCode, trace, context, createTraceState, INVALID_SPAN_CONTEXT } = require('@opentelemetry/api');
 const { EventEmitter } = require('events');
 const fs = require('fs');
 const { loadOtelModule } = require('./test-helpers/otel-test-utils');
@@ -23,8 +23,8 @@ const { loadOtelModule } = require('./test-helpers/otel-test-utils');
  * Load a fresh instance of otel.js with the given env overrides.
  * Clears the module cache so each call starts from a clean state.
  */
-function loadOtel(envOverrides = {}) {
-  return loadOtelModule(envOverrides);
+function loadOtel(envOverrides = {}, options = {}) {
+  return loadOtelModule(envOverrides, options);
 }
 
 /**
@@ -32,17 +32,9 @@ function loadOtel(envOverrides = {}) {
  * InMemorySpanExporter so we can inspect finished spans.
  */
 function loadOtelWithMemoryExporter(envOverrides = {}) {
-  const otel = loadOtel(envOverrides);
-
-  // Swap exporter via the provider's MultiSpanProcessor
   const memExporter = new InMemorySpanExporter();
-  const provider = otel._provider || null;
-  if (provider && provider.activeSpanProcessor) {
-    // Replace all span processors with a simple synchronous one
-    provider.activeSpanProcessor._spanProcessors = [
-      new SimpleSpanProcessor(memExporter),
-    ];
-  }
+  const spanProcessor = new SimpleSpanProcessor(memExporter);
+  const otel = loadOtel(envOverrides, { spanProcessor });
   return { otel, memExporter };
 }
 
@@ -175,7 +167,7 @@ describe('otel — startRequestSpan', () => {
     await otel._provider.forceFlush();
     const spans = memExporter.getFinishedSpans();
     expect(spans[0].spanContext().traceId).toBe(traceId);
-    expect(spans[0].parentSpanId).toBe(spanId);
+    expect(spans[0].parentSpanContext?.spanId).toBe(spanId);
   });
 
   test('ignores invalid parent trace IDs', async () => {
@@ -191,7 +183,7 @@ describe('otel — startRequestSpan', () => {
 
     await otel._provider.forceFlush();
     const spans = memExporter.getFinishedSpans();
-    expect(spans[0].parentSpanId).toBeUndefined();
+    expect(spans[0].parentSpanContext).toBeUndefined();
   });
 });
 
@@ -264,7 +256,7 @@ describe('otel — setTokenAttributes', () => {
 });
 
 describe('otel — setBudgetAttributes', () => {
-  test('sets AI credits and model unit attributes as strings', async () => {
+  test('sets AI credit attributes as strings', async () => {
     const { otel, memExporter } = loadOtelWithMemoryExporter();
 
     const span = otel.startRequestSpan({
@@ -274,9 +266,6 @@ describe('otel — setBudgetAttributes', () => {
     otel.setBudgetAttributes(span, {
       ai_credits_this_response: 0.042,
       ai_credits_total: 1.5,
-      effective_tokens_this_response: 3500,
-      effective_tokens_total: 85000,
-      model_multiplier: 2.5,
     });
 
     otel.endSpan(span, 200);
@@ -286,12 +275,9 @@ describe('otel — setBudgetAttributes', () => {
 
     expect(s.attributes['awf.ai_credits']).toBe('0.042');
     expect(s.attributes['awf.ai_credits_total']).toBe('1.5');
-    expect(s.attributes['awf.model_units']).toBe('3500');
-    expect(s.attributes['awf.model_units_total']).toBe('85000');
-    expect(s.attributes['awf.model_multiplier']).toBe('2.5');
   });
 
-  test('sets only ai_credits when model units are absent', async () => {
+  test('sets only AI-credit attributes', async () => {
     const { otel, memExporter } = loadOtelWithMemoryExporter();
 
     const span = otel.startRequestSpan({
@@ -310,8 +296,6 @@ describe('otel — setBudgetAttributes', () => {
 
     expect(s.attributes['awf.ai_credits']).toBe('0.01');
     expect(s.attributes['awf.ai_credits_total']).toBe('0.05');
-    expect(s.attributes['awf.model_units']).toBeUndefined();
-    expect(s.attributes['awf.model_units_total']).toBeUndefined();
   });
 
   test('is a no-op when budgetResult is undefined', () => {
@@ -413,6 +397,216 @@ describe('otel — endSpanError', () => {
   });
 });
 
+describe('otel — routerCallTracing', () => {
+  const WORKFLOW_TRACE = 'aabbccddeeff00112233445566778899';
+  const WORKFLOW_SPAN = 'aabbccddeeff0011';
+  const ROUTER = { method: 'POST', serverAddress: 'gh-aw-router', serverPort: 8737 };
+
+  async function finishedSpans(otel, memExporter) {
+    await otel._provider.forceFlush();
+    return memExporter.getFinishedSpans();
+  }
+
+  test('starts a CLIENT span with allowlisted attributes and its own trace headers', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter();
+    const call = otel.routerCallTracing.startCall({
+      ...ROUTER,
+      operation: 'route',
+      attributes: {
+        'gh_aw_router.goal': 'cost',
+        'gh_aw_router.mode': 'auto',
+        'gh_aw_router.classification.present': true,
+        'gh_aw_router.conversation': 'CANARY-CONVERSATION',
+        current_id: 'CANARY-CURRENT',
+      },
+    });
+    call.end({
+      statusCode: 200,
+      attributes: {
+        'gh_aw_router.selected.model': 'github-copilot/gpt-test',
+        'gh_aw_router.selected.effort': 'low',
+        'gh_aw_router.choice.id': 'CANARY-CHOICE',
+        'gh_aw_router.resolved_mode': 'CANARY-MODE',
+      },
+    });
+
+    const [span] = await finishedSpans(otel, memExporter);
+    expect(span.name).toBe('api_proxy.router.route');
+    expect(span.kind).toBe(SpanKind.CLIENT);
+    expect(span.parentSpanContext).toBeUndefined();
+    expect(span.attributes).toEqual({
+      'http.request.method': 'POST',
+      'url.path': '/route',
+      'server.address': 'gh-aw-router',
+      'server.port': 8737,
+      'http.response.status_code': 200,
+      'gh_aw_router.goal': 'cost',
+      'gh_aw_router.mode': 'auto',
+      'gh_aw_router.classification.present': true,
+      'gh_aw_router.selected.model': 'github-copilot/gpt-test',
+      'gh_aw_router.selected.effort': 'low',
+    });
+    expect(span.status.code).toBe(SpanStatusCode.OK);
+    const { traceId, spanId } = span.spanContext();
+    expect(call.headers).toEqual({ traceparent: `00-${traceId}-${spanId}-01` });
+    expect(JSON.stringify([span.name, span.attributes, span.events, span.status])).not.toContain('CANARY');
+  });
+
+  test('drops outcome attributes with the wrong type or length', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter();
+    otel.routerCallTracing.startCall({
+      ...ROUTER,
+      operation: 'route',
+      attributes: {
+        'gh_aw_router.goal': '',
+        'gh_aw_router.mode': 'x'.repeat(257),
+        'gh_aw_router.classification.present': 'true',
+      },
+    }).end({ statusCode: 200, attributes: { 'gh_aw_router.selected.model': 42 } });
+
+    const [span] = await finishedSpans(otel, memExporter);
+    expect(Object.keys(span.attributes).filter(key => key.startsWith('gh_aw_router.'))).toEqual([]);
+  });
+
+  test('uses an owned request context, then the workflow parent, and forwards tracestate', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter({
+      GITHUB_AW_OTEL_TRACE_ID: WORKFLOW_TRACE,
+      GITHUB_AW_OTEL_PARENT_SPAN_ID: WORKFLOW_SPAN,
+    });
+    const owned = trace.setSpanContext(context.active(), {
+      traceId: '11111111111111111111111111111111',
+      spanId: '2222222222222222',
+      traceFlags: 1,
+      isRemote: true,
+      traceState: createTraceState('vendor=value'),
+    });
+    const invalid = trace.setSpanContext(context.active(), INVALID_SPAN_CONTEXT);
+
+    const ownedCall = otel.routerCallTracing.startCall({ ...ROUTER, operation: 'classify', parentContext: owned });
+    const workflowCall = otel.routerCallTracing.startCall({ ...ROUTER, operation: 'classify' });
+    const fallbackCall = otel.routerCallTracing.startCall({ ...ROUTER, operation: 'route', parentContext: invalid });
+    for (const call of [ownedCall, workflowCall, fallbackCall]) call.end({ statusCode: 200 });
+
+    const spans = await finishedSpans(otel, memExporter);
+    expect(spans[0].spanContext().traceId).toBe('11111111111111111111111111111111');
+    expect(spans[0].parentSpanContext.spanId).toBe('2222222222222222');
+    expect(ownedCall.headers.tracestate).toBe('vendor=value');
+    for (const span of spans.slice(1)) {
+      expect(span.spanContext().traceId).toBe(WORKFLOW_TRACE);
+      expect(span.parentSpanContext.spanId).toBe(WORKFLOW_SPAN);
+    }
+    expect(workflowCall.headers.traceparent).toBe(`00-${WORKFLOW_TRACE}-${spans[1].spanContext().spanId}-01`);
+    expect(workflowCall.headers).not.toHaveProperty('tracestate');
+  });
+
+  test('starts a new root rather than inheriting an active span when there is no parent', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter();
+    const ambient = trace.setSpanContext(context.active(), {
+      traceId: '33333333333333333333333333333333',
+      spanId: '4444444444444444',
+      traceFlags: 1,
+    });
+    const invalid = trace.setSpanContext(ambient, INVALID_SPAN_CONTEXT);
+    context.with(ambient, () => {
+      otel.routerCallTracing.startCall({ ...ROUTER, operation: 'capabilities' }).end({ statusCode: 200 });
+      otel.routerCallTracing.startCall({ ...ROUTER, operation: 'route', parentContext: invalid }).end({ statusCode: 200 });
+    });
+
+    const spans = await finishedSpans(otel, memExporter);
+    expect(spans).toHaveLength(2);
+    for (const span of spans) {
+      expect(span.parentSpanContext).toBeUndefined();
+      expect(span.spanContext().traceId).not.toBe('33333333333333333333333333333333');
+    }
+  });
+
+  test('records only a fixed error type, never error text, and ends each span once', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter();
+    const start = operation => otel.routerCallTracing.startCall({ ...ROUTER, operation });
+
+    const http = start('route');
+    http.end({ statusCode: 503, error: Object.assign(new Error('SECRET body'), { statusCode: 503 }) });
+    http.end({ statusCode: 200 });
+    start('route').end({ error: Object.assign(new Error('SECRET timeout'), { code: 'ETIMEDOUT' }) });
+    start('classify').end({ error: new Error('SECRET raw') });
+    start('capabilities').end({ error: { code: 'SECRET_CODE' } });
+    start('route').end({
+      statusCode: 200,
+      error: { code: 'routing_contract_error' },
+      attributes: { 'gh_aw_router.selected.model': 'github-copilot/gpt-test' },
+    });
+
+    const spans = await finishedSpans(otel, memExporter);
+    expect(spans.map(span => [span.attributes['error.type'], span.status])).toEqual([
+      ['503', { code: SpanStatusCode.ERROR, message: '503' }],
+      ['ETIMEDOUT', { code: SpanStatusCode.ERROR, message: 'ETIMEDOUT' }],
+      ['_OTHER', { code: SpanStatusCode.ERROR, message: '_OTHER' }],
+      ['_OTHER', { code: SpanStatusCode.ERROR, message: '_OTHER' }],
+      ['routing_contract_error', { code: SpanStatusCode.ERROR, message: 'routing_contract_error' }],
+    ]);
+    expect(spans[0].attributes['http.response.status_code']).toBe(503);
+    expect(spans[4].attributes).not.toHaveProperty('gh_aw_router.selected.model');
+    expect(spans.every(span => span.events.length === 0)).toBe(true);
+    expect(JSON.stringify(spans.map(span => [span.name, span.attributes, span.events, span.status])))
+      .not.toContain('SECRET');
+  });
+
+  test('does not trace health checks or unknown operations and normalizes the method', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter();
+    expect(otel.routerCallTracing.startCall({ ...ROUTER, operation: 'healthz' })).toBeNull();
+    expect(otel.routerCallTracing.startCall({ ...ROUTER })).toBeNull();
+    otel.routerCallTracing.startCall({ ...ROUTER, operation: 'route', method: 'DELETE' }).end();
+
+    const spans = await finishedSpans(otel, memExporter);
+    expect(spans).toHaveLength(1);
+    expect(spans[0].attributes['http.request.method']).toBe('_OTHER');
+  });
+
+  test('sends the router the span context of each router call', async () => {
+    const { otel, memExporter } = loadOtelWithMemoryExporter({
+      GITHUB_AW_OTEL_TRACE_ID: WORKFLOW_TRACE,
+      GITHUB_AW_OTEL_PARENT_SPAN_ID: WORKFLOW_SPAN,
+    });
+    const { createRoutingRouterClient } = require('./routing-router-client');
+    const received = [];
+    const server = require('http').createServer((req, res) => {
+      received.push({ path: req.url, traceparent: req.headers.traceparent, baggage: req.headers.baggage });
+      req.resume();
+      req.on('end', () => (req.url === '/healthz'
+        ? res.writeHead(204).end()
+        : res.writeHead(200).end('{"ranked_choices":[]}')));
+    });
+    await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+    try {
+      const client = createRoutingRouterClient({
+        baseUrl: `http://127.0.0.1:${server.address().port}`,
+        tracing: otel.routerCallTracing,
+      });
+      await client.health({ timeoutMs: 1000 });
+      await client.capabilities({ timeoutMs: 1000 });
+      await client.route({}, {
+        timeoutMs: 1000,
+        trace: { describeResult: () => ({ 'gh_aw_router.selected.model': 'github-copilot/gpt-test' }) },
+      });
+    } finally {
+      await new Promise(resolve => server.close(resolve));
+    }
+
+    const spans = await finishedSpans(otel, memExporter);
+    expect(spans.map(span => span.name)).toEqual(['api_proxy.router.capabilities', 'api_proxy.router.route']);
+    expect(received).toEqual([
+      { path: '/healthz', traceparent: undefined, baggage: undefined },
+      ...spans.map(span => ({
+        path: span.attributes['url.path'],
+        traceparent: `00-${WORKFLOW_TRACE}-${span.spanContext().spanId}-01`,
+        baggage: undefined,
+      })),
+    ]);
+    expect(spans.every(span => span.parentSpanContext.spanId === WORKFLOW_SPAN)).toBe(true);
+    expect(spans[1].attributes['gh_aw_router.selected.model']).toBe('github-copilot/gpt-test');
+  });
+});
+
 describe('otel — _buildResourceSpans serialization', () => {
   test('serializes span to OTLP/JSON shape', async () => {
     const { otel, memExporter } = loadOtelWithMemoryExporter();
@@ -431,8 +625,8 @@ describe('otel — _buildResourceSpans serialization', () => {
     const spans = memExporter.getFinishedSpans();
 
     // Build the OTLP envelope to test serialization
-    const { Resource } = require('@opentelemetry/resources');
-    const resource = new Resource({ 'service.name': 'test' });
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
+    const resource = resourceFromAttributes({ 'service.name': 'test' });
     const envelope = otel._buildResourceSpans(spans, resource);
 
     expect(envelope).toHaveLength(1);
@@ -458,47 +652,47 @@ describe('otel — _buildResourceSpans serialization', () => {
 describe('otel — ProxyAwareOtlpExporter', () => {
   test('constructs without error when httpsProxy is null', () => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     expect(() => new _ProxyAwareOtlpExporter({
       url:        'https://otel.example.com:4318',
       headers:    {},
       httpsProxy: null,
-      resource:   new Resource({}),
+      resource:   resourceFromAttributes({}),
     })).not.toThrow();
   });
 
   test('appends /v1/traces to bare endpoint URL', () => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     const exp = new _ProxyAwareOtlpExporter({
       url:        'https://otel.example.com:4318',
       headers:    {},
       httpsProxy: null,
-      resource:   new Resource({}),
+      resource:   resourceFromAttributes({}),
     });
     expect(exp._parsedUrl.pathname).toBe('/v1/traces');
   });
 
   test('preserves /v1/traces when already present', () => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     const exp = new _ProxyAwareOtlpExporter({
       url:        'https://otel.example.com:4318/v1/traces',
       headers:    {},
       httpsProxy: null,
-      resource:   new Resource({}),
+      resource:   resourceFromAttributes({}),
     });
     expect(exp._parsedUrl.pathname).toBe('/v1/traces');
   });
 
   test('preserves query string when normalizing endpoint', () => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     const exp = new _ProxyAwareOtlpExporter({
       url:        'https://otel.example.com:4318?api-version=1',
       headers:    {},
       httpsProxy: null,
-      resource:   new Resource({}),
+      resource:   resourceFromAttributes({}),
     });
     expect(exp._parsedUrl.pathname).toBe('/v1/traces');
     expect(exp._parsedUrl.search).toBe('?api-version=1');
@@ -506,7 +700,7 @@ describe('otel — ProxyAwareOtlpExporter', () => {
 
   test('includes query string in export request path', (done) => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     const reqSpy = jest.spyOn(require('https'), 'request').mockImplementation((options, cb) => {
       try {
         expect(options.path).toBe('/v1/traces?api-version=1');
@@ -530,7 +724,7 @@ describe('otel — ProxyAwareOtlpExporter', () => {
       url:        'https://otel.example.com:4318?api-version=1',
       headers:    {},
       httpsProxy: null,
-      resource:   new Resource({}),
+      resource:   resourceFromAttributes({}),
     });
     const span = {
       spanContext: () => ({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16) }),
@@ -551,7 +745,7 @@ describe('otel — ProxyAwareOtlpExporter', () => {
 
   test('returns failure when request creation throws synchronously', (done) => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     const reqSpy = jest.spyOn(require('https'), 'request').mockImplementation(() => {
       throw new Error('bad request options');
     });
@@ -559,7 +753,7 @@ describe('otel — ProxyAwareOtlpExporter', () => {
       url:        'https://otel.example.com:4318',
       headers:    {},
       httpsProxy: null,
-      resource:   new Resource({}),
+      resource:   resourceFromAttributes({}),
     });
     const span = {
       spanContext: () => ({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16) }),
@@ -581,9 +775,9 @@ describe('otel — ProxyAwareOtlpExporter', () => {
 
   test('calls resultCallback with code 0 for empty spans', (done) => {
     const { _ProxyAwareOtlpExporter } = loadOtel();
-    const { Resource } = require('@opentelemetry/resources');
+    const { resourceFromAttributes } = require('@opentelemetry/resources');
     const exp = new _ProxyAwareOtlpExporter({
-      url: 'https://otel.example.com:4318', headers: {}, httpsProxy: null, resource: new Resource({}),
+      url: 'https://otel.example.com:4318', headers: {}, httpsProxy: null, resource: resourceFromAttributes({}),
     });
     exp.export([], (result) => {
       expect(result.code).toBe(0);
@@ -605,7 +799,7 @@ describe('otel — FileSpanExporter', () => {
     const exp = new _FileSpanExporter('/tmp/otel.jsonl');
     const span = {
       spanContext: () => ({ traceId: 'a'.repeat(32), spanId: 'b'.repeat(16) }),
-      parentSpanId: null,
+      parentSpanContext: undefined,
       name: 'test_span',
       kind: 2,
       startTime: [1700000000, 0],

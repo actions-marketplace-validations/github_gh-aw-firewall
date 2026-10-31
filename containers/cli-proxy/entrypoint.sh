@@ -11,6 +11,7 @@ echo "[cli-proxy] Starting CLI proxy sidecar..."
 
 NODE_PID=""
 TUNNEL_PID=""
+SHIM_PID=""
 
 # External DIFC proxy host and port, set by docker-manager.ts
 DIFC_HOST="${AWF_DIFC_PROXY_HOST:-host.docker.internal}"
@@ -45,8 +46,10 @@ echo "[cli-proxy] TLS certificate available"
 # Build a combined CA bundle so the gh CLI (Go binary) trusts the DIFC proxy's
 # self-signed cert.  NODE_EXTRA_CA_CERTS only helps Node.js; Go programs use
 # the system store or SSL_CERT_FILE.
-COMBINED_CA="/tmp/proxy-tls/combined-ca.crt"
-cat /etc/ssl/certs/ca-certificates.crt /tmp/proxy-tls/ca.crt > "${COMBINED_CA}"
+TRUST_DIR="$(mktemp -d /tmp/awf-cli-trust.XXXXXX)"
+sh /opt/awf/trust/filter-ca-store.sh "${TRUST_DIR}" \
+  /etc/ssl/certs/ca-certificates.crt /tmp/proxy-tls/ca.crt
+COMBINED_CA="${TRUST_DIR}/ca-certificates.crt"
 echo "[cli-proxy] Combined CA bundle created at ${COMBINED_CA}"
 
 # Configure gh CLI to route through the DIFC proxy via the TCP tunnel
@@ -61,11 +64,37 @@ export GH_REPO="${GH_REPO:-$GITHUB_REPOSITORY}"
 # Node.js (server.js / tcp-tunnel.js) uses NODE_EXTRA_CA_CERTS;
 # gh CLI (Go) uses SSL_CERT_FILE pointing to the combined bundle;
 # git (called by `gh repo clone`) uses GIT_SSL_CAINFO for OpenSSL verification.
-export NODE_EXTRA_CA_CERTS="/tmp/proxy-tls/ca.crt"
+export NODE_EXTRA_CA_CERTS="${COMBINED_CA}"
 export SSL_CERT_FILE="${COMBINED_CA}"
+export SSL_CERT_DIR="${TRUST_DIR}/certs"
 export GIT_SSL_CAINFO="${COMBINED_CA}"
 
 echo "[cli-proxy] gh CLI configured to route through DIFC proxy at ${GH_HOST}"
+
+# gh treats GH_HOST=localhost:<port> as GitHub Enterprise Server, so search
+# feature detection reads installed_version from /api/v3/meta, which the
+# github.com-backed DIFC proxy does not return ("malformed version: ").
+# Route gh API requests through a local Unix-socket shim that forwards them to
+# GH_HOST unchanged and fills in installed_version on /meta responses.
+if [ "${AWF_CLI_PROXY_MODE:-primary}" != "enclave" ]; then
+  GH_HTTP_SHIM_DIR="/tmp/gh-http-shim"
+  GH_HTTP_SHIM_SOCKET="${GH_HTTP_SHIM_DIR}/gh.sock"
+  export GH_CONFIG_DIR="/tmp/gh-config"
+  mkdir -p -m 0700 "${GH_HTTP_SHIM_DIR}" "${GH_CONFIG_DIR}"
+  printf 'http_unix_socket: %s\n' "${GH_HTTP_SHIM_SOCKET}" > "${GH_CONFIG_DIR}/config.yml"
+  node /app/gh-http-shim.js "${GH_HTTP_SHIM_SOCKET}" &
+  SHIM_PID=$!
+  SHIM_WAIT=0
+  while [ ! -S "${GH_HTTP_SHIM_SOCKET}" ]; do
+    if [ "${SHIM_WAIT}" -ge 50 ] || ! kill -0 "${SHIM_PID}" 2>/dev/null; then
+      echo "[cli-proxy] ERROR: gh HTTP shim did not start at ${GH_HTTP_SHIM_SOCKET}"
+      exit 1
+    fi
+    sleep 0.1
+    SHIM_WAIT=$((SHIM_WAIT + 1))
+  done
+  echo "[cli-proxy] gh HTTP shim listening at ${GH_HTTP_SHIM_SOCKET}"
+fi
 
 # Probe external DIFC proxy liveness before serving agent traffic.
 # Retries with exponential backoff to handle transient startup delays.
@@ -76,7 +105,7 @@ echo "[cli-proxy] gh CLI configured to route through DIFC proxy at ${GH_HOST}"
 # Echoes the diagnosis string. Kept as a pure function so it can be unit-tested
 # in isolation — see tests/cli-proxy-probe-classify.test.sh (#5615).
 #   ECONNREFUSED ("connection refused" in gh output)  → not yet ready
-#   Timeout (exit 124, or "deadline"/"timed out")      → unreachable / slow
+#   Timeout (exit 124/143, or "deadline"/"timed out")  → unreachable / slow
 #   EAI_AGAIN / ENOTFOUND / getaddrinfo                → DNS not yet resolved
 #     (peer may not yet be joined to awf-net; keep retrying, do not fail fast)
 #   HTTP NNN in gh output                              → proxy reachable, but the
@@ -88,7 +117,8 @@ classify_probe_failure() {
   http_status="$(printf '%s\n%s\n' "${probe_err}" "${probe_out}" | grep -oiE "HTTP[/ ][0-9.]* ?[0-9]{3}|HTTP [0-9]{3}" | grep -oE "[0-9]{3}" | head -1 || true)"
   if echo "${probe_err}" | grep -qiE "connection refused|ECONNREFUSED"; then
     echo "not-yet-ready (ECONNREFUSED)"
-  elif [ "${probe_exit}" -eq 124 ] || echo "${probe_err}" | grep -qiE "timeout|deadline|timed out"; then
+  elif [ "${probe_exit}" -eq 124 ] || [ "${probe_exit}" -eq 143 ] ||
+       echo "${probe_err}" | grep -qiE "timeout|deadline|timed out"; then
     echo "unreachable (timeout)"
   elif echo "${probe_err}" | grep -qiE "EAI_AGAIN|ENOTFOUND|getaddrinfo|no such host|name or service not known"; then
     echo "dns-not-yet-ready"
@@ -118,11 +148,19 @@ while [ "$ATTEMPT" -le "$MAX_LIVENESS_ATTEMPTS" ]; do
        >"${PROBE_OUT_FILE}" 2>"${PROBE_ERR_FILE}"; then
     echo "[cli-proxy] DIFC proxy liveness probe succeeded on attempt ${ATTEMPT}/${MAX_LIVENESS_ATTEMPTS}"
     break
+  else
+    PROBE_EXIT=$?
   fi
-  PROBE_EXIT=$?
   PROBE_ERR="$(cat "${PROBE_ERR_FILE}")"
   PROBE_OUT="$(cat "${PROBE_OUT_FILE}")"
   DIAG_TYPE="$(classify_probe_failure "${PROBE_ERR}" "${PROBE_OUT}" "${PROBE_EXIT}")"
+  # GHES intentionally returns 404 for rate_limit when rate limiting is disabled.
+  # This response confirms connectivity without accepting other API errors.
+  if [ "${DIAG_TYPE}" = "reachable-but-api-error (HTTP 404)" ] &&
+     printf '%s\n%s\n' "${PROBE_ERR}" "${PROBE_OUT}" | grep -qiF "Rate limiting is not enabled"; then
+    echo "[cli-proxy] WARNING: GHES rate limiting is disabled; DIFC proxy liveness probe succeeded on attempt ${ATTEMPT}/${MAX_LIVENESS_ATTEMPTS}"
+    break
+  fi
   if [ "$ATTEMPT" -ge "$MAX_LIVENESS_ATTEMPTS" ]; then
     echo "[cli-proxy] ERROR: DIFC proxy liveness probe failed for ${GH_HOST} (gh api exit=${PROBE_EXIT}, diagnosis=${DIAG_TYPE})"
     if [ -n "${PROBE_ERR}" ]; then
@@ -175,6 +213,10 @@ cleanup() {
   if [ -n "$TUNNEL_PID" ]; then
     kill "$TUNNEL_PID" 2>/dev/null || true
     wait "$TUNNEL_PID" 2>/dev/null || true
+  fi
+  if [ -n "$SHIM_PID" ]; then
+    kill "$SHIM_PID" 2>/dev/null || true
+    wait "$SHIM_PID" 2>/dev/null || true
   fi
 }
 trap 'cleanup; exit 0' INT TERM

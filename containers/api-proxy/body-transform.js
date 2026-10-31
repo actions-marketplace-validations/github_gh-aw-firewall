@@ -60,14 +60,29 @@ function sanitizeNullToolCallTypes(body) {
   };
 }
 
+function isMessagesRequest(requestPath) {
+  if (typeof requestPath !== 'string') return false;
+  const path = requestPath.split('?')[0].split('#')[0].replace(/\/+$/, '');
+  return path.endsWith('/messages');
+}
+
+function isResponsesRequest(requestPath) {
+  if (typeof requestPath !== 'string') return false;
+  const path = requestPath.split('?')[0].split('#')[0].replace(/\/+$/, '');
+  return path === '/responses' || path.endsWith('/responses');
+}
+
 /**
  * Inject a token-budget warning message into a request body.
  *
- * Handles three JSON body formats:
- *   - Anthropic  (/v1/messages)          — appends a text block to `system`
+ * Handles four JSON body formats:
+ *   - Messages   (/v1/messages)          — appends a text block to `system`
+ *                                           (Anthropic and Copilot)
  *   - Gemini     (/v1beta/…generateContent) — appends a part to `systemInstruction`
  *   - OpenAI     (/v1/chat/completions)  — inserts a system message after any
  *                                           existing system messages
+ *   - Responses  (/v1/responses)         — appends a final developer message to
+ *                                           `input`, preserving the cached prefix
  *
  * Returns a new Buffer containing the modified body, or null when the body
  * cannot be parsed or injection is not applicable.
@@ -75,23 +90,30 @@ function sanitizeNullToolCallTypes(body) {
  * @param {Buffer} body       - Raw request body
  * @param {string} provider   - Provider name ('anthropic' | 'gemini' | 'openai' | 'copilot')
  * @param {string} message    - Warning text to inject
+ * @param {string} [requestPath] - Incoming request path
  * @returns {Buffer|null}
  */
-function injectSteeringMessage(body, provider, message) {
+function injectSteeringMessage(body, provider, message, requestPath = '') {
   let parsed = parseBodyAsObject(body);
   if (!parsed) return null;
 
-  if (provider === 'anthropic') {
+  if (provider === 'anthropic' || isMessagesRequest(requestPath)) {
+    if (!Array.isArray(parsed.messages)) return null;
     if (typeof parsed.system === 'string') {
       parsed = { ...parsed, system: parsed.system + '\n\n' + message };
     } else if (Array.isArray(parsed.system)) {
       parsed = { ...parsed, system: [...parsed.system, { type: 'text', text: message }] };
-    } else {
+    } else if (parsed.system === undefined) {
       parsed = { ...parsed, system: message };
+    } else {
+      return null;
     }
   } else if (provider === 'gemini') {
+    if (!Array.isArray(parsed.contents)) return null;
     const existing = parsed.systemInstruction;
-    if (existing && typeof existing === 'object' && !Array.isArray(existing)) {
+    if (existing !== undefined) {
+      if (!existing || typeof existing !== 'object' || Array.isArray(existing)) return null;
+      if (existing.parts !== undefined && !Array.isArray(existing.parts)) return null;
       const parts = Array.isArray(existing.parts)
         ? [...existing.parts, { text: message }]
         : [{ text: message }];
@@ -99,6 +121,16 @@ function injectSteeringMessage(body, provider, message) {
     } else {
       parsed = { ...parsed, systemInstruction: { parts: [{ text: message }] } };
     }
+  } else if (
+    isResponsesRequest(requestPath) ||
+    (parsed.input !== undefined && !Array.isArray(parsed.messages))
+  ) {
+    if (typeof parsed.input !== 'string' && !Array.isArray(parsed.input)) return null;
+    if (parsed.instructions !== undefined && parsed.instructions !== null && typeof parsed.instructions !== 'string') return null;
+    const input = typeof parsed.input === 'string'
+      ? [{ role: 'user', content: parsed.input }]
+      : parsed.input;
+    parsed = { ...parsed, input: [...input, { type: 'message', role: 'developer', content: message }] };
   } else {
     if (!Array.isArray(parsed.messages)) return null;
     const systemMsg = { role: 'system', content: message };
@@ -125,7 +157,7 @@ function injectSteeringMessage(body, provider, message) {
  * skipped.
  *
  * @param {Buffer} body
- * @param {string} provider - 'openai' | 'copilot' | 'anthropic' | 'gemini'
+ * @param {string} provider - 'openai' | 'copilot' | 'anthropic' | 'gemini' | 'vertex'
  * @param {string} [requestPath] - Incoming request path (e.g. /v1/chat/completions)
  * @returns {{ body: Buffer, injected: boolean }|null}
  */
@@ -154,6 +186,9 @@ function injectStreamOptions(body, provider, requestPath = '') {
   // provider, since the Copilot provider also fronts the Messages API
   // (e.g. api.githubcopilot.com/v1/messages).
   if (/^\/(?:v\d+\/)?messages\/?$/.test(pathOnly)) return null;
+
+  // Anthropic models on Vertex use the Messages schema and reject stream_options.
+  if (/\/publishers\/anthropic\/models\/[^/:]+:(?:rawPredict|streamRawPredict)\/?$/.test(pathOnly)) return null;
 
   const parsed = parseBodyAsObject(body);
   if (!parsed) return null;

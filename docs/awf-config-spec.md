@@ -91,6 +91,9 @@ normatively by `docs/awf-config.schema.json`.
 
 ### 4.1 Filesystem write boundary
 
+The [Filesystem Sharing Contract](filesystem-sharing-contract.md) maps this
+boundary to each component, identity, host permission and runtime export.
+
 When `filesystem.allowWrite` is present, AWF MUST mount existing writable host
 binds read-only except at the listed guest-visible absolute paths. The list
 narrows existing access: it MUST NOT expose a new host path or make an
@@ -124,15 +127,18 @@ boots.
 
 ### 4.2 Cloud Hypervisor microVM preview
 
-The `cloudHypervisor` surface pins Cloud Hypervisor v53.0 artifacts and
-digests (binary, PCI-capable guest kernel, rootfs, and the shared AWF guest
-supervisor) and requires explicit `--cloud-hypervisor-preview` opt-in plus
+The `cloudHypervisor` surface binds Cloud Hypervisor v53.0, `virtiofsd`, the
+PCI-capable guest kernel, rootfs, and shared AWF guest supervisor to one
+release-pinned GitHub-attested manifest. It requires explicit
+`--cloud-hypervisor-preview` opt-in plus
 `container.containerRuntime:
-"cloud-hypervisor"` to execute a workload. Supported host target is
-GitHub-hosted Ubuntu `x86_64` runners with KVM only — self-hosted and
-non-Ubuntu/non-x86_64 hosts are rejected explicitly by
-[`src/cloud-hypervisor/host-eligibility.ts`](../src/cloud-hypervisor/host-eligibility.ts),
-with no fallback to another runtime. See
+"cloud-hypervisor"` to execute a workload. The supported host target is
+GitHub-hosted Ubuntu `x86_64` runners with KVM. Runner eligibility, missing KVM
+access, and unsupported host-policy failures warn and fall back to the standard
+Docker backend; invalid configuration and artifact trust, integrity, digest, or
+version failures remain fatal. Host eligibility is enforced by
+[`src/cloud-hypervisor/host-eligibility.ts`](../src/cloud-hypervisor/host-eligibility.ts).
+See
 [`src/cloud-hypervisor/preflight.ts`](../src/cloud-hypervisor/preflight.ts)
 for the artifact/host trust-check module,
 [`src/cloud-hypervisor/launcher.ts`](../src/cloud-hypervisor/launcher.ts)
@@ -144,6 +150,25 @@ for the guest artifact build/verification pipeline. See
 [docs/cloud-hypervisor-foundation.md](./cloud-hypervisor-foundation.md) for
 the full architecture and security-boundary writeup.
 
+`cloudHypervisor.mountPolicy` controls host directory exposure:
+
+- `workspace-only` is the default and recommended secure posture. It does not
+  infer a mount from `RUNNER_TOOL_CACHE` or `AGENT_TOOLSDIRECTORY`. The
+  workspace and the narrow gh-aw runtime directories (`RUNNER_TEMP/gh-aw` and
+  `/tmp/gh-aw`) remain eligible when present so generated workflows can run.
+- `workspace-and-tool-cache` explicitly opts into exporting the whole path
+  named by `RUNNER_TOOL_CACHE`, falling back to `AGENT_TOOLSDIRECTORY`. AWF
+  requires that value to name an existing real directory and stages it
+  recursively read-only on the host before virtiofsd starts. Cache paths that
+  overlap writable export sources, missing paths, and unknown policy values are
+  errors.
+
+AWF forwards `RUNNER_TOOL_CACHE` or `AGENT_TOOLSDIRECTORY` into the guest only
+when the corresponding export exists. gh-aw versions that generate a command
+which scans `RUNNER_TOOL_CACHE` must emit
+`--cloud-hypervisor-mount-policy workspace-and-tool-cache`; workflows that do
+not need runner-installed tools should retain the default.
+
 Release test artifacts (`cloud-hypervisor-test-x86_64`) are x86_64
 test/preview artifacts built and verified by both the release workflow and
 [`test-cloud-hypervisor.yml`](../.github/workflows/test-cloud-hypervisor.yml),
@@ -154,6 +179,28 @@ request label. They are published as explicitly named release/workflow
 assets, but are not production defaults and are never auto-downloaded. See
 [docs/cloud-hypervisor-foundation.md](./cloud-hypervisor-foundation.md#part-14--ci-workflow)
 for the complete CI workflow specification and troubleshooting reference.
+
+Releases also publish one `enclave-rootfs.ext4` artifact for both enclave
+roles with a separately attested enclave manifest, shared rootfs provenance
+and per-role SBOMs. The release setup
+script verifies those bindings before exporting unambiguous cached role paths.
+These artifacts do not enable Cloud Hypervisor enclave execution by themselves:
+the runtime remains terminal until every ADR 0002 host-executor gate is present,
+and `enclaves[].image` remains invalid for `runtime: cloud-hypervisor`.
+
+Normal execution requires `artifactManifestPath`,
+`artifactManifestBundlePath`, and `artifactReleaseTag`. AWF verifies the
+Sigstore bundle offline with `gh attestation verify`, constraining the signer
+to `github/gh-aw-firewall/.github/workflows/release.yml`, before parsing any
+manifest field. It then verifies all five local artifact names and SHA-256
+digests. The legacy `sha256` object is not a trust root.
+
+Same-run development builds may set
+`developmentAllowUnattestedArtifacts: true` only when the process environment
+also contains
+`AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1`. This
+preview-only dual opt-in still requires all five hashes and must not be used
+for release artifacts.
 
 ## 5. CLI Mapping
 
@@ -170,20 +217,25 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `network.allowDomains[]` → `--allow-domains <csv>`
 - `network.blockDomains[]` → `--block-domains <csv>`
 - `network.dnsServers[]` → `--dns-servers <csv>`
+- `network.subnet` → `--network-subnet <cidr>` *(relocates the `awf-net` Docker network; use when the default `172.30.0.0/24` collides with the host or cluster network, e.g. the OpenShift service CIDR `172.30.0.0/16`)*
 - `network.upstreamProxy` → `--upstream-proxy`
 - `network.isolation` → `--network-isolation` *(experimental; enforces egress via Docker network topology instead of host iptables)*
+- `network.verifySbxEgress` → `--verify-sbx-egress` *(fail-closed verification that Docker sbx direct traffic cannot bypass Squid; requires the sbx runtime)*
 - `network.topologyAttach[]` → `--topology-attach <name>` *(repeatable; requires `network.isolation: true`)*
 - `apiProxy.enabled` → `--enable-api-proxy` *([DEPRECATED] API proxy is always enabled; this flag is ignored)*
 - `apiProxy.caCert` → `--api-proxy-ca-cert <path>` *(mounts an additional CA certificate into the api-proxy sidecar and sets `NODE_EXTRA_CA_CERTS` for upstream TLS verification)*
-- `apiProxy.enableTokenSteering` → `--enable-token-steering` *(maps to `AWF_ENABLE_TOKEN_STEERING`; omit or set to `false` to opt out)*
+- `apiProxy.enableTokenSteering` → `--enable-token-steering` *(maps to `AWF_ENABLE_TOKEN_STEERING`; opts into runtime and AI-credit advisory warnings; omit or set to `false` to opt out)*
 - `apiProxy.anthropicAutoCache` → `--anthropic-auto-cache`
 - `apiProxy.anthropicCacheTailTtl` → `--anthropic-cache-tail-ttl <5m|1h>`
-- `apiProxy.maxEffectiveTokens` → *(config-only; no CLI equivalent)*
+- `apiProxy.hostedWeb.claude` → *(config-only; maps to `AWF_CLAUDE_HOSTED_WEB_POLICY` — AWF-owned domain policy for Anthropic-hosted `web_search_*`/`web_fetch_*` server tools; see [§9.8 Claude Hosted Web Search and Fetch](#98-claude-hosted-web-search-and-fetch))*
+- `apiProxy.hostedWeb.codex` → *(config-only; maps to `AWF_CODEX_HOSTED_WEB_POLICY` — AWF-owned domain policy for OpenAI Responses `web_search` and Codex `/v1/alpha/search`; see [§9.9 Codex/OpenAI Hosted Web Policy](#99-codexopenai-hosted-web-policy))*
 - `apiProxy.maxAiCredits` → *(config-only; maps to `AWF_MAX_AI_CREDITS`)*
 - `apiProxy.defaultAiCreditsPricing` → *(config-only; maps to `AWF_DEFAULT_AI_CREDITS_PRICING`)*
+- `apiProxy.modelPricingCatalog` → *(config-only; maps to `AWF_MODEL_PRICING_CATALOG` — versioned, provider-scoped model prices; see the AI credits pricing section)*
+- `apiProxy.modelCatalogue` → *(config-only; maps to `AWF_MODEL_CATALOGUE` — runtime reviewed-source loading, offline/local controls, refresh and age policy; see [runtime catalogue configuration](model-catalogue-publication.md#configuration-and-fallback))*
 - `apiProxy.providers` → *(config-only; maps to `AWF_API_PROXY_PROVIDERS`)*
 - `apiProxy.modelMultipliers` → `--max-model-multiplier <model:multiplier,...>`
-- `apiProxy.defaultModelMultiplier` → *(config-only; maps to `AWF_EFFECTIVE_TOKEN_DEFAULT_MODEL_MULTIPLIER`)*
+- `apiProxy.defaultModelMultiplier` → *(config-only; maps to `AWF_DEFAULT_MODEL_MULTIPLIER`)*
 - `apiProxy.maxTurns` → *(config-only; no CLI equivalent)*
 - `apiProxy.maxRuns` → *(deprecated alias for `maxTurns`; maps to `AWF_MAX_RUNS`)*
 - `apiProxy.maxModelMultiplierCap` → `--max-model-multiplier-cap <number>`
@@ -191,6 +243,10 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `apiProxy.maxPermissionDenied` → `--max-permission-denied <number>`
 - `apiProxy.requestedModel` → *(config-only; maps to `AWF_REQUESTED_MODEL` for pre-startup validation)*
 - `apiProxy.modelFallback` → *(config-only; model fallback strategy)*
+- `apiProxy.fallbackModels` → *(config-only; maps to `AWF_FALLBACK_MODELS` — ordered model IDs, optionally provider-qualified for cross-provider fallback, retried on 5xx, timeout, or model-not-supported failures)*
+- `experimental.modelRouting` → *(config-only; experimental opt-in required for `apiProxy.routing`; defaults to off)*
+- `apiProxy.routing` → *(config-only; requires `experimental.modelRouting: true`; task-level routing objective and task conversation input)*
+- `apiProxy.routing.candidateModels` → *(optional glob patterns that limit router/classifier choices; intersected with the model policy; defaults to `apiProxy.allowedModels`)*
 - `apiProxy.modelRouter.providerType` → *(config-only; maps to `COPILOT_PROVIDER_TYPE`)*
 - `apiProxy.modelRouter.baseUrl` → *(config-only; maps to `COPILOT_PROVIDER_BASE_URL`)*
 - `apiProxy.allowedModels` → *(config-only; maps to `AWF_ALLOWED_MODELS` — JSON array of glob patterns; only matching models are permitted)*
@@ -218,7 +274,7 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `apiProxy.auth.anthropicServiceAccountId` → *(config-only; maps to `AWF_AUTH_ANTHROPIC_SERVICE_ACCOUNT_ID`)*
 - `apiProxy.auth.anthropicWorkspaceId` → *(config-only; maps to `AWF_AUTH_ANTHROPIC_WORKSPACE_ID`)*
 - `apiProxy.auth.anthropicTokenUrl` → *(config-only; maps to `AWF_AUTH_ANTHROPIC_TOKEN_URL`)*
-- `apiProxy.targets.<provider>.host` → `--<provider>-api-target` *(except `antigravity.host`, which maps to the Gemini flag below)*
+- `apiProxy.targets.<provider>.host` → `--<provider>-api-target` *(except `antigravity.host`, which maps to the Gemini flag below). Accepts a bare hostname or a full URL; a bare hostname or explicit `https://` URL both dial the target over HTTPS on port 443 (the default), while an explicit `http://` URL dials it in cleartext on port 80 — matching the runner-side allowlist, which already adds an `http://`-scoped allowlist entry for such targets. Custom ports are not supported: `http://host` always dials port 80 and `https://host` always dials port 443.)*
 - `apiProxy.targets.antigravity.host` → `--gemini-api-target`
 - `apiProxy.targets.copilot.extraHeaders` → *(config-only; non-sensitive supplemental BYOK headers, maps to `AWF_BYOK_EXTRA_HEADERS`)*
 - `apiProxy.targets.copilot.extraBodyFields` → *(config-only; non-sensitive supplemental BYOK body fields, maps to `AWF_BYOK_EXTRA_BODY_FIELDS`)*
@@ -248,7 +304,7 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `container.enableDind` → `--enable-dind`
 - `container.workDir` → `--work-dir`
 - `container.containerWorkDir` → `--container-workdir`
-- `container.images` → *(config-only; a closed compiler-authorized manifest of literal, registry-qualified `tag@sha256:<digest>` OCI references. Supported keys are `squid`, `agent`, `apiProxy`, `cliProxy`, `buildTools`, `dohProxy`, `enclaveScript`, `enclaveAgent`, `enclaveMcpServer`, and `dindStaging`. Every image AWF runs — including consumers outside Docker Compose such as DinD staging, `awf predownload --config`, and rootless artifact repair — resolves through this manifest, and the effective per-role references are recorded in `image-manifest.json`. AWF rejects missing enabled roles and never falls back to the official registry. It cannot be combined with controls that would select a different image: `container.imageRegistry`, `container.imageTag`, `container.agentImage`, `container.buildLocal`, `security.sslBump` (requires a locally built Squid image), `runner.sysrootImage`, `dind.stagingImage`, or per-enclave image overrides. Registry credentials are intentionally not configured by AWF; use a pre-authenticated Docker daemon.)*
+- `container.images` → *(config-only; a closed compiler-authorized manifest of literal, registry-qualified `tag@sha256:<digest>` OCI references. Supported keys are `squid`, `agent`, `apiProxy`, `router`, `cliProxy`, `buildTools`, `dohProxy`, `enclaveScript`, `enclaveAgent`, `enclaveMcpServer`, and `dindStaging`. Every image AWF runs — including consumers outside Docker Compose such as DinD staging, `awf predownload --config`, and rootless artifact repair — resolves through this manifest, and the effective per-role references are recorded in `image-manifest.json`. AWF rejects missing enabled roles and never falls back to the official registry. It cannot be combined with controls that would select a different image: `container.imageRegistry`, `container.imageTag`, `container.agentImage`, `container.buildLocal`, `security.sslBump` (requires a locally built Squid image), `runner.sysrootImage`, `dind.stagingImage`, or per-enclave image overrides. Registry credentials are intentionally not configured by AWF; use a pre-authenticated Docker daemon.)*
 - `container.imageRegistry` → `--image-registry`
 - `container.imageTag` → `--image-tag`
 - `container.skipPull` → `--skip-pull`
@@ -258,22 +314,42 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `container.dockerHost` → `--docker-host`
 - `container.dockerHostPathPrefix` → `--docker-host-path-prefix`
 - `container.runnerToolCachePath` → *(config-only; checked first for optional read-only runner tool cache mount, before `RUNNER_TOOL_CACHE` and `/home/runner/work/_tool` auto-detection)*
-- `container.mounts[]` → `-v, --mount` *(repeatable; each array entry maps to one Docker volume mount in `/host_path:/container_path[:ro|rw]` format (both paths must be absolute; host path must exist); in chroot mode, container paths are automatically prefixed with `/host`)*
-- `container.containerRuntime` → `--container-runtime` *(user-facing runtime name: `"gvisor"` for an OCI runtime in Compose, `"sbx"` for a Docker sbx microVM, or `"cloud-hypervisor"` for the explicit Cloud Hypervisor v53.0 workload preview (GitHub-hosted Ubuntu x86_64 KVM runners only; see §4.2). gVisor translates to `"runsc"` and injects `extra_hosts` for its DNS workaround. For sbx and Cloud Hypervisor, infrastructure stays in Compose while the primary agent runs in a microVM.)*
+- `container.mounts[]` → `-v, --mount` *(repeatable; each array entry maps to one Docker volume mount in `/host_path:/container_path[:ro|rw]` format (both paths must be absolute; host path must exist); in chroot mode, container paths are automatically prefixed with `/host`. With ARC/DinD, `--docker-host-path-prefix` translates the bind-mount host source only, not the container destination or paths in the agent command. Sysroot staging can drop automatic mounts whose sources are not daemon-visible; explicitly mount required shared paths. See [docs/arc-dind.md](./arc-dind.md#staging-recipe))*
+- `container.containerRuntime` → `--container-runtime` *(user-facing runtime name: `"gvisor"` for an OCI runtime in Compose, `"sbx"` for a Docker sbx microVM, `"cloud-hypervisor"` for the explicit Cloud Hypervisor v53.0 workload preview (GitHub-hosted Ubuntu x86_64 KVM runners only; see §4.2), or `"nvx"` for the explicit NVX/OpenVMM one-shot workload preview (Linux x86_64 KVM-only; see [docs/nvx-security-design.md](./nvx-security-design.md#runtime-registration-opt-in-preview)). gVisor translates to `"runsc"` and injects `extra_hosts` for its DNS workaround. For sbx, Cloud Hypervisor, and NVX, infrastructure stays in Compose while the primary agent runs in a microVM.)*
 - `filesystem.allowWrite[]` → *(config-only; no CLI equivalent; narrows existing writable host binds to the listed guest-visible absolute paths, see §4.1)*
-- `cloudHypervisor.previewEnabled` → `--cloud-hypervisor-preview` *(requires `container.containerRuntime: "cloud-hypervisor"` and a GitHub-hosted Ubuntu x86_64 KVM runner to execute a workload)*
+- `cloudHypervisor.previewEnabled` → `--cloud-hypervisor-preview` *(requires `container.containerRuntime: "cloud-hypervisor"` or at least one `enclaves[].runtime: "cloud-hypervisor"` entry, plus a GitHub-hosted Ubuntu x86_64 KVM runner to execute a workload)*
+- `cloudHypervisor.mountPolicy` → `--cloud-hypervisor-mount-policy` *(`workspace-only` by default; use `workspace-and-tool-cache` only when the workload needs the runner tool cache)*
 - `cloudHypervisor.cloudHypervisorBinary` → `--cloud-hypervisor-binary`
 - `cloudHypervisor.kernelPath` → `--cloud-hypervisor-kernel`
 - `cloudHypervisor.rootfsPath` → `--cloud-hypervisor-rootfs`
 - `cloudHypervisor.supervisorPath` → `--cloud-hypervisor-supervisor`
+- `cloudHypervisor.artifactManifestPath` → `--cloud-hypervisor-artifact-manifest`
+- `cloudHypervisor.artifactManifestBundlePath` → `--cloud-hypervisor-artifact-manifest-bundle`
+- `cloudHypervisor.artifactReleaseTag` → `--cloud-hypervisor-artifact-release-tag`
+- `cloudHypervisor.developmentAllowUnattestedArtifacts` → `--cloud-hypervisor-development-allow-unattested-artifacts` *(development only; also requires the matching environment variable and complete legacy hashes)*
 - `cloudHypervisor.vcpuCount` → `--cloud-hypervisor-vcpus`
 - `cloudHypervisor.memoryMib` → `--cloud-hypervisor-memory-mib`
+- `cloudHypervisor.scratchMib` → `--cloud-hypervisor-scratch-mib` *(optional positive integer MiB; bounds primary guest `/tmp` with tmpfs before workload startup, leaving fixed enclave budgets unchanged)*
+- `cloudHypervisor.enclaveDebugPublic` → `--cloud-hypervisor-enclave-debug-public` *(defaults on for eligible attested, static public-only enclaves after positive GitHub visibility verification; set `false` in configuration to opt out; host-only bounded artifacts include agent session diagnostics; private/mixed/dynamic scopes remain default off; see [public enclave debugging](cloud-hypervisor-foundation.md#public-fixture-enclave-debugging))*
 - `cloudHypervisor.apiTimeoutMs` → `--cloud-hypervisor-api-timeout-ms`
-- `cloudHypervisor.sha256.cloudHypervisor` → `--cloud-hypervisor-binary-sha256`
+- `cloudHypervisor.sha256.cloudHypervisor` → `--cloud-hypervisor-binary-sha256` *(development bypass only)*
 - `cloudHypervisor.sha256.virtiofsd` → `--cloud-hypervisor-virtiofsd-sha256`
 - `cloudHypervisor.sha256.kernel` → `--cloud-hypervisor-kernel-sha256`
 - `cloudHypervisor.sha256.rootfs` → `--cloud-hypervisor-rootfs-sha256`
 - `cloudHypervisor.sha256.supervisor` → `--cloud-hypervisor-supervisor-sha256`
+- `nvx.previewEnabled` → `--nvx-preview` *(requires `container.containerRuntime: "nvx"`; execution never falls back to Docker, Cloud Hypervisor, or another runtime on failure)*
+- `nvx.layerPath` → `--nvx-layer` *(guest distro layer; required)*
+- `nvx.artifactManifestPath` → `--nvx-artifact-manifest` *(required)*
+- `nvx.artifactManifestBundlePath` → `--nvx-artifact-manifest-bundle` *(required)*
+- `nvx.signerWorkflow` → `--nvx-signer-workflow`
+- `nvx.openvmmPath` → `--nvx-openvmm` *(required)*
+- `nvx.kernelPath` → `--nvx-kernel` *(required)*
+- `nvx.initramfsPath` → `--nvx-initramfs` *(required)*
+- `nvx.memoryMib` → `--nvx-memory-mib` *(default 512)*
+- `nvx.memoryMaxBytes` → `--nvx-memory-max-bytes` *(default 512 MiB)*
+- `nvx.pidsMax` → `--nvx-pids-max` *(default 128)*
+- `nvx.scratchBytes` → `--nvx-scratch-bytes`
+- `nvx.mountPolicy` → `--nvx-mount-policy` *(`"workspace-only"` (default) exports `$GITHUB_WORKSPACE` into the guest at `/workspace` read-write; `"workspace-and-tool-cache"` additionally exports the runner tool cache read-only. `filesystem.allowWrite` narrows the workspace export, and `container.containerWorkDir` must resolve inside `/workspace`.)*
 - `chroot.binariesSourcePath` → *(config-only; mounts a runner-side binaries directory at `/tmp/awf-runner-bin` inside chroot mode and prepends it to `PATH`)*
 - `chroot.identity.home` → *(config-only; forwarded as `AWF_CHROOT_IDENTITY_HOME` and applied after chroot pivot)*
 - `chroot.identity.user` → *(config-only; forwarded as `AWF_CHROOT_IDENTITY_USER` and applied to `USER`/`LOGNAME` after chroot pivot)*
@@ -296,7 +372,22 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `rateLimiting.requestsPerMinute` → `--rate-limit-rpm`
 - `rateLimiting.requestsPerHour` → `--rate-limit-rph`
 - `rateLimiting.bytesPerMinute` → `--rate-limit-bytes-pm`
+- `rateLimiting.maxGithubApiPointsRest` → `--max-github-api-points-rest` *(requires `security.difcProxy.host`)*
+- `rateLimiting.maxGithubApiPointsGraphql` → `--max-github-api-points-graphql` *(requires `security.difcProxy.host`)*
+- `rateLimiting.maxNumToolCalls` → `--max-num-tool-calls` *(requires `enclaves`, see §14.2a)*
+
+GitHub API point budgets apply to the entire AWF run and are enforced only by
+the protected `gh` CLI proxy enabled through `security.difcProxy.host`. REST
+read requests consume one point, REST mutations consume five points, and
+GraphQL requests consume one point, matching GitHub's secondary-rate-limit
+point accounting. A command that would exceed its REST or GraphQL budget is
+rejected before it is executed; the CLI proxy writes a
+`github_api_points_limited` structured audit record with the API kind, used
+points, configured limit, and remaining budget.
+
 - *(no config equivalent)* → `--reflect` *(CLI-only; starts AWF, queries the API proxy `/reflect` endpoint, and prints its JSON response instead of running a command; mutually exclusive with a command argument)*
+- *(no config equivalent)* → `--capture-command-output <directory>` *(CLI-only; captures raw command stdout/stderr into a new absolute host-only directory outside agent-visible mounts; non-TTY Compose runtimes only; see `docs/protected-command-output.md`)*
+- *(no config equivalent)* → `--capture-command-output-max-bytes <bytes>` *(CLI-only; requires `--capture-command-output`; default and maximum 67108864)*
 - `platform.type` → *(config-only; maps to `AWF_PLATFORM_TYPE`)*
 - `runner.topology` → *(config-only; sets runner deployment model — `standard` or `arc-dind`; when `arc-dind`, enables sysroot staging and emits RUNNER_TOOL_CACHE warnings)*
 - `runner.sysrootImage` → *(config-only; sysroot init-container image for `arc-dind` topology; defaults to `<container.imageRegistry>/build-tools:<container.imageTag>`, where `container.imageRegistry` defaults to `ghcr.io/github/gh-aw-firewall`)*
@@ -320,7 +411,9 @@ AWF settings MAY be supplied via config files, including stdin (`--config -`).
 - `enclaves[].agent.maxTaskBytes` → *(config-only; no CLI equivalent, see §14)*
 - `enclaves[].agent.maxModelRequests` → *(config-only; no CLI equivalent, see §14)*
 - `enclaves[].agent.maxModelTokens` → *(config-only; no CLI equivalent, see §14)*
-- `enclaves[].agent.github.cli` → *(config-only; closed optional profile, see §14.3)*
+- `enclaves[].agent.github.cli` → *(config-only; deprecated closed legacy profile, see §14.3)*
+- `enclaves[].agent.tools.github` → *(config-only; closed GitHub MCP tool contract, see §14.3)*
+- `enclaves[].dynamic` → *(config-only; no CLI equivalent; requires compiler handoff; see §14.1a)*
 
 When `container.dockerHostPathPrefix` points at a daemon-visible shared `/tmp` path, the implementation stages the invoking CLI binary together with `/etc/passwd`, `/etc/group`, and the generated chroot `/etc/hosts` under that shared path so chroot mode can bootstrap on split-filesystem ARC/DinD hosts.
 
@@ -727,10 +820,14 @@ A conforming implementation:
 
 1. MUST read the named variable only in runner-side configuration code, before
    any container starts.
-2. MUST require an absolute `https://` URL and MUST reject embedded credentials
+2. MUST require an absolute `http://` or `https://` URL and MUST reject embedded credentials
    (`user:pass@`), query strings, fragments, malformed hosts, unsupported
-   schemes, and non-default ports (the sidecar connects on port 443).
+   schemes, and dangerous service ports. HTTPS is recommended for remote endpoints.
 3. MUST derive the host, `host:port`, and optional base path from the URL.
+   Explicit ports MUST be preserved for discovery, validation, and inference.
+   Non-default ports MUST be authorized only for the trusted API-proxy source
+   and the exact configured DNS hostname/port, without widening agent access,
+   bypassing Squid, or overriding destination blocks.
 4. MUST add the derived destination to the effective Squid policy without
    persisting it in repository configuration, and MUST keep it out of
    `allowedDomains` (it is carried in the sensitive allowlist instead).
@@ -747,158 +844,354 @@ A conforming implementation:
 The same rules apply to agent and detection phases, which share this
 configuration path.
 
-## 10. Effective Token Budget Enforcement
+### 9.8 Claude Hosted Web Search and Fetch
 
 *This section is normative.*
 
-When `apiProxy.maxEffectiveTokens` is configured, the API proxy MUST enforce
-a cumulative effective-token budget across all LLM API requests in a single
-run. The budget limits total *weighted* token consumption, not raw token
-counts.
+Anthropic's hosted server tools — `web_search_YYYYMMDD` and
+`web_fetch_YYYYMMDD` — are executed by Anthropic infrastructure, not inside the
+agent container. Squid therefore only ever observes the Anthropic API endpoint;
+the searched or fetched destination is invisible to the domain ACL and to Squid
+access logs, and the retrieved content returns inside an already-allowed API
+response. Without additional enforcement this is a semantic egress gap: an
+indirect prompt-injection and blind-exfiltration channel driven by
+model-generated queries and URLs.
 
-### 10.1 Token Weighting
+Because the api-proxy sidecar is trusted and already inspects Anthropic Messages
+bodies, AWF closes the gap there. `apiProxy.hostedWeb.claude` is **config-only**:
+there is no CLI flag and no environment alias. AWF serializes the validated
+policy into the sidecar as `AWF_CLAUDE_HOSTED_WEB_POLICY`; that variable is an
+implementation detail, is generated only from validated configuration, and MUST
+NOT be accepted from an agent-controlled source.
 
-Each upstream response's `usage` object is decomposed into four categories,
-each with a fixed weight:
-
-| Category | Weight | Usage field |
-|----------|--------|-------------|
-| Input | 1.0 | `input_tokens` / `prompt_tokens` |
-| Cache read | 0.1 | `cache_read_input_tokens` / `prompt_tokens_details.cached_tokens` |
-| Output | 4.0 | `output_tokens` / `completion_tokens` |
-| Reasoning | 4.0 | `reasoning_tokens` / `completion_tokens_details.reasoning_tokens` |
-
-The base weighted tokens for a single response are:
-
-```
-base = (1.0 × input) + (0.1 × cache_read) + (4.0 × output) + (4.0 × reasoning)
-```
-
-### 10.2 Model Multipliers
-
-When `apiProxy.modelMultipliers` is configured, each model name MAY have
-an associated positive multiplier. The effective tokens for a response are:
-
-```
-effective_tokens = model_multiplier × base_weighted_tokens
+```yaml
+apiProxy:
+  hostedWeb:
+    claude:
+      enabled: true
+      allowedDomains:
+        - docs.github.com
+        - nodejs.org
+      maxUses: 5
 ```
 
-If no exact multiplier is configured, AWF MUST attempt to match
-`apiProxy.modelMultipliers` keys against the request model using a hyphen-suffix
-prefix match so family keys like `claude-opus-4.7` apply to concrete model IDs
-like `claude-opus-4.7-20260501`.
+Blocklist mode:
 
-If no exact or prefix match is found, and `apiProxy.defaultModelMultiplier` is
-configured, that default multiplier MUST be used.
-
-Otherwise, if no exact or prefix match is found, the multiplier MUST default to
-the highest configured model multiplier. If no model multipliers are configured
-at all, the multiplier defaults to `1`.
-
-When AWF falls back to the default multiplier because no configured model key
-matched, it MUST emit a warning log entry.
-
-### 10.3 Enforcement Behavior
-
-The API proxy MUST enforce the budget as follows:
-
-1. **Accumulation**: After each successful upstream response, the proxy
-   extracts the `usage` object, computes effective tokens, and adds them
-   to a running total for the session.
-
-2. **Pre-request check**: Before forwarding each subsequent request to the
-   upstream provider, the proxy checks whether the cumulative total has
-   reached or exceeded `maxEffectiveTokens`.
-
-3. **Rejection**: When the budget is reached or exceeded, the proxy MUST reject the
-   request with:
-   - **HTTP status**: `403 Forbidden`
-   - **Content-Type**: `application/json`
-   - **Response body**:
-     ```json
-     {
-       "error": {
-         "type": "effective_tokens_limit_exceeded",
-         "message": "Maximum effective tokens exceeded (1234.56 / 1000).",
-         "total_effective_tokens": 1234.56,
-         "max_effective_tokens": 1000
-       }
-     }
-     ```
-
-4. **WebSocket rejection**: For WebSocket upgrade requests, the proxy MUST
-   reject with `HTTP/1.1 403 Forbidden` and include the same JSON
-   error body before destroying the socket.
-
-5. **Finality**: Once the budget is reached or exceeded, all subsequent requests in
-   the same run MUST be rejected. The budget is not recoverable.
-
-### 10.4 Threshold Tracking
-
-The proxy MUST track when cumulative effective tokens cross the following
-percentage thresholds of `maxEffectiveTokens`:
-
-| Threshold |
-|-----------|
-| 80% |
-| 90% |
-| 95% |
-| 99% |
-
-Each threshold MUST be recorded at most once per run.
-
-### 10.5 Token Steering
-
-Token steering is **opt-in**. It is active only when `apiProxy.enableTokenSteering`
-is `true` (CLI: `--enable-token-steering`), which sets `AWF_ENABLE_TOKEN_STEERING=true`
-in the api-proxy sidecar. When disabled (the default), thresholds are still tracked
-(for introspection) but no warning messages are injected. Setting the field to
-`false`, or omitting it, opts a workflow out; the env var is only emitted when the
-value is `true`.
-
-When token steering is enabled and a threshold is first crossed, the proxy MUST
-inject a budget-warning system message into the **body** of the very next eligible
-request sent by the agent, then discard the pending message so that it is injected
-at most once per threshold per run.
-
-The injected message has the format:
-
-```
-[AWF TOKEN WARNING] <threshold-specific text>
+```yaml
+apiProxy:
+  hostedWeb:
+    claude:
+      enabled: true
+      blockedDomains:
+        - untrusted.example
+        - ads.example
 ```
 
-| Threshold | Injected text |
-|-----------|---------------|
-| 80% | You have used 80% of your effective token budget. Begin planning to wrap up your current work. |
-| 90% | You have used 90% of your effective token budget. Complete your current task and prepare final output. |
-| 95% | You have used 95% of your effective token budget. Finalize and submit your work now. |
-| 99% | You have used 99% of your effective token budget. You are about to be cut off. Submit immediately. |
+Prohibit Claude hosted web tools entirely:
 
-If multiple thresholds are crossed simultaneously (e.g. a single large
-response crosses both 80% and 90%), the proxy MUST inject only the highest
-crossed threshold on the next request and queue the remaining thresholds for
-subsequent requests (one per request).
+```yaml
+apiProxy:
+  hostedWeb:
+    claude:
+      enabled: false
+```
 
-**Provider-specific injection rules:**
+#### 9.8.1 Configuration Contract
 
-- **OpenAI / Copilot** — the proxy inserts a `{ "role": "system", "content": "<message>" }` entry into the `messages` array immediately after any pre-existing system messages.
-- **Anthropic** — the proxy appends the warning to the `system` field: if `system` is a string it is concatenated (separated by `\n\n`); if `system` is an array of content blocks a `{ "type": "text", "text": "<message>" }` block is appended; if `system` is absent it is created as the warning string.
-- **Gemini** — the proxy appends a `{ "text": "<message>" }` part to `systemInstruction.parts`; if `systemInstruction` is absent it is created.
+`apiProxy.hostedWeb` and `apiProxy.hostedWeb.claude` are closed objects
+(`additionalProperties: false`).
 
-If the request body cannot be parsed as JSON, or if the body format does not
-match the expected structure, the proxy MUST silently skip injection for that
-request and NOT re-queue the message.
+| Property | Type | Required | Semantics |
+|---|---|---|---|
+| `enabled` | boolean | yes | `false` rejects every matching Claude hosted search/fetch tool. `true` enables enforcement using exactly one configured domain mode. |
+| `allowedDomains` | non-empty array of unique domains | conditional | Provider allowlist upper bound. Mutually exclusive with `blockedDomains`. |
+| `blockedDomains` | non-empty array of unique domains | conditional | Provider blocklist lower bound. Mutually exclusive with `allowedDomains`. |
+| `maxUses` | positive integer | no | Maximum uses AWF permits per matching hosted tool. Request values may only reduce it. |
 
-When token steering is enabled **and** `container.agentTimeout` is configured,
-the proxy MUST also inject runtime warnings at 80/90/95/99% of elapsed run time
-using the same queueing behavior (highest crossed threshold first, then one
-pending warning per subsequent request):
+There is deliberately **no implicit unrestricted `enabled: true` state**: when
+`enabled` is `true`, exactly one of `allowedDomains` or `blockedDomains` MUST be
+present and non-empty. This prevents a success-shaped configuration that appears
+protected while forwarding unrestricted hosted web access. Domains MUST NOT be
+combined with `enabled: false`.
+
+Domain values use one canonical syntax: lowercase DNS hostnames with at least
+two labels and no URL scheme, path, query, fragment, credentials or port, and no
+raw IP address, CIDR, wildcard, `localhost`-style single-label name, Docker
+service alias, or empty string. Duplicates are removed after normalization. A
+parent domain also covers its subdomains, matching Anthropic's semantics.
+
+Absence of `apiProxy.hostedWeb.claude` preserves the pre-existing pass-through
+behaviour. **Warning: omitting the object does not constrain Claude-hosted
+egress.** A compiler such as gh-aw can opt into enforcement by always emitting
+the object when workflow frontmatter declares a network policy.
+
+The hosted-web list is intentionally explicit rather than derived from
+`network.allowDomains`. The network list may contain provider API endpoints,
+internal services, or ecosystem expansions that are inappropriate to disclose to
+or authorize for provider-hosted retrieval. Sensitive, secret-derived allowlist
+entries (see [§9.7](#97-secret-backed-openai-target)) MUST NOT be disclosed to
+the provider.
+
+The behaviour is identical for a JSON file, a YAML file, JSON on stdin, and YAML
+on stdin. Validation errors from `--config -` identify `stdin` as the source and
+reject the run before any container starts. A compiler therefore only needs to
+emit a stable config document:
+
+```json
+{
+  "network": {
+    "allowDomains": ["api.github.com", "docs.github.com"]
+  },
+  "apiProxy": {
+    "hostedWeb": {
+      "claude": {
+        "enabled": true,
+        "allowedDomains": ["docs.github.com"]
+      }
+    }
+  }
+}
+```
+
+and pipe it to `awf --config - -- <command>`. Compilers do not need to understand
+Anthropic request JSON, tool-version names, or api-proxy environment variables;
+AWF owns the provider-specific translation and enforcement.
+
+#### 9.8.2 Configuration-Source Precedence
+
+The effective configured policy is selected before request processing:
+
+1. an explicit CLI option, if one is added in a later revision;
+2. the AWF configuration document, including JSON or YAML supplied via
+   `--config -`;
+3. AWF's internal default (no enforcement; current compatibility behaviour).
+
+#### 9.8.3 Request-Level Precedence
+
+The configured policy is an immutable security boundary. Request-provided tool
+settings MAY narrow it but MUST NEVER broaden, remove, replace, or disable it.
+
+| Configured policy | Request tool fields | Effective result |
+|---|---|---|
+| `enabled: false` | any | Reject (`claude_hosted_web_disabled`) |
+| allowlist | none | Inject configured `allowed_domains` |
+| allowlist | `allowed_domains` | Intersection of configured and requested |
+| allowlist | `allowed_domains` with empty intersection | Reject (`claude_hosted_web_empty_intersection`) |
+| allowlist | `blocked_domains` | Reject (`claude_hosted_web_policy_conflict`) |
+| blocklist | none | Inject configured `blocked_domains` |
+| blocklist | `blocked_domains` | Union of configured and requested |
+| blocklist | `allowed_domains` | Reject (`claude_hosted_web_policy_conflict`) |
+| any enabled mode | both `allowed_domains` and `blocked_domains` | Reject (`claude_hosted_web_policy_conflict`) |
+| `maxUses` configured | `max_uses` omitted | Inject configured value |
+| `maxUses` configured | `max_uses` present | `min(configured, requested)` |
+| any enabled mode | malformed `max_uses` (zero, negative, non-integer) | Reject (`claude_hosted_web_max_uses_invalid`) |
+
+Cross-mode request restrictions are rejected rather than silently dropped
+because Anthropic cannot represent `allowed_domains` and `blocked_domains` on the
+same tool definition; rejecting is safer and more diagnosable than pretending
+both policies were enforced. AWF-generated values replace the corresponding
+request fields only after the effective policy has been calculated: a hosted tool
+is never silently stripped, and an unprotected hosted tool is never silently
+forwarded.
+
+#### 9.8.4 API-Proxy Behaviour
+
+A conforming implementation:
+
+1. MUST parse and validate the serialized policy once at sidecar startup and MUST
+   fail startup — not the first request — on an invalid internal policy.
+2. MUST apply enforcement only to Anthropic Messages request bodies that contain
+   a matching hosted tool. A configured policy MUST NOT mutate an ordinary
+   Messages request, including requests to custom Anthropic-compatible endpoints
+   that implement no hosted server tools.
+3. MUST recognize versioned tool types with a validated `web_search_YYYYMMDD` /
+   `web_fetch_YYYYMMDD` matcher — including versions published after this
+   revision — rather than a fixed list of exact names.
+4. MUST fail closed on a value that claims to be a hosted web tool but does not
+   match the versioned form (`claude_hosted_web_tool_unrecognized`), so a future
+   or malformed shape can never be forwarded without policy.
+5. MUST apply enforcement after generic body parsing and after the other
+   Anthropic transforms (model rewriting, prompt-cache optimizations, tool drop,
+   custom transform file) so that no other transform can re-expand or remove the
+   enforced policy.
+6. MUST enforce every matching tool in a request, not only the first.
+7. MUST return structured API-proxy errors with the stable `error.code` values
+   listed above (HTTP 403 for policy rejections, HTTP 400 for malformed tool
+   definitions, domains, or `max_uses`), and MUST NOT include prompts, queries,
+   URLs, or request bodies in those errors.
+
+### 9.9 Codex/OpenAI Hosted Web Policy
+
+*This section is normative.*
+
+OpenAI-hosted retrieval executes beyond the AWF network boundary. Squid sees
+the permitted OpenAI endpoint, not the searched or fetched destination. AWF
+therefore enforces `apiProxy.hostedWeb.codex` inside the trusted API proxy on:
+
+1. Responses requests containing a `web_search` or dated
+   `web_search_YYYY_MM_DD` tool; and
+2. every request to `/v1/alpha/search`.
+
+The config object is closed and references the same schema, normalization, and
+source-precedence contract as `apiProxy.hostedWeb.claude`: `enabled` is
+required; `enabled: true` requires exactly one non-empty `allowedDomains` or
+`blockedDomains`; `enabled: false` permits neither; and `maxUses`, when present,
+is a positive integer. Domains are normalized and validated identically for
+both providers. The two policies may coexist in one config.
+
+```yaml
+apiProxy:
+  hostedWeb:
+    claude:
+      enabled: true
+      blockedDomains:
+        - untrusted.example
+    codex:
+      enabled: true
+      allowedDomains:
+        - docs.github.com
+        - nodejs.org
+      maxUses: 5
+```
+
+Configuration-source precedence is:
+
+1. an explicit CLI option, if one is added in the future;
+2. the validated AWF document, including JSON/YAML via `--config -`; and
+3. compatibility behavior.
+
+The initial implementation is config-only. `AWF_CODEX_HOSTED_WEB_POLICY` is an
+internal transport generated from validated config and cannot independently
+override it. Omission preserves pass-through behavior and **does not constrain
+Codex-hosted egress**.
+
+#### 9.9.1 Request Precedence
+
+The configured policy is immutable. A request can only narrow it. OpenAI can
+represent allowed and blocked filters together, so the canonical cross-mode
+rule is to preserve the request's opposite-mode restriction while applying the
+configured mode; no restriction is silently removed.
+
+| Config mode | Request filters | Effective filters |
+|---|---|---|
+| disabled | Any Responses hosted tool or standalone request | Reject with `codex_hosted_web_disabled` |
+| allow | none | Inject configured `allowed_domains` |
+| allow | `allowed_domains` | Intersect with configured allowlist; reject an empty result |
+| allow | `blocked_domains` | Inject configured allowlist and preserve request blocklist |
+| block | none | Inject configured `blocked_domains` |
+| block | `blocked_domains` | Union with configured blocklist |
+| block | `allowed_domains` | Preserve request allowlist and inject configured blocklist |
+
+Both request filter arrays, when present, must be non-empty valid domain lists.
+On the standalone route, the effective `settings.filters` is applied again to
+each `commands.search_query[].domains` and `commands.image_query[].domains`
+list. An allowlist is intersected; blocked domains are removed; and an empty
+effective query scope rejects with `codex_hosted_web_empty_query_scope` rather
+than falling back to the request-level scope.
+
+Literal HTTP(S) URLs in `commands.open[].ref_id`,
+`commands.find[].ref_id`, and `commands.screenshot[].ref_id` are host-checked
+against both effective lists. Non-URL provider reference IDs remain valid.
+A malformed URL/host rejects; a disallowed host rejects with
+`codex_hosted_web_url_disallowed`.
+
+The **most restrictive** applicable configured, request, per-query, and URL
+scope governs each retrieval. No scope can relocate or widen authority granted
+by another. `network.allowDomains` and `network.sensitiveAllowDomains` are
+never copied into provider policy or request bodies.
+
+#### 9.9.2 Access Modes, Limits, and Unknown Shapes
+
+Responses `external_web_access` and `indexed_web_access` values must be
+booleans. Standalone `settings.external_web_access` accepts booleans or the
+current `cached`, `indexed`, and `live` modes. Unknown future values fail closed
+with `codex_hosted_web_access_invalid`; they are never interpreted as
+permissive.
+
+For Responses tools, configured `maxUses` is injected as `max_uses`, or
+resolved as `min(configured, requested)`. Malformed, zero, negative, or
+non-integer request values reject. `/v1/alpha/search` exposes no equivalent
+per-request cap, so a configured `maxUses` rejects that route with
+`codex_hosted_web_max_uses_unsupported` rather than being silently ignored.
+
+Recognized standalone command families are `search_query`, `image_query`,
+`open`, `click`, `find`, and `screenshot`. Unknown command shapes and malformed
+dated hosted-tool names fail closed. Enforcement runs after existing OpenAI
+body/model transforms and immediately before dispatch, so no later transform
+can remove or expand the effective policy.
+
+#### 9.9.3 Stable Errors and Compiler Contract
+
+Policy failures use `invalid_request_error` envelopes with stable
+`codex_hosted_web_*` codes:
+
+| Code | Meaning |
+|---|---|
+| `codex_hosted_web_disabled` | Hosted retrieval is prohibited |
+| `codex_hosted_web_filter_invalid` / `codex_hosted_web_domain_invalid` | Malformed filters or domains |
+| `codex_hosted_web_empty_intersection` / `codex_hosted_web_empty_query_scope` | Narrowing produced no permitted scope |
+| `codex_hosted_web_url_invalid` / `codex_hosted_web_url_disallowed` | Literal URL is malformed or outside policy |
+| `codex_hosted_web_access_invalid` | Unknown hosted-access mode |
+| `codex_hosted_web_max_uses_invalid` / `codex_hosted_web_max_uses_unsupported` | Invalid cap or route cannot enforce it |
+| `codex_hosted_web_tool_unrecognized` / `codex_hosted_web_command_unrecognized` / `codex_hosted_web_shape_invalid` | Unknown future or malformed hosted-search shape |
+
+Errors do not include prompts, queries, literal URLs, or request bodies.
+Serialized internal policy is validated during sidecar startup. Ordinary
+OpenAI-compatible requests without a hosted-web surface are unchanged.
+
+Compiler integrations only emit the stable config and pipe it to
+`awf --config - -- <command>`; they do not need to understand provider routes,
+body fields, tool versions, or internal environment variables.
+
+## 10. AI Credit and Runtime Controls
+
+### 10.1 Budget Steering
+
+Budget steering is **opt-in**. It is active only when `apiProxy.enableTokenSteering`
+is `true` (CLI: `--enable-token-steering`), which sets
+`AWF_ENABLE_TOKEN_STEERING=true` in the api-proxy sidecar. When disabled (the
+default), thresholds remain observable but no warning messages are injected.
+Setting the field to `false`, or omitting it, opts out.
+
+When enabled, the proxy tracks AI-credit and runtime thresholds
+at 80%, 90%, 95%, and 99%. Credit thresholds use the lower of configured
+`maxAiCredits` and the non-overridable 10,000-credit hard cap (the hard cap is
+the ceiling when `maxAiCredits` is not configured). Runtime thresholds use the
+agent start marker written by the runtime; the host timeout and API proxy use
+that same start time and deadline.
+
+Warnings are advisory and are injected into the **next eligible outbound model
+request** after a threshold crossing. They do not interrupt an in-progress model
+request or tool, extend a timeout, raise a budget, guarantee a later request, or
+guarantee that the agent completes or submits work. If the budget is already
+exhausted, normal terminal rejection remains in effect.
+
+Each threshold is recorded once per run. At most one warning is injected per
+request: the largest crossed percentage is delivered first, then other pending
+warnings are delivered on later eligible requests. For equal percentages, time
+warnings precede AI-credit warnings.
+Classifier requests, malformed JSON, unsupported body shapes, or any request
+that cannot be modified do not consume pending warnings. A warning is consumed
+only after successful body injection.
+
+The warning formats are:
 
 ```
+[AWF AI CREDIT WARNING] <threshold-specific text>
 [AWF TIME WARNING] <threshold-specific text>
 ```
 
-### 10.6 Introspection
+AI-credit and time messages use threshold-specific wording for the AI-credit
+budget and allotted run time.
+
+**Provider-specific injection rules:**
+
+- **OpenAI / Copilot Chat Completions** — the proxy inserts a `{ "role": "system", "content": "<message>" }` entry into the `messages` array immediately after any pre-existing system messages.
+- **OpenAI / Copilot Responses** — the proxy appends one final `developer` message item to `input`, after all existing items (including tool results), leaving `instructions`, tools, existing input items, and streaming fields unchanged to preserve the prompt-cache prefix. A string `input` becomes a single user message followed by the notice. The notice is one-shot and is not added to later requests; when translated to Chat Completions, it remains the final message and the leading system message from `instructions` is unchanged.
+- **Anthropic** — the proxy appends the warning to the `system` field: if `system` is a string it is concatenated (separated by `\n\n`); if `system` is an array of content blocks a `{ "type": "text", "text": "<message>" }` block is appended; if `system` is absent it is created as the warning string.
+- **Gemini** — the proxy appends a `{ "text": "<message>" }` part to `systemInstruction.parts`; if `systemInstruction` is absent it is created.
+
+### 10.2 Introspection
 
 The API proxy exposes a `GET /reflect` endpoint on every provider port
 (10000–10004). Each port returns the same aggregate reflection payload, whose
@@ -906,20 +1199,31 @@ The API proxy exposes a `GET /reflect` endpoint on every provider port
 (10000, OpenAI) serves `/metrics` and the aggregate `/health`; non-management
 ports still serve provider-local `/health` responses.
 
-### 10.7 Max AI Credits Configuration
+### 10.3 Max AI Credits Configuration
 
-`maxAiCredits` is a positive number. It is supplied via the AWF config file
+`maxAiCredits` accepts a positive budget or a disabled value (`-1` or `0`).
+It is supplied via the AWF config file
 (including stdin config via `--config -`) and maps to the
 `AWF_MAX_AI_CREDITS` environment variable injected into the api-proxy
 container.
 
-When configured, the proxy MUST enforce this budget in addition to any
-configured `maxEffectiveTokens` budget. Once cumulative AI credits reach or
+Setting `maxAiCredits` to `-1` or `0` disables the configured budget, as if the
+field were omitted. AWF does not inject `AWF_MAX_AI_CREDITS` for these values.
+Other negative values are invalid. The non-overridable 10,000-credit hard cap
+still applies.
+
+When configured, the proxy MUST enforce this budget. Once cumulative accounted AI credits reach or
 exceed `maxAiCredits`, subsequent requests MUST be rejected with HTTP `403`
 and error type `ai_credits_limit_exceeded`.
+Usage without resolvable pricing is excluded from these totals and produces a
+warning, so enforcement may undercount actual spending.
+
+When `apiProxy.enableTokenSteering` is true, cumulative credits also queue the
+80%, 90%, 95%, and 99% advisory warnings. This warning path does not alter credit
+accounting or terminal rejection.
 
 Regardless of `maxAiCredits` configuration, AWF also enforces a non-overridable
-hard cap of **10,000 AI credits**. When cumulative AI credits reach this hard
+hard cap of **10,000 accounted AI credits**. When cumulative accounted AI credits reach this hard
 cap, subsequent requests MUST be rejected with HTTP `403` and error type
 `ai_credits_limit_exceeded`, and the error/log payload MUST include
 `hard_cap: true`.
@@ -930,36 +1234,122 @@ If both limits are present, the effective enforcement threshold is the lower of:
 
 Setting `maxAiCredits` above 10,000 MUST NOT raise the effective limit.
 
-### 10.7.1 Model Name Resolution for Pricing
+### 10.3.1 Model Name Resolution for Pricing
 
 The AI credits guard resolves model names using this lookup order:
 
 1. **Operator provider overlay** — model prices configured under
-   `apiProxy.providers`.
-2. **Runtime provider metadata** — authoritative token prices discovered from
-   the configured provider. Copilot supports this today.
-3. **Curated pricing table** — a built-in table of known models with exact pricing.
-4. **Bundled models.dev catalog** — a bundled snapshot of the models.dev catalog used as a fallback when the model is not found in the curated table.
+   `apiProxy.providers`. These explicit overrides take precedence over every
+   other source.
+2. **Versioned shared catalog** — provider-scoped prices supplied in
+   `apiProxy.modelPricingCatalog`. This catalog is pinned by its `catalogId`
+   and `version` and takes precedence over runtime and bundled prices.
+3. **Runtime provider metadata** — authoritative token prices discovered from
+   the configured provider. Complete fresh prices take precedence over fetched
+   central prices. Copilot supports this today.
+4. **Fetched central catalogue** — validated fresh reviewed-source tariffs in
+   the exact applicable provider/channel/deployment scope. Currently supports
+   Copilot API token tariffs, not native-provider or custom/BYOK mappings.
+5. **Curated pricing table** — a built-in table of known models with exact pricing.
+6. **Bundled models.dev catalog** — an offline snapshot used when the model is
+   not found in the higher-priority sources.
 
-Model names are **canonicalized** before lookup: provider prefixes
+The existing incomplete-provider component merge remains the fallback when no
+applicable fresh central tariff exists. Disabled, offline, unavailable or denied
+feeds do not remove those approved existing pricing paths. See the
+[publication and loader contract](model-catalogue-publication.md) for authentication,
+immutable request revisions, freshness, unsupported harness rejection and scope.
+
+Legacy model names are **canonicalized** before lookup: provider prefixes
 (e.g. `copilot/`) are stripped, and separators (`.`, `_`, `-`) are treated
 as interchangeable. For example, `copilot/claude-sonnet-4.6`,
 `claude_sonnet_4_6`, and `claude-sonnet-4-6` all resolve to the same pricing
-entry.
+entry. Version-date suffixes are also normalized. Shared-catalog entries and
+bundled pricing require an exact canonical model match; AWF does not infer a
+price from a related model-family prefix. `apiProxy.providers` retains its
+explicit longest-prefix override behavior.
+Fetched central tariffs instead match only the exact reviewed provider-qualified,
+raw or lookup identity; they do not infer aliases, date suffixes or families.
 
 If none of these sources resolves the model, the `defaultAiCreditsPricing` fallback
-(if configured) is used. If that is also absent, the request is rejected.
+(if configured) is used. If that is also absent, the request proceeds with a
+warning and unpriced usage is excluded from AI-credit totals.
 Models whose catalog entry carries zero-cost pricing are recognized as known
-models with zero AI credit impact, so they are never rejected as "unknown".
+models with zero AI credit impact and do not produce missing-pricing warnings.
 
-Runtime tiered pricing uses the provider's default-tier prompt threshold. When
-the total input exceeds that threshold, all token categories use the
-long-context tier. Pricing source, API version, observation time, selected
-tier, and any provider-advertised promotion are retained in provenance.
+Tiered pricing uses the default-tier prompt threshold. When the applicable
+prompt-token count exceeds that threshold, all token categories use the
+long-context tier. Runtime Copilot prices, operator overlays, and the shared
+pricing catalog can provide this tier; curated prices may also define it.
+Overlay tier rates use dollars per token, while curated and shared-catalog rates
+use dollars per million tokens. Pricing source, API version, observation time,
+selected tier, and any provider-advertised promotion are retained in provenance.
+The prompt-token count follows runtime Copilot pricing: Anthropic and Copilot
+usage with separately reported cache counts sum input, cache-read, and
+cache-write tokens; usage whose input count already includes cached tokens uses
+the reported input count.
 Promotions are informational only because provider discovery does not prove
 that a discount applies to a specific request; they never reduce accounting.
 Failed or empty discovery responses do not replace the last successful runtime
 snapshot.
+
+### 10.3.1.1 Versioned Shared Pricing Catalog
+
+Compilers that report inference cost SHOULD pass the exact provider/model rates
+they use through `apiProxy.modelPricingCatalog`. AWF consumes the supplied
+catalog locally and does not fetch or refresh it, so the compiler's lock pins
+the same catalog version for both estimate and enforcement. Updating prices
+requires updating the authoritative catalog and recompiling the workflow; an
+existing lock continues using its pinned version. `catalogId` and `version`
+are included in AI-credit usage logs and reflect state to diagnose mismatches.
+
+The contract is provider-scoped and rates are dollars per million tokens:
+
+```yaml
+apiProxy:
+  modelPricingCatalog:
+    schemaVersion: 1
+    unit: USD_PER_1M_TOKENS
+    catalogId: github/gh-aw/model-pricing
+    version: sha256:<immutable-catalog-digest>
+    providers:
+      github-copilot:
+        models:
+          gpt-6.1-sol:
+            input: 10
+            cachedInput: 1
+            cacheWrite: null
+            output: 50
+            reasoning: 50
+            longContext:
+              threshold: 100000
+              input: 20
+              cachedInput: 2
+              cacheWrite: null
+              output: 100
+              reasoning: 100
+```
+
+Each catalog model MUST provide `input`, `output`, `cachedInput`, `cacheWrite`,
+and `reasoning`, all in USD per million tokens. Use `cacheWrite: null` when no
+separate cache-write price applies, and set `reasoning` equal to `output` when
+there is no distinct reasoning rate. A model MAY include a `longContext` object
+with the same five rates and a positive `threshold` in prompt tokens. When the
+prompt-token count is greater than the threshold, every token category uses
+that tier; at or below the threshold, the base rates apply. A malformed tier
+invalidates the catalog entry. Requiring explicit values makes the catalog
+consumer-independent rather than relying on different defaults.
+AI-credit accounting treats `reasoning_tokens` as a subset of
+`output_tokens`: it prices the remaining output tokens at `output` and the
+reasoning tokens at `reasoning`, without double-counting them. If reasoning
+usage is absent, all output tokens use the output rate. Cache and input token
+totals retain the provider-specific usage semantics described above. Catalog
+model matching is exact after canonicalization; provider names support the
+aliases listed for `apiProxy.providers`.
+
+Without a supplied catalog, standalone AWF continues to use its local curated
+and bundled snapshots without network access. Operators may supply the same
+contract directly through the AWF config file for offline runs.
 
 Provider overlays use the models.dev provider structure and per-token dollar
 rates:
@@ -975,50 +1365,65 @@ apiProxy:
             output: "1.5e-05"
             cache_read: "3e-07"
             cache_write: "3.75e-06"
+            long_context:
+              max_prompt_tokens: 100000
+              input: "3e-05"
+              output: "1.5e-04"
+              cache_read: "3e-06"
+              cache_write: "3.75e-05"
 ```
 
 The overlay is passed to both normal and threat-detection API proxy instances
 through `AWF_API_PROXY_PROVIDERS`. Provider aliases `github-copilot` and
-`copilot` resolve to the Copilot proxy.
+`copilot` resolve to the Copilot proxy. A `long_context` cost tier uses the
+same per-token dollar units as the base `cost` object and its
+`max_prompt_tokens` threshold.
 
-### 10.7.2 Default AI Credits Pricing (Fallback)
+### 10.3.2 Default AI Credits Pricing (Fallback)
 
 `defaultAiCreditsPricing` is an optional object with `input` and `output`
 fields (both required, in $/1M tokens), plus optional `cachedInput` and
-`cacheWrite` fields.
+`cacheWrite` fields and an optional `reasoning` rate. `reasoning` defaults to
+`output`; reported reasoning tokens are priced separately using that rate.
 
 It is supplied via the AWF config file and maps to the
 `AWF_DEFAULT_AI_CREDITS_PRICING` environment variable (JSON string) injected
 into the api-proxy container.
 
-When configured, any model not found in the curated built-in pricing table or
-the bundled models.dev catalog uses these rates as a fallback for AI credits
-calculation.
+When configured, any model not found in the operator overlay, shared catalog,
+runtime provider metadata, curated built-in pricing table, or bundled models.dev
+catalog uses these rates as a fallback for AI credits calculation.
 
-### 10.7.3 Unknown Model Rejection
+### 10.3.3 Missing Model Pricing Warnings
 
-When `maxAiCredits` is active and the proxy encounters a request whose model
-cannot be resolved from the curated built-in pricing table or the bundled
-models.dev catalog:
+Missing pricing does not make a model unavailable. When a request's model
+cannot be priced using provider overlays, runtime metadata, or the pricing
+catalogs:
 
 1. **If `defaultAiCreditsPricing` is configured**: the fallback rates are used
    and the request proceeds normally.
 
-2. **If `defaultAiCreditsPricing` is NOT configured**: the proxy MUST reject
-   the request with HTTP `400` and error type `unknown_model_ai_credits`. The
-   error payload includes:
-   - `model`: the unresolved model name
-   - `message`: human-readable instructions to configure
-     `apiProxy.defaultAiCreditsPricing`
+2. **If `defaultAiCreditsPricing` is NOT configured**: the request proceeds and
+   the proxy logs an `unknown_model_ai_credits_pricing` warning once per model.
+   Usage without resolvable pricing is excluded from AI-credit totals, so
+   `maxAiCredits` and the hard cap may undercount actual spending. The proxy
+   does not invent a price or treat missing pricing as model ineligibility,
+   including during automatic fallback selection. Configure accurate
+   `apiProxy.defaultAiCreditsPricing` rates to account for otherwise unpriced
+   usage. Incomplete pricing tiers also warn; responses with complete pricing
+   continue to be accounted for normally.
 
-   This fail-closed behavior prevents unaccounted spending from models whose
-   pricing is unknown to the proxy.
+This behavior applies to HTTP requests and WebSocket upgrades, with or without
+`maxAiCredits`. Existing budget limits still reject requests once the accounted
+spending reaches the limit; other model policy and compatibility checks are
+unchanged.
 
-Note: Requests without a `model` field in the body (e.g. non-chat endpoints)
-are not subject to this check.
+Requests without an identified model skip the request-time pricing check.
+WebSocket upgrades identify the model from the query string; response usage
+accounting also checks pricing for the reported model.
 
-**Recognized dynamic selectors.** The Copilot `auto` model (`copilot:auto`) is
-not subject to `unknown_model_ai_credits` rejection. Because its concrete
+**Recognized dynamic selectors.** The Copilot `auto` model (`copilot:auto`) keeps
+its existing conservative accounting. Because its concrete
 runtime model is not known at request time, the proxy accounts it using a
 conservative fallback ceiling (the maximum per-token rate across the curated
 pricing catalog) rather than rejecting the request or silently under-counting
@@ -1026,23 +1431,20 @@ spend. Token-usage records for these requests set `pricing_source` and
 `accounting_policy` to `dynamic_selector_fallback`, `pricing_tier` to
 `conservative`, `fallback_pricing_used` to `true`, and `dynamic_selector` to
 `copilot:auto`. This dynamic-selector accounting path applies only to the
-recognized Copilot `auto` selector; other unresolved models still follow the
-fallback/rejection behavior above.
+recognized Copilot `auto` selector; other unresolved models follow the
+fallback/warning behavior above.
 
-### 10.7.4 Token Usage JSONL Schema Extensions
+### 10.3.4 Token Usage JSONL Schema Extensions
 
-When AI credits and/or effective tokens are computed, the `token-usage.jsonl`
-records include additional optional fields:
+When AI credits are computed, the `token-usage.jsonl` records include additional
+optional fields:
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `effective_tokens_this_response` | number | Weighted tokens for this request |
-| `effective_tokens_total` | number | Running total of effective tokens |
-| `model_multiplier` | number | Cost multiplier applied for this model |
 | `ai_credits_this_response` | number | AI credits consumed by this request |
 | `ai_credits_total` | number | Running total of AI credits |
 
-These fields are only present when the respective guard is active.
+These fields are only present when AI-credit accounting is active.
 
 ## 11. Max-Runs Enforcement
 
@@ -1074,7 +1476,7 @@ The API proxy MUST enforce the max-runs limit as follows:
      {
        "error": {
          "type": "max_runs_exceeded",
-         "message": "Maximum LLM invocations exceeded (5 / 5).",
+         "message": "Maximum LLM invocations exceeded (5 / 5): the shared per-run max-turns budget, including sub-agents, is exhausted. For gh-aw workflows, increase max-turns in workflow frontmatter and recompile; retrying within this run cannot restore the budget.",
          "invocation_count": 5,
          "max_runs": 5
        }
@@ -1091,7 +1493,7 @@ The API proxy MUST enforce the max-runs limit as follows:
 ### 11.3 Introspection
 
 The `/reflect` endpoint (available on all provider ports 10000–10004; see
-§10.6) MUST include the current max-runs state:
+§10.2) MUST include the current max-runs state:
 
 ```json
 {
@@ -1155,7 +1557,7 @@ The API proxy MUST enforce the permission-denied limit as follows:
 ### 11a.3 Introspection
 
 The `/reflect` endpoint (available on all provider ports 10000–10004; see
-§10.6) MUST include the current permission-denied guard state:
+§10.2) MUST include the current permission-denied guard state:
 
 ```json
 {
@@ -1244,7 +1646,7 @@ The API proxy MUST enforce the cache-miss limit as follows:
 ### 11b.3 Introspection
 
 The `/reflect` endpoint (available on all provider ports 10000–10004; see
-§10.6) MUST include the current cache-miss guard state:
+§10.2) MUST include the current cache-miss guard state:
 
 ```json
 {
@@ -1285,8 +1687,7 @@ forwarding the request to the upstream provider.
 
 ### 12.1 Multiplier Resolution
 
-The proxy resolves the effective multiplier for the requested model using the
-same algorithm as the effective-token guard:
+The proxy resolves the multiplier for the requested model as follows:
 
 1. **Exact match**: if `apiProxy.modelMultipliers` contains the exact model
    name, use its multiplier.
@@ -1302,7 +1703,7 @@ Before forwarding each POST/PUT/PATCH request to an upstream LLM provider,
 the proxy MUST:
 
 1. Extract the `model` field from the request body.
-2. Resolve the model's effective multiplier (§12.1).
+2. Resolve the model's multiplier (§12.1).
 3. If the multiplier exceeds `maxModelMultiplierCap`, reject the request with:
    - **HTTP status**: `400 Bad Request`
    - **Content-Type**: `application/json`
@@ -1423,6 +1824,38 @@ The fallback is **NOT** activated when:
   OpenAI deployment endpoints), where deployment names are provider-local and
   must not be rewritten to catalog model IDs
 
+### 12.3.1 Custom-agent selectors at the firewall boundary
+
+Copilot custom agents declare `model` in `.agent.md` frontmatter, not in
+`plugin.json`. This applies to both Agent Plugins 1.0
+(`com.github.copilot/agents/`) and legacy Copilot plugins (`agents/`).
+The loader/surface owns parsing the scalar or prioritized list and must choose
+the first available entry in list order for the active surface/account.
+AWF does not load plugin files or select from frontmatter arrays; an array sent
+as an inference request's `model` is rejected with `unsupported_model_selector`.
+
+The API proxy resolves a selected scalar against the active provider's discovered
+IDs and advertised display names before model policy, pricing, upstream inference,
+and retry/fallback handling. For example, when Copilot advertises
+`name: "GPT-5.6 Terra"` for `id: "gpt-5.6-terra"`, both `GPT-5.6 Terra` and
+`GPT-5.6 Terra (copilot)` resolve to `gpt-5.6-terra`. Canonical IDs continue to
+work. The vendor qualifier must match the active proxy provider; it does not
+switch backends or become part of the upstream model ID.
+
+Unqualified display names must be unique within that provider's available
+catalog. Ambiguous or unknown display/qualified selectors fail with an actionable
+`unsupported_model_selector` error, including when discovery is unavailable;
+they never trigger an unrelated middle-power fallback. Explicit `apiProxy.models`
+aliases take precedence over advertised display names, but canonical catalog IDs
+remain authoritative. No spaces-to-hyphens rewriting is performed, and catalog
+deployment IDs (including IDs with spaces or parentheses) take precedence over
+selector syntax. Unknown ordinary API IDs retain existing provider behavior.
+
+The `model_selector_resolution` log/diagnostic event separates
+`requested_selector`, `selected_provider`, and `resolved_model`. End-to-end list
+availability and cross-provider selection require support in the consuming
+Copilot/GH-AW surface; they are not implemented by the firewall.
+
 ### 12.4 Extended Alias Syntax
 
 Model aliases now support an extended syntax that permits per-alias fallback
@@ -1509,6 +1942,122 @@ This enables workflow authors to get clear, early feedback when a retired or
 misspelled model is specified, rather than waiting for the first API request to
 fail with an opaque error.
 
+This non-blocking proxy check is separate from gh-aw's **pre-engine-startup**
+resolution of Claude/Codex inline sub-agent models. The gh-aw harness resolves
+declared aliases in the engine's provisioned provider scope, checks the configured
+AWF `/reflect` catalogue and endpoint support, and records `model.resolution`
+events. An unresolvable workflow-declared sub-agent model stops engine startup;
+AWF's non-blocking `requestedModel` check does not override that decision.
+See [sub-agent model resolution](api-proxy-sidecar.md#gh-aw-inline-sub-agent-model-resolution).
+
+### 12.7 Ordered Fallback Models
+
+When `apiProxy.fallbackModels` is configured, the API proxy retries a failed
+request with the next model in an ordered list. The middle-power fallback above
+picks a model when the request is *resolved*. This chain applies after the
+upstream has *rejected* the model.
+
+```json
+{
+  "apiProxy": {
+    "fallbackModels": ["gpt-5.4", "claude-sonnet-4.6"]
+  }
+}
+```
+
+**Mapping:** `apiProxy.fallbackModels` → `AWF_FALLBACK_MODELS` (JSON array; a
+comma-separated list is also accepted when the variable is set directly)
+
+**Behavior:**
+
+1. Fallback triggers only on model-specific failures:
+   - any upstream `5xx` response (`504` is reported as `upstream_timeout`)
+   - a connection error or timeout before any upstream response
+     (`upstream_connection_error`)
+   - a `400`/`404` whose body says the model is unsupported, not found, or not
+     accessible, such as `model_not_supported`, `model_not_found`, or
+     `not accessible via the … endpoint` (`model_not_supported`)
+2. `401`, `403`, and `429` responses never trigger a fallback. A generic `400`
+   validation error, such as a bad tool schema or a too-long context, is
+   returned to the client unchanged.
+3. The proxy rewrites the request body's `model` field (OpenAI, Anthropic,
+   Copilot). For Gemini, where the body has no `model`, it rewrites the
+   `/models/<model>:<method>` path segment instead. The proxy strips a
+   redundant `<provider>/` prefix on fallback entries.
+4. Entries are tried in order. The proxy skips models already attempted for the
+   request and models rejected by the model-policy, retired-model,
+   multiplier-cap, or budget guards. When the chain is exhausted, the proxy
+   returns the last upstream error to the client.
+5. Each switch emits a `model_fallback` warning log with `from_model`,
+   `to_model`, `from_provider`, `to_provider`, `requested_model`,
+   `requested_provider`, `attempt`, `reason`, and `status`. The token-usage
+   record for the successful response holds the model and provider that served
+   the request in `model` and `provider`, plus a `model_fallback` object with
+   `requested_model`, `requested_provider`, `model`, `provider`, `attempt`,
+   `reason`, `status`, `from_model`, `from_provider`, and `failures` (every
+   failed attempt in order). gh-aw can report that model in `GH_AW_INFO_MODEL`
+   and telemetry.
+6. Copilot's existing transient `model not supported` retries and the alias
+   endpoint-blocked candidate retry still run first. The ordered chain applies
+   only after those have been exhausted.
+7. WebSocket (Responses API) upgrades and AWF-internal routing classifier
+   requests are not covered.
+
+#### 12.7.1 Cross-Provider Fallback Chains
+
+An entry qualified with a different provider than the one whose listener
+received the request (`openai/…`, `anthropic/…`, `copilot/…`; `github/…` and
+`github-copilot/…` are aliases for `copilot`) switches the upstream provider as
+well as the model, without restarting the agent:
+
+```json
+{
+  "apiProxy": {
+    "fallbackModels": ["openai/gpt-5.4", "anthropic/claude-sonnet-4.6"]
+  }
+}
+```
+
+1. The attempt uses the target provider's configured endpoint (including a
+   custom target/base path), credentials, request signer, and body transforms.
+   Client headers that identify the originating provider (`copilot-*`,
+   `openai-*`, `x-github-*`, `editor-*`, `x-initiator`, …) are not forwarded.
+2. The proxy translates the protocol where needed and translates the response
+   back, so the agent keeps the protocol and live session it started with:
+
+   | Agent protocol | `openai` | `copilot` | `anthropic` |
+   |---|---|---|---|
+   | Chat Completions | native | native | translated to Messages |
+   | Responses | native | native | translated to Messages (via Chat) |
+   | Anthropic Messages | — | native (`/v1/messages`) | native |
+
+   Translation covers system prompts, text and image content, tool definitions,
+   tool choice, assistant tool calls, tool results, stop sequences, usage, and
+   streaming (SSE) responses including tool-call deltas. A request that uses a
+   feature with no faithful equivalent (for example `n > 1`, `logprobs`, or a
+   JSON-schema `response_format` sent to Anthropic) is not translated: that
+   candidate is skipped with a `model_fallback_skipped` log.
+3. Guards run against the *target* provider: model policy (`openai/*` style
+   patterns), retired models, multiplier caps, and budgets. A candidate that a
+   guard rejects is skipped; switching providers never bypasses a veto.
+4. Only configured entries are used, in order. When a target body transform
+   (such as alias resolution or the middle-power fallback) would substitute a
+   different model, the configured model is kept and a
+   `model_fallback_substitution_blocked` warning is logged.
+5. Failure eligibility is unchanged: only failures that occur before any
+   response byte has been sent to the agent advance the chain, so no partial
+   response is replayed and no tool call is duplicated.
+6. A qualified entry for an unconfigured provider is a configuration error:
+   the API proxy refuses to start and logs `fallback_models_invalid` with the
+   credential to configure. Entries for providers that cannot serve the
+   request's protocol (for example `gemini/…` from a Chat Completions request)
+   are skipped at request time with a `model_fallback_skipped` log.
+7. Unqualified entries, and entries qualified with the receiving provider, keep
+   the existing same-provider behavior, including after a cross-provider
+   attempt. To send a model ID that itself contains a provider-like prefix (for
+   example an OpenRouter ID on an OpenAI-compatible endpoint), qualify it with
+   the serving provider: `openai/anthropic/claude-sonnet-4`.
+
 ### 12.1 Alias Candidates Are Restricted to Configured Providers
 
 Alias resolution MUST only consider provider slots that are actually configured
@@ -1534,10 +2083,252 @@ it is returned with HTTP `403` and `"retryable": false` so clients fail fast.
 Only transient OIDC readiness states, such as a token that has not been minted
 yet, use HTTP `503` and `"retryable": true`.
 
+## 13a. Task-Level Model Routing
+
+Task-level model routing is **experimental and opt-in**. To enable it, set
+root-level `experimental.modelRouting: true` alongside the compiler-authored
+`apiProxy.routing` request. An existing config containing `apiProxy.routing`
+without this gate must add the `experimental` block shown below; otherwise
+validation fails rather than silently ignoring the request. The gate alone,
+without `apiProxy.routing`, is valid but does not activate routing. Omitting
+the gate (or setting it to `false`) without a routing request preserves normal
+operation without routing infrastructure or environment.
+
+As of this release, both the proxy-side and host-side halves of task-level
+routing are wired and shipped on `main`. The API proxy's routing controller
+is wired into the running server
+([PR #8966](https://github.com/github/gh-aw-firewall/pull/8966)): when
+`AWF_ROUTING_CONFIG` is present, a routing session starts after key
+validation and model discovery and selects one model/effort for the run.
+The host workflow stages and validates `apiProxy.routing` input before
+the proxy starts ([PR #8985](https://github.com/github/gh-aw-firewall/pull/8985)):
+it writes the task conversation into a private per-run routing directory,
+rejects unsupported configurations (non-Linux, non-runc, disabled API proxy,
+`--keep-containers`, DinD/split filesystems, Docker-socket exposure, or an
+unpinned router image),
+and waits for `selection.json` before starting the agent.
+
+The selection is **advisory**, not admitted-only. The agent is seeded with the
+selected model, effort, and endpoint, but the proxy does not pin requests to
+it: an agent (or a sub-agent that declares its own `model:`) MAY send any model
+that model policy permits, and such a request completes normally. Model choice
+is not a containment boundary — `allowedModels` / `disallowedModels`
+(`AWF_ALLOWED_MODELS` / `AWF_DISALLOWED_MODELS`) remain the enforcement
+surface that bounds cost and policy, independently of routing, and a request
+for an excluded model is still rejected by that policy guard. WebSocket
+upgrades are proxied normally while a routing session exists. For each
+inference request the proxy logs a `model_routing` event with
+`stage: "request"`, recording the requested and selected provider, model,
+effort, and endpoint, `routed: "as_selected"` or `"deviated"`, and the list of
+`deviations`, so routing quality stays measurable without enforcement.
+
+For gh-aw workflows, `models.allowed` and `models.blocked` define the request
+policy enforced by AWF (`apiProxy.allowedModels` and
+`apiProxy.disallowedModels`). On AWF v0.28.33 or later,
+`engine.model-routing.allowed-models` is only a router-candidate list: it
+narrows router choices without restricting agent requests. Older AWF releases
+require this field and also use it as the admitted-model allowlist. When the
+field is omitted on a supported release, the router uses the policy-filtered
+catalogue; gh-aw additionally limits Claude and Codex candidates to their
+engine model families. Routed Claude and Codex workflows must set
+`engine.model-provider: github`. See the
+[gh-aw model-routing reference](https://github.github.com/gh-aw/reference/model-routing/)
+for the workflow-side configuration.
+
+A genuine routing failure still surfaces as host exit code `78` instead of the
+run silently continuing: no selection could be produced (`no_route`, router
+unreachable, contract or configuration errors), or an upstream failure on a
+request that used the selected provider and model (a native provider error
+code, an SSE error event, or a prematurely closed response). A request that
+uses another model is not a routing failure, and neither is its upstream
+error or a model-policy rejection of it.
+
+The agent learns the selected model, effort, and endpoint from the API proxy's
+`GET /reflect` `routing` field (see
+[api-proxy-sidecar.md](api-proxy-sidecar.md)); the private `selection.json`
+is not visible to the agent.
+
+```yaml
+experimental:
+  modelRouting: true
+apiProxy:
+  routing:
+    provider: copilot
+    objective:
+      goal: cost
+      mode: balanced
+    task:
+      conversationFile: /tmp/gh-aw/routing-conversation.json
+```
+
+| Field | Allowed values | Description |
+|-------|----------------|-------------|
+| `provider` | `copilot` (default), `openai`, `anthropic` | Restricts routing to one configured native API-proxy provider; AWF does not switch credentials or translate across providers. |
+| `candidateModels` | non-empty array of model glob patterns | Limits router/classifier choices without widening the request policy; defaults to `apiProxy.allowedModels`. |
+| `objective.goal` | `cost`, `cost-speed` | Optimization goal used by the router |
+| `objective.mode` | `economy`, `balanced`, `robust`, `auto` | Fixed routing profile, or `auto` classification |
+| `task.conversationFile` | non-empty string | Host path to the task conversation whose description the router classifies |
+
+The task conversation must be written by the workflow host before AWF starts.
+Callers are responsible for preparing task-relevant conversation content before
+AWF starts. AWF classifies the supplied conversation as-is; it does not parse
+workflow prompt markup or remove injected system instructions. If a rendered
+prompt contains a system block, the caller should provide the task conversation
+without that unrelated block.
+The conversation is a JSON array in the router's
+conversation format, for example
+`[{"role":"user","parts":[{"text":"Fix the failing unit test."}]}]`, with at
+least one non-blank `user` message and at most 1 MiB. Its user messages form the
+task **description**, which the router classifies once per run. The resulting
+**classification** (task type, scope, complexity, and, for `mode: auto`, the
+routing profile) selects the one model and effort the agent is seeded with for
+the whole run. The router is not invoked again per request or per sub-agent.
+
+The routing object is closed: `objective` and `task` are required, `provider`
+and `candidateModels` are optional, and unknown properties are rejected.
+Omitting `provider` preserves Copilot routing. OpenAI and Anthropic routing
+require the matching provider to be configured for the agent and currently
+require the native `api.openai.com` or `api.anthropic.com` target; AWF does not
+route custom gateways or translate or forward requests across provider
+boundaries. A supported routed run also requires a complete
+`container.images` manifest containing digest-pinned references for `router`
+and every other enabled image role. Without a manifest, the router image
+resolves like the other AWF images, from `--image-registry` and `--image-tag`
+(`ghcr.io/github/gh-aw-firewall/router:<tag>` by default), and routing still
+fails unless that reference is pinned by digest. With `--build-local`, AWF
+builds the router from `containers/router` in the same checkout instead, and
+no digest pin is required.
+
+The candidate pool uses models discovered for the selected native provider.
+The `/reflect` `model_api_mapping` includes maintained routing metadata for
+selected model families where provider `/models` endpoints do not publish
+context limits or reasoning-effort support. The initial maintained set covers
+OpenAI `gpt-5.4` and `gpt-5.4-2026-03-05`, plus Anthropic
+`claude-opus-5-5`, `claude-opus-5`, `claude-fable-5-1`, `claude-fable-5`,
+`claude-mythos-5-1`, `claude-mythos-5`, `claude-mythos-preview*`,
+`claude-sonnet-5-5`, `claude-sonnet-5`, `claude-opus-4-6`/`4-7`/`4-8`, and
+`claude-sonnet-4-6`. This is deliberately not exhaustive: discovered IDs are
+eligible only when endpoint and effort support are known from runtime metadata
+or an exact maintained mapping. For example, `o3`, `gpt-5-nano`, and
+`gpt-5.4-mini` do not inherit metadata from the GPT-5.4 base model and can yield
+`no_route`. Positive context limits are also maintained in `/reflect`; without
+one, a model is excluded from classifier preflight but may still remain
+available to the router.
+
+An explicitly empty effort list (or explicit lack of reasoning-effort support)
+allows one effortless choice. OpenAI uses its mapped Responses or Chat
+Completions protocol; Anthropic uses Messages. Unsupported effort values are
+discarded, and a model with no remaining advertised effort is excluded rather
+than converted into an effortless choice.
+
+Request guards and alias resolution use the provider-aware
+`allowedModels` / `disallowedModels` policy. Candidate filtering additionally
+uses `apiProxy.routing.candidateModels` when supplied; those patterns only
+narrow the router/classifier pool and never widen the request policy. When
+omitted, candidates continue to be derived from `allowedModels`. Native patterns
+such as `gpt-*` match the native model name; qualified patterns such as
+`github-copilot/gpt-*` match that provider only. Copilot recognizes the existing
+`copilot`, `github-copilot`, and `github` provider aliases. Matching remains
+case-insensitive with `*` wildcards, and deny rules take precedence. A
+provider-prefixed `auto` remains subject to dynamic-model verification: under
+a denylist it must also match an explicit allow rule.
+
+### 13a.1 Model-routing audit records
+
+When task-level routing is active, the proxy MUST attempt to persist `model-routing.jsonl`
+in `apiProxy.logging.tokenLogDir` (`AWF_TOKEN_LOG_DIR`, default
+`/var/log/api-proxy`) independently of diagnostic logging. Records MUST include
+`_schema: "model-routing/v<AWF_VERSION>"`, `timestamp` as specified in §13.4,
+`event: "model_routing"`, and `stage` equal to `classification`, `selection`,
+`failure`, or `request`.
+
+Every selection record MUST include:
+
+- `selected_model` as the canonical provider-qualified ID, `selected_effort`
+  (or `null`), and `selected_provider`;
+- `wire_model` and `endpoint` matching the selected route advertised in
+  `/reflect`;
+- `labels` and `mode` from validated classification, or `null` when
+  classification did not succeed;
+- `classifier_model` and `classifier_effort` identifying the successful
+  classifier, or `null` when no classifier succeeded;
+- `router` containing `name` and `version`;
+- `ranked_choices` in router preference order, each with `model` and `effort`;
+- the routing `objective` and configured `provider`;
+- `conversation_sha256`, the SHA-256 digest of the UTF-8 `JSON.stringify`
+  serialization of the validated staged conversation;
+- `interaction_id` from the existing Copilot interaction-ID builder; and
+- `github_repository` and `github_workflow_ref` when available.
+
+Every request record MUST retain the advisory comparison (`routed`,
+`deviations`, `unavailable`, `selected_model`, `selected_effort`, `selected_provider`,
+`selected_endpoint`, `requested_model`, and `requested_effort`, with `provider`
+and `pathname` identifying the requested provider and endpoint) and
+include `request_id`, terminal `outcome` (`completed`, `rejected`, `failed`,
+`aborted`, or `client_closed`), and `status` (final HTTP status). Request-side model fields
+use the wire representation used for comparison, unlike canonical selection
+model fields. A resolved custom-agent selector uses its canonical wire ID for
+comparison; the original selector is retained in `model_selector_resolution`
+diagnostics. Before the request body is observed, body-dependent comparisons
+MUST be listed in `unavailable` and omitted from `deviations`; known provider
+and endpoint differences remain reportable. Endpoint differences are
+informational and MUST NOT by themselves make `routed` `deviated`. A known
+provider difference makes `routed` `deviated`, even when body-dependent
+comparisons remain unavailable. Otherwise, `routed` is `unobserved` when
+body-dependent comparisons remain unavailable.
+A model-policy rejection MUST NOT be reported as successful
+completion. Stream errors and premature closure MUST NOT be treated as
+completion merely because HTTP headers indicated success. A 2xx streamed
+response whose client closed the connection before AWF finished writing is
+recorded as `client_closed`, not `aborted`, only after the upstream sent its
+protocol terminal success event (`response.completed`, `message_stop`, or
+the Chat Completions `[DONE]` sentinel) and no stream error; it MUST NOT be
+reported as a provider failure. Any other premature closure on the selected
+model remains `aborted` and fails the routed run with `provider_unavailable`. When token usage is
+available, `request_id` MUST correlate with the corresponding
+`token-usage.jsonl` record; not every rejected or aborted call produces usage.
+A `failed` request record MUST include `error_code` and `error_type` when an
+identifier-shaped value matching `^[A-Za-z0-9_.:-]{1,64}$` is available, and
+`error_source` whenever either is present: `upstream` when taken from the
+provider's JSON error body (decoded when it is `gzip`, `deflate`, or `br`
+encoded) or first SSE error event, or `awf` whenever AWF produced the error
+body in the response, including when AWF replaced a provider's rejection with
+its own envelope. These fields MUST NOT contain the provider's error `message`
+and MUST be omitted, not `null`, when no valid value exists.
+
+A request record MUST carry the same `purpose`, `agent_name`, and
+`caller_source` as the `token-usage.jsonl` record with the same `request_id`.
+A trusted AWF purpose (router classifier calls) MUST be recorded as
+`purpose: "routing_classification"` with `caller_source: "awf"` and no
+`agent_name`, regardless of any caller header. Otherwise, a valid optional
+`x-awf-caller` request header MUST be recorded as `purpose: "agent"` for
+`main`, or `purpose: "subagent"` with `agent_name: "<agentName>"` for
+`subagent/<agentName>`, each with `caller_source: "caller_header"`. A value is
+valid only when it is at most 128 characters and fully matches
+`^(?:main|subagent/[A-Za-z0-9_.:/-]+)$`; any other value MUST be treated as
+absent and MUST NOT be logged. With no valid header and no AWF purpose, all
+three fields MUST be omitted. The header MUST always be stripped before
+forwarding upstream. It is an unauthenticated declaration from inside the
+sandbox: consumers MUST take credits, token counts, and served models from
+AWF's own record and use the caller fields only to attribute that record, and
+the header MUST NOT change routing, model policy, steering, guards, budget
+accounting, or cost.
+
+These records MUST NOT contain raw conversation or prompt text, raw classifier
+output, or request/response bodies. Optional conversation capture is not
+implemented and remains outside the routing audit contract. AWF MUST attempt to preserve
+the audit file alongside the other API-proxy logs described in §13.4.
+Audit writes are synchronous and best-effort; disk success is not guaranteed,
+and logging errors MUST NOT change routing or inference behavior. The writer
+MUST use owner-only file permissions (`0600`)
+and MUST NOT follow symbolic links. No explicit flush is required.
+
 ## 13. Model Alias Logging
 
 The API proxy emits structured logging events during model alias resolution.
 These events are critical for debugging model routing decisions in production.
+The proxy's `model_resolution` event is distinct from the gh-aw harness's
+`model.resolution` startup event described in §12.6.
 
 ### 13.1 Always-On Events (stdout)
 
@@ -1599,7 +2390,7 @@ apiProxy:
 | Property | Type | Default | Env var | Description |
 |----------|------|---------|---------|-------------|
 | `apiProxy.logging.debugTokens` | boolean | `false` | `AWF_DEBUG_TOKENS` | Enable diagnostic token/model-alias logging to file |
-| `apiProxy.logging.tokenLogDir` | string | `/var/log/api-proxy` | `AWF_TOKEN_LOG_DIR` | Directory for `token-usage.jsonl` and `token-diag.jsonl` |
+| `apiProxy.logging.tokenLogDir` | string | `/var/log/api-proxy` | `AWF_TOKEN_LOG_DIR` | Directory for `token-usage.jsonl`, `model-routing.jsonl`, and `token-diag.jsonl` |
 | `apiProxy.diagnostics.captureBlockedRequests` | string \| boolean | `false` | `AWF_CAPTURE_BLOCKED_LLM_REQUESTS` | Capture body-shape info for guard-blocked requests (`false`/`true`/`summary`/`redacted`/`full`; `true` is an alias for `summary`) |
 | `apiProxy.diagnostics.maxCapturedBytes` | integer | `250000` | `AWF_MAX_BLOCKED_CAPTURE_BYTES` | Max bytes per record in `full` capture mode |
 
@@ -1628,11 +2419,19 @@ Directory: configured by `logging.proxyLogsDir` (default: `<workDir>/squid-logs/
 
 Directory: configured by `apiProxy.logging.tokenLogDir` / `AWF_TOKEN_LOG_DIR`
 (default: `/var/log/api-proxy/`; must be `/var/log/api-proxy` or a subdirectory to be preserved by AWF's default bind mount)
+
+On the runner, these files are preserved under `<logging.proxyLogsDir>/api-proxy-logs/`
+(or `/tmp/api-proxy-logs-<ts>/` when `proxyLogsDir` is not set). After cleanup AWF logs
+`Token usage log available at: <path>` and, when `$GITHUB_ENV` is set, exports
+`AWF_TOKEN_USAGE_LOG=<path>` so later workflow steps can locate `token-usage.jsonl`
+without hardcoding a path (see [ARC + DinD](arc-dind.md#locating-api-proxy-token-usage-logs)).
+
 | File | Format | Description | Always written |
 |------|--------|-------------|----------------|
 | `token-usage.jsonl` | JSONL (`token-usage/v<version>` schema) | Per-API-call token usage and cost records | Yes (when API proxy is active) |
+| `model-routing.jsonl` | JSONL (`model-routing/v<AWF_VERSION>` schema) | Routing classification, selection, failure, and terminal request audit records; metadata only | Yes (when task-level routing is active) |
 | `token-diag.jsonl` | JSONL (`token-diag/v<version>` schema) | Diagnostic events: model resolution steps, alias rewrites, token budget decisions | Only when `apiProxy.logging.debugTokens: true` |
-| `blocked-request-diag.jsonl` | JSONL (`blocked-request-diag/v<version>` schema) | Body-shape diagnostics for guard-blocked requests (effective tokens, AI credits, etc.) | Only when `apiProxy.diagnostics.captureBlockedRequests` is set |
+| `blocked-request-diag.jsonl` | JSONL (`blocked-request-diag/v<version>` schema) | Body-shape diagnostics for guard-blocked requests (AI credits, run limits, etc.) | Only when `apiProxy.diagnostics.captureBlockedRequests` is set |
 | `otel.jsonl` | JSONL (OpenTelemetry spans) | Distributed tracing spans; written as local fallback when no OTLP collector is configured | Only when OTEL is active and no collector endpoint set |
 
 #### CLI Proxy Logs
@@ -1642,6 +2441,28 @@ Directory: `/var/log/cli-proxy/` (or `AWF_CLI_PROXY_LOG_DIR`)
 | File | Format | Description | Always written |
 |------|--------|-------------|----------------|
 | `access.jsonl` | JSONL | CLI proxy request audit records (gh CLI invocations routed through DIFC proxy) | Yes (when CLI proxy is active) |
+
+#### Router Logs
+
+Directory: `<logging.proxyLogsDir>/router-logs/` (or `/tmp/router-logs-<ts>/` when `proxyLogsDir` is not set)
+
+The model router logs only to stderr. At the end of a routed run, AWF stops the router before
+`docker compose down`, so that the router writes its shutdown records, and then copies the
+container's complete log stream into this directory. No container mounts it. The directory
+(`0700`) and the file (`0600`) belong to the user who ran AWF (`SUDO_UID` when AWF runs under
+`sudo`), because a custom router image could log more than the bundled one does. For the same
+reason, `--diagnostic-logs` collection, whose copies become world-readable, leaves the router
+out, and a path whose components include a symlink is refused. Cleanup makes the audit,
+session-state and `<workDir>/diagnostics` directories readable by everyone, so if either the
+capture or preservation destination would be inside any of those trees (including their
+preserved locations), or contain one, AWF doesn't save the router's logs and warns. Protected
+paths containing a `..` component are also refused rather than normalized past a symlink. If the
+router can't be stopped or read within 5 s, AWF logs a warning, keeps whatever it saved and
+continues teardown. AWF writes at most 16 MiB and then stops reading.
+
+| File | Format | Description | Always written |
+|------|--------|-------------|----------------|
+| `router.jsonl` | JSONL (the router's own records: `time`, `level`, `msg`, with no `_schema`) | Startup, routing table load, telemetry setup, one `request` record per router call with its `trace_id`, and shutdown. Never request bodies, headers or model ids; see the [router README](../containers/router/README.md#serving) | Yes (when model routing is active) |
 
 #### API Proxy stdout (Docker logs)
 
@@ -1659,8 +2480,8 @@ initial release.
 
 ### 13.6 Blocked Request Diagnostics (blocked-request-diag.jsonl)
 
-When a guard hard-rails a request (e.g. `effective_tokens_limit_exceeded`,
-`ai_credits_limit_exceeded`, `max_runs_exceeded`), the api-proxy can write a
+When a guard hard-rails a request (e.g. `ai_credits_limit_exceeded`,
+`max_runs_exceeded`), the api-proxy can write a
 structured diagnostic record to `blocked-request-diag.jsonl`.  This is
 **opt-in and disabled by default**.
 
@@ -1711,10 +2532,10 @@ Each record follows the `blocked-request-diag/v<version>` schema:
   "request_id": "bc446626-a67b-4a78-a8c3-7293a2bc7306",
   "provider": "anthropic",
   "path": "/v1/messages",
-  "guard_type": "effective_tokens_limit_exceeded",
+  "guard_type": "ai_credits_limit_exceeded",
   "guard_totals": {
-    "total_effective_tokens": 27198679,
-    "max_effective_tokens": 25000000
+    "total_ai_credits": 250,
+    "max_ai_credits": 250
   },
   "body_transformed": true,
   "inbound_bytes": 184320,
@@ -1745,11 +2566,22 @@ Each record follows the `blocked-request-diag/v<version>` schema:
 
 ## 14. Unified Enclaves
 
-The optional top-level `enclaves` array defines AWF's sole supported private-repository execution surface. It is structurally identical to the gh-aw compiler's enclave frontmatter: every entry declares exactly one `script` or `agent` executor, its own `repos` list, and entry-level shared controls including `timeout`, `runtime`, `image`, resource limits, and disclosure limits. AWF stages immutable repository seeds on the host, starts one AWF-owned `enclave-mcp-server`, maintains one shared per-repository ledger for the run, and exposes configured executors only through compiler-launched `gh-aw-mcpg`.
+The optional top-level `enclaves` array defines AWF's sole supported private-repository execution surface. It is structurally identical to the gh-aw compiler's enclave frontmatter: every entry declares exactly one `script` or `agent` executor, its own non-empty `repos` list, and entry-level shared controls including `timeout`, `runtime`, `image`, resource limits, and disclosure limits. AWF stages immutable repository seeds on the host, starts one AWF-owned `enclave-mcp-server`, maintains one shared per-repository ledger for the run, and exposes configured executors only through compiler-launched `gh-aw-mcpg`.
+
+Dynamic repository-policy entries (`dynamic` in place of `repos` on an `agent`
+entry, per `docs/adr/0001-agent-enclaves.md`) select one canonical repository at
+runtime, receive one short-lived `github-repository-read-v1` identity, and read
+that repository through GitHub MCP without cloning or mounting a seed. They run
+only when the gh-aw compiler has started mcpg's
+`github-repository-delegation-v1` controller and handed AWF its private control
+endpoint and capability; otherwise AWF rejects the run. See §14.1a for the
+envelope, the handoff, and the identity lifecycle.
 
 ### 14.1 Executors and shared configuration
 
 ```yaml
+container:
+  containerRuntime: gvisor
 enclaves:
   - script: {}
     repos:
@@ -1760,9 +2592,14 @@ enclaves:
       model: gpt-5
       maxModelRequests: 3
       maxModelTokens: 10000
-      github:
-        cli: issues-read-v1
-    runtime: gvisor
+      tools:
+        github:
+          allowed:
+            - list_issues
+            - issue_read
+          allowedRepos:
+            - octo-org/private-service
+          minIntegrity: none
     memoryLimit: 256m
     maxOutputBytes: 2048
     maxInvocations: 3
@@ -1773,16 +2610,224 @@ enclaves:
 ```
 
 - **Script executor** — an entry keyed by `script`; launches a no-network, read-only, single-use Python sandbox. An empty `script: {}` object is valid and selects AWF's pinned defaults.
-- **Agent executor** — an entry keyed by `agent`; launches a bounded single-use Copilot enclave. `agent.model` is REQUIRED. Optional `agent.github.cli: issues-read-v1` adds the PAT-free AWF CLI proxy as the only additional peer.
+- **Agent executor** — an entry keyed by `agent`; launches a bounded single-use Copilot enclave. `agent.model` is REQUIRED. Optional `agent.tools.github` (or the deprecated legacy `agent.github.cli: issues-read-v1` marker; the two are mutually exclusive) adds compiler-owned shared mcpg as the only additional peer.
 - **Entry-level controls** — `runtime`, `image`, `memoryLimit`, `cpuLimit`, `pidsLimit`, `tmpfsLimit`, `maxOutputBytes`, and `maxInvocations` apply to the entry's selected executor. `script.maxScriptBytes` and agent `maxTaskBytes`, `maxModelRequests`, and `maxModelTokens` remain executor-specific. Network and interpreter are AWF-owned invariants, not input fields.
 
 At most one entry MAY exist per executor kind, and each entry MUST declare exactly one executor key. Every entry's `repos` list is merged into one trusted repository catalog: a repository shared by both entries MUST declare the same `sensitivity`, because sensitivity fixes one shared per-run information budget that both executors debit.
 
-`timeout` is a per-invocation wall-clock bound in seconds. It defaults to `30` for `script` entries and `120` for `agent` entries, and values above `4740` are rejected. Responses use fixed timing buckets at 100 ms, 1 second, 10 seconds, 60 seconds, 120 seconds, 180 seconds, 240 seconds, 300 seconds, 600 seconds, 1200 seconds, 2400 seconds, and 4800 seconds, followed by a cryptographically random, secret-independent delay from 0 through 1000 ms. The canonical enclave MCP tools use a fixed `toolTimeout` of `4860` seconds, covering the maximum bucket, response jitter, and a bounded transport allowance.
+`timeout` is the guest execution wall-clock bound in seconds. It defaults to `30` for `script` entries and `120` for `agent` entries, and values above `4740` are rejected. It does not bound end-to-end response time: admission, startup, cancellation/settlement, cleanup, selection of a disclosure bucket, and padding/jitter happen outside guest execution. Responses use fixed timing buckets at 100 ms, 1 second, 10 seconds, 60 seconds, 120 seconds, 180 seconds, 240 seconds, 300 seconds, 600 seconds, 1200 seconds, 2400 seconds, and 4800 seconds, followed by a cryptographically random, secret-independent delay from 0 through 1000 ms. The canonical enclave MCP tools advertise `toolTimeout: 4860` seconds, covering the maximum bucket, jitter, and a bounded transport allowance. This is distinct from the MCP connection timeout and readiness/startup timeouts. The smoke lock pins `github/gh-aw-actions/setup@26e5d7e7d2345ae4c8dfa3d9017ca2ff9bbf2c82`; its `setup/js/mcp_cli_bridge.cjs` owns the client HTTP JSON-RPC call and sets `TOOL_CALL_TIMEOUT_MS` to 120,000 ms. `getToolCallTimeoutMs` applies that fixed deadline to every non-`logs` tool, including `enclave_run_agent`, and `httpPostJSON` destroys the HTTP request at expiry. The checked-in workflow does not override this bridge constant. Thus the effective caller deadline is shorter than the configured gateway `toolTimeout`, and the caller can time out before finite disclosure releases the canonical response. The bridge's timeout is distinct from its 15-second default HTTP timeout for short gateway operations, the 120-second `connectTimeout`, and readiness/startup timeouts. Do not shorten or bypass finite disclosure to fit the caller deadline.
+
+`maxModelRequests` and `maxModelTokens` are enforced by the dedicated enclave API proxy for each admitted agent invocation. AWF signs an invocation-scoped capability containing the invocation identity and configured limits; the guest receives only that capability, and the proxy rejects an invalid capability or an exhausted budget. A budgeted enclave also requires a proxy health response that advertises model-budget enforcement, so an older proxy image fails startup rather than silently running without enforcement.
+
+- **Request count** — each agent `POST` inference attempt admitted at the proxy boundary consumes one request before upstream signing/dispatch, including provider errors and every retry/fallback attempt. Model-discovery `GET`s are excluded. Requests rejected before admission do not count. An upstream failure with unknown token usage exhausts a configured token budget, so retries cannot reset or bypass it.
+- **Token count** — only the supported chat-completions and responses endpoints are accepted when a token ceiling is configured. Before dispatch, the proxy uses the UTF-8 request-body byte count as a conservative input reservation and clamps the provider's output-token limit (`max_tokens`/`max_completion_tokens` or `max_output_tokens`) to the remaining allowance. It permits only one token-limited inference in flight per invocation. On completion, the proxy accounts normalized input, output, cache-read, and cache-write usage using the existing provider-specific usage normalizer; absent optional cache counters normalize to zero when that provider's usage shape omits them. Cache-read is not added a second time when the provider's input count already includes it, and reasoning tokens are not added separately from output. Exact-limit usage is accepted and exhausts later requests. Missing input/output usage, partial or unsupported accounting shapes, and failed responses exhaust the token budget rather than counting as zero. These usage counts are enforcement counters, not billing units. Because providers report usage after inference, a provider that ignores its output cap or reports usage beyond the reservation can overshoot on that one response; AWF records the invocation as exhausted and rejects subsequent inference.
+- **Streaming, retries, and cancellation** — streaming chat requests ask for final usage, and the invocation reservation remains held until the response is accounted or the stream/caller is cancelled. A cancellation or transport failure with no trusted usage settles the token reservation as exhausted; dispatched attempts remain counted. WebSocket inference is rejected while model budgets are enabled because it does not use this accounting path.
+
+These guarantees require the AWF-owned enclave server and dedicated API proxy implementations that support the capability/health contract. Older independently pinned AWF/proxy images may retain advisory settings; do not infer enforcement from positive-value validation or successful usage logging alone.
 
 `gvisor` requires an exactly registered `runsc` runtime and never falls back. `sbx` remains fail-closed for both executors until the audited capability proof lands.
 
+**One workload backend per run:** omitted enclave `runtime` values inherit the
+primary selection in `container.containerRuntime`. An omitted primary selection
+means Docker/runc. Explicit enclave selections must match that backend; gVisor
+is distinct from Docker even though both use Docker orchestration. A mismatch
+fails before seed staging or infrastructure startup, rather than changing either
+selection or falling back. Each workload still uses its own isolated instance.
+Supporting Squid, proxy, and MCP infrastructure may remain in Docker.
+Cloud Hypervisor inheritance is implemented, but primary-with-enclave execution
+remains gated until lifecycle integration lands. NVX enclaves remain unsupported.
+
+`cloud-hypervisor` selects the trusted host enclave executor governed by
+[ADR 0002](adr/0002-cloud-hypervisor-enclave-executor.md), not the primary-agent
+VM backend. AWF owns the per-run authenticated private Unix listener, staged
+seed paths, release-attested role artifacts, launch policy, and recovery state.
+The broker uses the unchanged protocol v2 without caller-selectable launch
+controls. Supported GitHub-hosted Ubuntu x86_64 KVM host/artifact preflight and
+the hard-bounded aggregate writable-storage provider from
+[#9394](https://github.com/github/gh-aw-firewall/issues/9394) are mandatory.
+The production provider is installed and is selected only after the supported
+host and package-matched release-attested artifact preflight pass. Unsupported
+hosts fail explicitly before staging/listener/VM creation; there is no bypass
+flag.
+The initial scope is static script and static agent entries only. Dynamic
+entries, custom `image` overrides, mixed container/VM enclave runtimes,
+Docker host path prefixes, primary sbx/NVX/Cloud Hypervisor combinations, and static
+GitHub tools lacking a scoped executor bearer handoff are rejected.
+No unavailable configuration falls back to another runtime.
+
+An enclave-only `cloud-hypervisor` selection does not implicitly switch the
+primary agent. A static Cloud Hypervisor agent enclave may run under a Docker
+primary, provided every enabled enclave executor uses Cloud Hypervisor.
+Other backend mismatches still fail closed, and general all-VM primary-agent
+execution with enclaves retains its separate acceptance gates.
+
+Static GitHub tools on VM agents require the trusted compiler's
+`AWF_ENCLAVE_GITHUB_EXECUTOR_CAPABILITY` handoff and a gateway enforcing that
+capability's run/executor identity, exact tools, repositories, integrity policy
+and expiry. AWF consumes this host-only handoff before spawning children and
+exports only the scoped bearer to the guest's private read-only session handoff.
+There is no identity-only or gateway-wide-key fallback. See the
+[capability contract and lifetime](enclaves-architecture.md#cloud-hypervisor-scoped-executor-capability)
+for the closed JSON format, one-hour lifetime bound, cleanup obligations and
+compiler/gateway coordination. gh-aw v1.0.1 does not implement this contract.
+
 The agent executor additionally requires `enableApiProxy`, a configured provider route for its fixed engine/profile, a configured `model`, and the absence of `enableDind`. AWF validates those requirements before repository staging.
+
+### 14.1a Dynamic repository admission (agent-only)
+
+```yaml
+enclaves:
+  - agent:
+      model: gpt-5
+    dynamic:
+      allowedOwners:
+        - octo-org
+      allowedRepositories: []
+      sensitivity: confidential
+      executor: agent
+      githubPolicy:
+        version: github-repository-read-v1
+        tools:
+          - list_issues
+          - issue_read
+      maxRepositories: 4
+      limits:
+        timeoutSeconds: 180
+        memoryLimit: 256m
+        cpuLimit: "1"
+        pidsLimit: 128
+        tmpfsLimit: 256m
+        maxOutputBytes: 2048
+        maxTaskBytes: 4096
+        maxModelRequests: 8
+        maxModelTokens: 4096
+      quotas:
+        maxInvocations: 100
+        maxOutputBytes: 100000
+        maxExecutionSeconds: 3600
+      auditLabels:
+        - awf-enclave-dynamic
+      expiresAt: "2030-01-01T00:00:00Z"
+```
+
+The `dynamic` object is byte-for-byte the envelope the gh-aw compiler emits. An agent entry MUST declare exactly one of `repos` or `dynamic`, never both, and a `script` entry MUST NOT declare `dynamic`. The object is closed (unknown fields are rejected) and every field is REQUIRED:
+
+- `allowedOwners` / `allowedRepositories` — exact canonical lowercase ASCII owner scopes (`owner`) and/or `owner/repo` selectors. Either list MAY be empty, but at least one selector MUST be reachable for the envelope to admit anything. AWF performs no trimming, case folding, Unicode normalization, or URL decoding before matching; a selector that is not already in this exact canonical form is rejected.
+- `sensitivity` — one of `public`, `trusted`, `internal`, `confidential`, `sealed`; fixes the shared per-repository information budget an admitted repository debits (§14.4). An admitted repository opens its balance in the same run-wide ledger the static executors debit, so re-admitting a repository can never refill a budget it has already spent.
+- `executor` — fixed to `agent`; any other value is rejected.
+- `githubPolicy` — fixed to `{ version: "github-repository-read-v1", tools: ["list_issues", "issue_read"] }`. Any other version, tool set, or additional tool is rejected; this is the sole supported dynamic GitHub policy.
+- `maxRepositories` — integer `1..1000`: distinct repositories this envelope may admit for the run.
+- `limits` — per-invocation trusted bounds, all REQUIRED: `timeoutSeconds` (`1..4740`, whole seconds), `memoryLimit`, `cpuLimit`, `pidsLimit` (`1..4096`), `tmpfsLimit`, `maxOutputBytes` (`1..8192`), `maxTaskBytes` (`1..65536`), `maxModelRequests` (`1..64`), `maxModelTokens` (`1..32768`). These are the same resource and response controls a static agent entry declares at entry level.
+- `quotas` — run-wide totals debited across every admission under this envelope, all REQUIRED: `maxInvocations` (`1..10000`), `maxOutputBytes` (`1..1048576`), `maxExecutionSeconds` (`1..86400`).
+- `auditLabels` — a non-empty, unique array of at most 32 opaque labels matching `^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$`. Labels are what AWF and mcpg reconcile dynamic state against at shutdown; they are never repository names or credentials.
+- `expiresAt` — an absolute ISO-8601 timestamp, never later than the workflow job lifetime; admission at or after this time is denied.
+
+#### Runtime prerequisites
+
+A dynamic entry runs only when the gh-aw compiler has started mcpg's
+`github-repository-delegation-v1` controller and handed AWF **both** private
+values:
+
+- `AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_ENDPOINT` — the loopback-only control
+  endpoint, published by Docker on the runner's own `127.0.0.1`
+  (`http://127.0.0.1:<port>/internal/awf-enclave-mcp-control/github-repository-delegation-v1`).
+  AWF accepts only the literal loopback hosts `127.0.0.1` and `[::1]`; a
+  resolver-dependent name such as `localhost`, a routable or wildcard address,
+  embedded credentials, a query string, a fragment, or any other path is
+  rejected. An omitted or explicit `:80` is accepted as port 80 (the WHATWG URL
+  parser normalizes both to the same value).
+- `AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_CAPABILITY` — the AWF-only 256-bit
+  hex control capability.
+
+A missing, partial, or malformed handoff is a hard failure. AWF never falls
+back to a static seed catalog, a job-lifetime identity, or a broader policy.
+
+Because the control listener is published on host loopback, only the AWF host
+process can reach it **through the published port**, which is why the control
+client runs there rather than in a container. That is a property of the
+publication rather than a general routing guarantee: under network isolation the
+in-container listener binds `0.0.0.0`, and a peer co-attached to a Docker
+network with mcpg addresses the container IP directly without traversing the
+published port. The control plane is therefore protected by authentication —
+every request must carry the AWF-only capability, and mcpg rejects anything else
+with `403 delegation_access_denied`.
+
+AWF takes custody of both values before any inherited
+environment is assembled, stages them into the `0700` enclave private root with
+exclusive `0600` files, and never mounts either one into the enclave MCP broker,
+the single-use executor, the model sidecar, the general MCP route, or the
+delegated data plane. Both variables are also in the primary agent's environment
+exclusion set.
+
+For Docker, the broker routes `enclave_run_agent` through the authenticated
+host-executor protocol. The host owns admission, invocation-scoped bearer
+staging, execution, quota settlement and revocation; the bearer never returns
+to the broker. The broker retains its disclosure ledger and admission lane.
+The unmigrated gVisor path uses the existing `0700` request/response directory
+bound only into the broker. Neither transport carries the control endpoint,
+control capability, identity handle, compiler envelope, mcpg state path or
+policy generation to the broker.
+
+#### Dynamic-only runs stage nothing
+
+A dynamic-only entry needs no `GH_TOKEN`/`GITHUB_TOKEN`, clones no repository,
+writes no seed catalog (not even an empty one), and mounts neither `/awf/seed`
+nor a seed map. A run that also declares a separate static entry keeps the full
+static staging path unchanged.
+
+#### Admission semantics (enforced by the AWF registry)
+
+Admission runs in `src/enclave/dynamic-registry.ts` before any repository
+content is exposed and before any control call is made:
+
+- Admission is idempotent by `(run, enclave entry, invocation id, canonical repository)`. A retried request with the same key returns the previously recorded outcome, and joins an in-flight admission rather than reserving capacity a second time. A different repository under an already-bound invocation id is rejected rather than rebinding.
+- `maxRepositories` and all three quotas are reserved synchronously before any asynchronous lookup, so concurrent admissions can never both observe capacity and both commit. `maxOutputBytes` and `maxExecutionSeconds` are reserved at their per-invocation worst case (`limits.maxOutputBytes`, `limits.timeoutSeconds`) and replaced by the actual reported usage once the invocation settles. Charges committed after admission stay committed even if the invocation later fails.
+- Every outcome — malformed selector, policy denial, resolution failure, or success — is delayed to the same fixed timing bucket (§14.3's bucket list) plus secret-independent jitter, so elapsed wall-clock time cannot distinguish failure causes. Every failure returns one non-disclosing canonical denial.
+
+#### Identity lifecycle
+
+For each admitted invocation AWF calls mcpg's control API, authenticated with
+the capability in `Authorization`, using bounded request/response bodies,
+explicit timeouts, and strict JSON validation:
+
+| Operation | Path |
+| --- | --- |
+| create or confirm | `/internal/awf-enclave-mcp-control/create-or-confirm` |
+| status | `/internal/awf-enclave-mcp-control/status` |
+| reconcile | `/internal/awf-enclave-mcp-control/reconcile` |
+| revoke | `/internal/awf-enclave-mcp-control/revoke` |
+| revoke by labels | `/internal/awf-enclave-mcp-control/revoke-by-labels` |
+
+Operation paths are siblings of the controller name in the exported endpoint,
+not children of it. `requested_ttl` is a positive whole number of seconds,
+matching the user-configured `limits.timeoutSeconds` and mcpg's
+`max_identity_ttl` unit; timestamps are RFC 3339.
+
+Every create-or-confirm response is verified before it is trusted: non-empty
+handle and executor bearer, an exact repository match against the admitted
+selector, `tool_policy` equal to `github-repository-read-v1`, tools exactly
+`list_issues` and `issue_read`, an admitted SHA that matches when one was
+requested, and an expiry no later than the requested TTL or the invocation
+deadline. Only the executor bearer leaves the AWF host process; the handle stays
+in AWF-private state.
+
+At startup AWF calls `status`, revokes any stale labelled identity, and only
+then calls the transactional `reconcile`. New admissions stay blocked until that
+sequence succeeds. Every terminal path — success, agent failure, schema failure,
+timeout, cancellation, broker error — settles the reserved quota and revokes the
+identity, and `revoke-by-labels` sweeps the run at teardown. An unresolved
+revocation re-blocks admissions and downgrades the invocation to the canonical
+error rather than returning a success-shaped result.
+
+#### Live versus pinned reads
+
+`admitted_default_branch_sha` is optional in both the ADR and mcpg's contract.
+AWF has no already-authorized, repository-confined path to resolve a
+default-branch SHA before the delegated identity exists, and
+`github-repository-read-v1` grants only `list_issues` and `issue_read`
+afterwards. AWF therefore omits the field, never widens a token or tool to
+obtain one, and audits every repository read as a **live** read. A read is
+marked `pinned` only when the control binding actually carries a resolved SHA.
 
 ### 14.2 MCP-only tool surface
 
@@ -1806,30 +2851,44 @@ Both tool schemas are closed (`additionalProperties: false`). A call can never p
 
 The primary agent MUST NOT receive a broker socket, wrapper binary, direct server URL, capability token, repository seed, ledger state, or alternate enclave transport.
 
+### 14.2a Optional tool-call cap (cost control)
+
+`rateLimiting.maxNumToolCalls` (CLI: `--max-num-tool-calls <n>`) caps the number of enclave tool calls the primary agent may make in one AWF run. It is OPTIONAL and defaults to **unlimited**: when omitted, `enclave-mcp-server` keeps no counter, persists no state, and publishes no advisory text. Setting it without any configured enclave is a startup error.
+
+When configured:
+
+- **Scope** — one run-wide budget shared by `enclave_run_script` and `enclave_run_agent`, independent of each entry's `maxInvocations` and of the per-repository disclosure ledger. Dynamic repository admission is performed by the broker inside an `enclave_run_agent` call and does not consume additional units; tool calls made *inside* an enclave agent are bounded by `maxModelRequests`/`maxModelTokens` instead.
+- **Counting** — every attempted, well-formed `tools/call` to a published enclave tool consumes one unit before any other admission decision, including calls later rejected as busy, oversized, invalid, or failed. Malformed JSON-RPC requests that never name a published tool do not count.
+- **Advisory** — each published tool description, and the `initialize` result's `instructions`, state: "You are allowed to make at most N enclave tool calls in this run. After that, the system will deny any further enclave tool calls."
+- **Denial** — once exhausted, calls never reach an executor and return an in-band `isError` result whose text is "Max tool call count reached, no more tool calls are allowed. Make a decision based on what you already have in context." The decision depends only on the caller's own call count and trusted configuration, so it discloses no repository information. On the first denied call the broker logs one warning, `Max tool call count reached. {"toolName":…,"agentName":<executor kind>,"sessionID":<run id>,"maxToolCalls":N}`, so repeated retries cannot flood the logs.
+- **Persistence** — the count is persisted (mode `0600`) in the broker's private control directory keyed by the AWF run id. Successfully persisted counts are restored, but persistence is best-effort: write failures warn, and unreadable or corrupt state resets the count. This is not a fail-closed cross-restart budget guarantee. The information ledger and executor-local invocation counters remain in-memory; host execution journals and container recovery records do not restore them.
+- **Exemptions** — the enclave server publishes no final-answer or structured-result submission tool; the agent's own result/safe-output tools are served elsewhere and are never counted or denied by this cap.
+
 ### 14.3 Topology, gateway contract, and readiness
 
 `enclave-mcp-server` joins only the private `awf-enclave-mcp-control` network. The compiler launches `gh-aw-mcpg`, labels it for the run, and passes AWF the private gateway endpoint plus a run-unique capability/identity handoff. The server is reachable **only** through that gateway.
 
 When the agent executor is enabled, each invocation joins only the dedicated
 `internal` `awf-enclave-agent` network. Its mandatory peer is the dedicated
-enclave API proxy. With `issues-read-v1`, the only additional peer is an
-AWF-owned PAT-free CLI proxy at `172.31.0.40:11000`. That proxy is dual-homed
-onto the internal `awf-enclave-github-control` network
-(`172.29.0.0/24`), where compiler-owned mcpg is attached under the fixed alias
-`awf-enclave-github-proxy:18443`. mcpg never joins the enclave network.
-Squid, the primary agent, general proxies, safe outputs, the MCP gateway, and
-the MCP server itself remain excluded.
+enclave API proxy. When GitHub access is configured (`agent.tools.github` or
+the deprecated legacy `agent.github.cli: issues-read-v1` marker), the only
+additional peer is compiler-owned shared mcpg.
+AWF attaches that existing container directly at `172.31.0.40` under the fixed
+alias `awf-enclave-github-mcp`; the enclave uses `/mcp/github` on port 8080.
+Squid, the primary agent, general proxies, safe outputs, and the enclave MCP
+server itself remain excluded.
 
 The base compiler handoff from `github/gh-aw#50920` and late backend
-rediscovery from `github/gh-aw-mcpg#10784` are present on current defaults:
-gh-aw pins mcpg v0.4.10 and mcpg reports MCP Gateway spec 1.16.0. The base floor
-remains spec 1.15.0 and a post-v0.4.8 mcpg release.
+rediscovery from `github/gh-aw-mcpg#10784` are present in mcpg v0.4.15, which
+reports MCP Gateway spec 1.16.0. The base floor remains spec 1.15.0 and a
+post-v0.4.8 mcpg release. That floor covers static entries only; dynamic
+repository admission requires mcpg v0.4.18 or newer for the whole-second
+delegation duration encoding (see §14 and `docs/enclaves-architecture.md`).
 
-`issues-read-v1` additionally requires the first compiler/mcpg releases with
-the dedicated proxy policy, v1 token vectors, public-visibility proof, secrecy
-labels, and proxy identity/readiness contract. The compiler MUST gate or pin
-the first supporting AWF release. Older AWF versions reject the closed
-`github` field; AWF has no compatibility fallback.
+GitHub access additionally requires compiler support for mcpg multi-agent
+identities and policies, tracked by `github/gh-aw#57787`. The compiler MUST gate
+or pin the first supporting AWF release. Older AWF versions reject the closed
+`github`/`tools.github` fields; AWF has no compatibility fallback.
 
 While the backend is still starting, mcpg may return retryable HTTP `503 backend_unavailable`. AWF retries `initialize` with bounded backoff until `AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS` expires, then fails closed before the primary agent starts.
 
@@ -1846,48 +2905,72 @@ configuration or persist the resolved credential under `GITHUB_WORKSPACE` (or
 any other agent-readable path). The AWF upstream contract cannot enforce this
 requirement on the downstream output/converter path.
 
-For `issues-read-v1`, the compiler supplies
-`AWF_ENCLAVE_GITHUB_PROXY_CONTAINER`,
-`AWF_ENCLAVE_GITHUB_PROXY_IDENTITY`,
-`AWF_ENCLAVE_GITHUB_PROXY_CA_CERT`, and
-`MCP_GATEWAY_ENCLAVE_CAPABILITY_KEY`. The last value MUST be exactly 32 random
-bytes encoded as 64 lowercase hexadecimal characters. AWF writes it mode 0600
-beneath the private enclave run root, mounts it read-only only into
-`enclave-mcp-server`, and removes it from the host environment. The proxy
-identity MUST match `^[a-z0-9][a-z0-9-]{0,63}$` and mcpg policy
-`workflow_run_id` byte for byte; AWF stages it in a separate mode-0600 private
-file. Policy JSON reaches only mcpg; the AWF CLI proxy receives no PAT, HMAC
-root, policy, or caller-configurable endpoint.
+When GitHub access is configured, the compiler supplies the shared gateway
+contract (`AWF_ENCLAVE_MCP_GATEWAY_CONTAINER`, `AWF_ENCLAVE_MCP_GATEWAY_ENDPOINT`, and
+`AWF_ENCLAVE_MCP_GATEWAY_IDENTITY`) plus a distinct
+`AWF_ENCLAVE_GITHUB_MCP_AGENT_ID`. The compiler configures that identity in
+mcpg `gateway.agentIds` and restricts it with `gateway.agentPolicies` to the
+`github` server, `agent.tools.github.allowed` (or the legacy marker's fixed
+`list_issues`/`issue_read` pair), and the trusted enclave repository catalog
+named in `agent.tools.github.allowedRepos`:
 
-The server mints one short-lived `awf-egh1` HMAC capability per admitted
-invocation. Its canonical compact JSON field order is
-`v,aud,run,inv,repo,profile,ops,nbf,exp`; the fixed sorted operations are
-`issues.comments.list`, `issues.get`, and `issues.list`. The enclave receives
-only that token as a read-only file. The `run` claim is the compiler proxy
-identity, not AWF's independent random seed-map/container-reconciliation run
-ID. Its `gh` wrapper permits only bounded
-`gh api` GET calls for:
+- `list_issues`
+- `issue_read` with method `get`
+- `issue_read` with method `get_comments`
 
-- `repos/{owner}/{repo}/issues`
-- `repos/{owner}/{repo}/issues/{number}`
-- `repos/{owner}/{repo}/issues/{number}/comments`
+AWF itself only validates the closed `agent.tools.github` contract — that
+`allowed` is a non-empty subset of the two supported tools, that
+`allowedRepos` is a non-empty list of exact `owner/repository` slugs each
+present in this same agent entry's own `repos` list (not the run-wide merged
+catalog shared with the script executor), and that `minIntegrity` (when set)
+is one of `none`, `unapproved`, `approved`, or `merged` — and wires the shared
+gateway connection. The legacy `agent.github.cli: issues-read-v1` marker has
+no `allowedRepos` field of its own; its repository scope comes entirely from
+the compiler-defined trusted catalog baked into that fixed marker, not from
+anything AWF validates. Repository and integrity enforcement live entirely in
+the compiler-created, enclave-specific mcpg identity; AWF never broadens or
+replaces that policy.
 
-The `repo` claim MUST be the exact canonical lowercase `owner/repo` admitted
-for that invocation. AWF MUST NOT substitute an owner-wide, wildcard,
-all-private, empty, or label-shaped value and does not configure the
-invocation's DIFC secrecy label. mcpg derives only the exact
-`private:owner/repo` agent tag from the verified claim; public responses carry
-empty secrecy and any different private repository carries its own distinct
-tag, so the normal `resource secrecy subset-of agent secrecy` check rejects it.
+AWF stores the enclave identity in a mode-0600 private file, removes it from
+the host environment, and gives each invocation a read-only private copy. The
+enclave sends the identity directly as `Authorization` to
+`http://172.31.0.40:8080/mcp/github`. The shared toolchain includes `gh`, but the
+enclave receives no GitHub CLI credentials or direct GitHub network route;
+GitHub reads must use the repository-scoped MCP tools. Tool presence is not a
+security boundary. Before primary-agent work begins, AWF initializes
+the endpoint and fails closed unless `tools/list` advertises exactly the
+configured `allowed` tools — no more, no fewer.
 
-GraphQL, search, writes, arbitrary paths, absolute or alternate hosts,
-traversal, body/input/field flags, auth/config/extensions/aliases, environment
-overrides, and shell execution are rejected. Stock `gh issue` commands are not
-part of v1 because they commonly use GraphQL.
+This mcpg identity lasts for the job rather than one invocation. Its repository
+policy therefore covers the union of trusted repositories configured for the
+enclave agent; it is not independently expired, revoked, or narrowed to the
+repository assigned to a particular invocation. This is an explicit tradeoff
+of direct shared-mcpg connectivity. AWF's per-invocation process, seed,
+admission, shared-ledger debit, finite output schema, and timing controls remain
+in force.
 
 ### 14.4 Shared ledger and disclosure
 
 Script and agent calls debit the same live per-repository balance and share one AWF-owned admission lane. Switching executor kinds never resets or forks the ledger.
+
+Repository sensitivity selects the response schema and per-run disclosure policy:
+
+| Sensitivity | Per-run budget | Response schema |
+|-------------|----------------|-----------------|
+| `trusted` | Unmetered | Structured schemas, including free-form `string` nodes |
+| `public` | Unmetered | Finite schemas only |
+| `internal` | 64 bits | Finite schemas only |
+| `confidential` | 8 bits | Finite schemas only |
+| `sealed` | 0 bits | No invocation can be admitted |
+
+The `trusted` class is intended only for repositories whose content may be
+returned to the primary agent without confidentiality accounting. It permits
+an exact `{ "type": "string" }` schema node at any otherwise valid schema
+position. Strings remain bounded by `maxOutputBytes` and the global 8192-byte
+result ceiling. The schema remains strict and structured: floats, optional
+fields, extra properties, `$ref`, recursion, regex schemas, and untagged unions
+are unsupported. Every other sensitivity rejects a schema containing a
+free-form `string` node before launching an enclave.
 
 `enclave_run_agent` necessarily sends repository-derived content to the configured model provider through the dedicated API proxy. The ledger bounds what the **calling agent** learns; it does not bound what the **provider** sees.
 

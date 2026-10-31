@@ -7,9 +7,9 @@ import type { LogLevel } from './log-level';
 // ─── Cloud Hypervisor (v53.0 preview lifecycle backend) ────────────────────
 //
 // This configuration surface pins trusted artifacts and configures the
-// Cloud Hypervisor microVM runtime. It is selectable via
-// `--container-runtime cloud-hypervisor` (gated behind explicit
-// `--cloud-hypervisor-preview` opt-in): see
+// Cloud Hypervisor microVM runtime. It is selected by the primary-agent
+// `--container-runtime cloud-hypervisor` option or a trusted enclave runtime
+// entry (both gated behind explicit `--cloud-hypervisor-preview` opt-in): see
 // `src/cloud-hypervisor/preflight.ts` for artifact/host validation and
 // `guest/cloud-hypervisor/` for the guest artifact pipeline. GitHub-hosted
 // Ubuntu x86_64 KVM runners are the only supported host target.
@@ -19,6 +19,13 @@ export const CLOUD_HYPERVISOR_DEFAULT_BINARY = '/usr/local/bin/cloud-hypervisor'
 export const CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT = 2;
 export const CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB = 512;
 export const CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS = 5_000;
+export const CLOUD_HYPERVISOR_MOUNT_POLICIES = [
+  'workspace-only',
+  'workspace-and-tool-cache',
+] as const;
+export type CloudHypervisorMountPolicy = typeof CLOUD_HYPERVISOR_MOUNT_POLICIES[number];
+export const CLOUD_HYPERVISOR_DEFAULT_MOUNT_POLICY: CloudHypervisorMountPolicy =
+  'workspace-only';
 
 export interface CloudHypervisorArtifactDigests {
   cloudHypervisor?: string;
@@ -31,19 +38,30 @@ export interface CloudHypervisorArtifactDigests {
 /**
  * Cloud Hypervisor v53.0 preview microVM runtime settings.
  *
- * Selectable via `--container-runtime cloud-hypervisor`, gated behind
- * explicit `--cloud-hypervisor-preview` opt-in. Supported only on
+ * Required when the primary agent or an enclave selects Cloud Hypervisor,
+ * gated behind explicit `--cloud-hypervisor-preview` opt-in. Supported only on
  * GitHub-hosted Ubuntu x86_64 KVM runners.
  */
 export interface CloudHypervisorOptions {
   previewEnabled: boolean;
+  /** Host exposure policy; runner tool-cache access always requires explicit opt-in. */
+  mountPolicy: CloudHypervisorMountPolicy;
   cloudHypervisorBinary: string;
   kernelPath?: string;
   rootfsPath?: string;
   supervisorPath?: string;
+  artifactManifestPath?: string;
+  artifactManifestBundlePath?: string;
+  artifactReleaseTag?: string;
+  developmentAllowUnattestedArtifacts?: boolean;
+  /** Host-only diagnostics; defaults on for eligible verified public-only enclaves. False opts out. */
+  enclaveDebugPublic?: boolean;
   vcpuCount: number;
   memoryMib: number;
+  /** Optional primary guest /tmp tmpfs capacity in MiB; enclave limits remain fixed. */
+  scratchMib?: number;
   apiTimeoutMs: number;
+  /** Development-only legacy digest pins; never a provenance trust root. */
   sha256?: CloudHypervisorArtifactDigests;
 }
 
@@ -213,4 +231,58 @@ export interface RuntimeOptions {
    * GitHub-hosted Ubuntu x86_64 KVM runners.
    */
   cloudHypervisor?: CloudHypervisorOptions;
+
+  /**
+   * NVX preview microVM runtime settings.
+   *
+   * Selectable via `--container-runtime nvx`, gated behind explicit
+   * `--nvx-preview` opt-in. Supported only on Linux x86_64 KVM hosts (see
+   * `src/nvx/preflight.ts`).
+   */
+  nvx?: NvxOptions;
+}
+
+// ─── NVX (opt-in preview microVM lifecycle backend) ────────────────────────
+//
+// This configuration surface pins trusted NVX artifacts and configures the
+// NVX one-shot microVM runtime. It is selected by the primary-agent
+// `--container-runtime nvx` option, gated behind explicit `--nvx-preview`
+// opt-in. See `src/nvx/preflight.ts` for artifact/host validation and
+// `src/nvx/manager.ts` for the launch/cleanup lifecycle. Linux x86_64 KVM
+// hosts are the only supported host target.
+
+export const NVX_MOUNT_POLICIES = [
+  'workspace-only',
+  'workspace-and-tool-cache',
+] as const;
+export type NvxMountPolicy = typeof NVX_MOUNT_POLICIES[number];
+export const NVX_DEFAULT_MOUNT_POLICY: NvxMountPolicy = 'workspace-only';
+
+export const NVX_DEFAULT_MEMORY_MIB = 512;
+export const NVX_DEFAULT_MEMORY_MAX_BYTES = 512 * 1024 * 1024;
+export const NVX_DEFAULT_PIDS_MAX = 128;
+
+/**
+ * NVX preview one-shot microVM runtime settings.
+ *
+ * Required when the primary agent selects `nvx`, gated behind explicit
+ * `--nvx-preview` opt-in. Supported only on Linux x86_64 KVM hosts.
+ */
+export interface NvxOptions {
+  previewEnabled: boolean;
+  /** Host directory exposure policy for the live guest workspace export. */
+  mountPolicy: NvxMountPolicy;
+  /** Host path to the prebuilt guest distro layer (EROFS source directory). */
+  layerPath?: string;
+  artifactManifestPath?: string;
+  artifactManifestBundlePath?: string;
+  /** Expected GitHub Actions workflow that signed the artifact manifest. */
+  signerWorkflow?: string;
+  openvmmPath?: string;
+  kernelPath?: string;
+  initramfsPath?: string;
+  memoryMib: number;
+  memoryMaxBytes: number;
+  pidsMax: number;
+  scratchBytes?: number;
 }

@@ -11,9 +11,88 @@ import {
   setupConfigAssemblyTestSuite,
   validateRateLimitFlags,
 } from './config-assembly.test-utils';
+import { normalizeEnclavesConfig } from '../../parsers/enclave-parser';
 
 describe('config-assembly', () => {
   setupConfigAssemblyTestSuite();
+
+  it('falls back to the Docker backend when Cloud Hypervisor runner eligibility fails', () => {
+    const previousGithubActions = process.env.GITHUB_ACTIONS;
+    delete process.env.GITHUB_ACTIONS;
+    try {
+      mockBuildConfigOnce({
+        containerRuntime: 'cloud-hypervisor',
+        networkIsolation: true,
+        legacySecurity: false,
+        enableApiProxy: true,
+        cloudHypervisor: {
+          previewEnabled: true,
+          mountPolicy: 'workspace-only',
+          cloudHypervisorBinary: '/opt/cloud-hypervisor',
+          kernelPath: '/opt/kernel',
+          rootfsPath: '/opt/rootfs',
+          supervisorPath: '/opt/supervisor',
+          artifactManifestPath: '/opt/manifest.json',
+          artifactManifestBundlePath: '/opt/manifest.sigstore.jsonl',
+          artifactReleaseTag: 'v0.23.1',
+          vcpuCount: 2,
+          memoryMib: 512,
+          apiTimeoutMs: 5000,
+        },
+      });
+
+      const result = callAssembleWith();
+
+      expect(result.containerRuntime).toBeUndefined();
+      expect(result.cloudHypervisor).toBeUndefined();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('falling back to the standard Docker backend'),
+      );
+    } finally {
+      if (previousGithubActions === undefined) delete process.env.GITHUB_ACTIONS;
+      else process.env.GITHUB_ACTIONS = previousGithubActions;
+    }
+  });
+
+  it('never falls back when an enclave selects Cloud Hypervisor', () => {
+    const previousGithubActions = process.env.GITHUB_ACTIONS;
+    delete process.env.GITHUB_ACTIONS;
+    try {
+      mockBuildConfigOnce({
+        containerRuntime: 'docker',
+        networkIsolation: true,
+        legacySecurity: false,
+        enableApiProxy: false,
+        enclaves: normalizeEnclavesConfig([{
+          script: {},
+          runtime: 'cloud-hypervisor',
+          repos: [{ repo: 'octo/private', sensitivity: 'internal' }],
+        }]),
+        cloudHypervisor: {
+          previewEnabled: true,
+          mountPolicy: 'workspace-only',
+          cloudHypervisorBinary: '/opt/cloud-hypervisor',
+          kernelPath: '/opt/kernel',
+          rootfsPath: '/opt/rootfs',
+          supervisorPath: '/opt/supervisor',
+          artifactManifestPath: '/opt/manifest.json',
+          artifactManifestBundlePath: '/opt/manifest.sigstore.jsonl',
+          artifactReleaseTag: 'v0.23.1',
+          vcpuCount: 2,
+          memoryMib: 512,
+          apiTimeoutMs: 5000,
+        },
+      });
+
+      expect(() => callAssembleWith()).toThrow('process.exit(1)');
+      expect(logger.warn).not.toHaveBeenCalledWith(
+        expect.stringContaining('falling back to the standard Docker backend'),
+      );
+    } finally {
+      if (previousGithubActions === undefined) delete process.env.GITHUB_ACTIONS;
+      else process.env.GITHUB_ACTIONS = previousGithubActions;
+    }
+  });
 
   describe('rate limit validation', () => {
     it('should exit if rate limit config build fails', () => {

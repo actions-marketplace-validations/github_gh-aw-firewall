@@ -1,7 +1,9 @@
 import { constants, promises as fs } from 'fs';
 import * as path from 'path';
+import { Writable } from 'stream';
 import type { ExecaChildProcess } from 'execa';
 import type { MicrovmNetworkLifecycle, MicrovmNetworkPlan } from '../microvm/network';
+import type { CloudHypervisorNetworkLifecycle } from './network-namespace';
 import {
   CLOUD_HYPERVISOR_RELEASE_VERSION,
   type CloudHypervisorOptions,
@@ -21,6 +23,20 @@ import {
   type CloudHypervisorRunPaths,
 } from './manager-types';
 import type { VirtiofsdDevice } from './virtiofsd';
+import type { CloudHypervisorConfinementEvidence } from './confinement-verifier';
+import { redactSensitiveValues } from '../redact-secrets';
+import type { GuestConnectionDiagnostics } from './guest-execution';
+
+export class DiagnosticPersistenceCleanupError extends Error {
+  readonly cause: unknown;
+  readonly cleanupError: unknown;
+
+  constructor(cause: unknown, cleanupError: unknown) {
+    super('Diagnostic persistence failed and closing its file failed');
+    this.cause = cause;
+    this.cleanupError = cleanupError;
+  }
+}
 
 /** Reads at most `maxBytes` from the end of `filePath`. */
 export async function readBoundedTail(filePath: string, maxBytes: number): Promise<Buffer> {
@@ -33,6 +49,27 @@ export async function readBoundedTail(filePath: string, maxBytes: number): Promi
       await handle.read(buffer, 0, length, size - length);
     }
     return buffer;
+  } finally {
+    await handle.close();
+  }
+}
+
+async function secureFileHandoff(
+  dependencies: AuditDependencies,
+  filePath: string,
+  identity: CloudHypervisorIdentity,
+): Promise<void> {
+  const handle = await dependencies.open(
+    filePath,
+    constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`Refusing to hand off non-regular or multiply-linked file: ${filePath}`);
+    }
+    await handle.chmod(0o600);
+    await handle.chown(identity.uid, identity.gid);
   } finally {
     await handle.close();
   }
@@ -54,6 +91,15 @@ export class BoundedOutputCapture {
 
   contents(): Buffer {
     return this.buffer;
+  }
+
+  writable(): Writable {
+    return new Writable({
+      write: (chunk: Buffer, _encoding, callback) => {
+        this.append(chunk);
+        callback();
+      },
+    });
   }
 }
 
@@ -88,8 +134,10 @@ export async function stageArtifact(
   destination: string,
   mode: number,
   identity: CloudHypervisorIdentity,
+  copy?: () => Promise<void>,
 ): Promise<void> {
-  await dependencies.copyFile(source, destination, constants.COPYFILE_EXCL);
+  if (copy) await copy();
+  else await dependencies.copyFile(source, destination, constants.COPYFILE_EXCL);
   await dependencies.chown(destination, identity.uid, identity.gid);
   await dependencies.chmod(destination, mode);
 }
@@ -99,21 +147,55 @@ export async function stageDiagnosticFile(
   destination: string,
   identity: CloudHypervisorIdentity,
 ): Promise<void> {
-  await dependencies.writeFile(destination, '', { flag: 'wx', mode: 0o600 });
-  await dependencies.chown(destination, identity.uid, identity.gid);
+  const handle = await dependencies.open(
+    destination,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`Refusing to create non-regular diagnostic file: ${destination}`);
+    }
+    await handle.chmod(0o600);
+    await handle.chown(identity.uid, identity.gid);
+  } finally {
+    await handle.close();
+  }
+}
+
+export async function preserveVirtiofsdStartupEvidence(
+  dependencies: CloudHypervisorManagerDependencies,
+  devices: readonly VirtiofsdDevice[],
+  directory: string,
+): Promise<void> {
+  if (devices.length === 0) return;
+  const { identity, directory: auditDirectory } = await prepareAuditDirectory(directory, dependencies);
+  for (const device of devices) {
+    try {
+      const destination = path.join(auditDirectory, path.basename(device.evidencePath));
+      await dependencies.copyFile(device.evidencePath, destination, constants.COPYFILE_EXCL);
+      await secureFileHandoff(dependencies, destination, identity);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    }
+  }
 }
 
 async function copyBoundedDiagnostic(
   dependencies: CloudHypervisorManagerDependencies,
   source: string,
   destination: string,
+  identity: CloudHypervisorIdentity,
 ): Promise<void> {
+  let bounded: Buffer;
   try {
-    const bounded = await dependencies.readFileTail(source, CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
-    await dependencies.writeFile(destination, bounded, { mode: 0o600 });
+    bounded = await dependencies.readFileTail(source, CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    return;
   }
+  await writeAuditFile(dependencies, destination, bounded, identity);
 }
 
 export async function waitForApiSocket(
@@ -151,15 +233,260 @@ export interface CloudHypervisorDiagnosticsContext {
   config: CloudHypervisorOptions;
   stdoutCapture: BoundedOutputCapture;
   stderrCapture: BoundedOutputCapture;
-  network: MicrovmNetworkLifecycle | undefined;
+  guestStdoutCapture: BoundedOutputCapture;
+  guestStderrCapture: BoundedOutputCapture;
+  captureGuestRawOutput?: boolean;
+  network: MicrovmNetworkLifecycle | CloudHypervisorNetworkLifecycle | undefined;
   networkPlan: MicrovmNetworkPlan | undefined;
   client: CloudHypervisorApiClient | undefined;
   instanceStarted: boolean;
+  guestConnection?: GuestConnectionDiagnostics;
   // Snapshotted by stop(), before any shutdown attempt, since the API
   // socket becomes unresponsive once the process is asked to exit.
   lastVmInfo: CloudHypervisorVmInfo | undefined;
   lastVmCounters: CloudHypervisorVmCounters | undefined;
   fsDevices: readonly VirtiofsdDevice[];
+  confinementEvidence: CloudHypervisorConfinementEvidence | undefined;
+  debugArtifactProtectedRoot?: string;
+}
+
+type AuditDependencies = Pick<
+  CloudHypervisorManagerDependencies,
+  'mkdir' | 'lstat' | 'realpath' | 'open' | 'resolveIdentity'
+>;
+
+async function assertExistingDiagnosticComponents(
+  dependencies: AuditDependencies,
+  directory: string,
+): Promise<void> {
+  const absolutePath = path.resolve(directory);
+  const root = path.parse(absolutePath).root;
+  const segments = absolutePath.slice(root.length).split(path.sep).filter(Boolean);
+  const cloudHypervisorIndex = segments.lastIndexOf('cloud-hypervisor');
+  if (cloudHypervisorIndex < 0) return;
+  const diagnosticsIndex = segments.lastIndexOf('diagnostics');
+  const protectedIndex = diagnosticsIndex >= 0 && diagnosticsIndex < cloudHypervisorIndex
+    ? diagnosticsIndex
+    : cloudHypervisorIndex;
+  const anchor = path.join(root, ...segments.slice(0, protectedIndex));
+  let existingAncestor = anchor;
+  const missingSegments: string[] = [];
+  while (true) {
+    try {
+      await dependencies.realpath(existingAncestor);
+      break;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      missingSegments.unshift(path.basename(existingAncestor));
+      const parent = path.dirname(existingAncestor);
+      if (parent === existingAncestor) throw error;
+      existingAncestor = parent;
+    }
+  }
+  let current = await dependencies.realpath(existingAncestor);
+  const descendants = [
+    ...missingSegments,
+    ...segments.slice(protectedIndex),
+  ];
+  for (const segment of descendants) {
+    current = path.join(current, segment);
+    let stat;
+    try {
+      stat = await dependencies.lstat(current);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ENOENT') return;
+      throw error;
+    }
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Refusing to use non-directory path component: ${current}`);
+    }
+    if ((await dependencies.realpath(current)) !== current) {
+      throw new Error(`Refusing to use non-canonical directory path: ${current}`);
+    }
+  }
+}
+
+async function realDirectoryPath(
+  dependencies: AuditDependencies,
+  directory: string,
+): Promise<string> {
+  const canonicalDirectory = await dependencies.realpath(directory);
+  const root = path.parse(canonicalDirectory).root;
+  let current = root;
+  for (const segment of canonicalDirectory.slice(root.length).split(path.sep).filter(Boolean)) {
+    current = path.join(current, segment);
+    const stat = await dependencies.lstat(current);
+    if (stat.isSymbolicLink() || !stat.isDirectory()) {
+      throw new Error(`Refusing to use non-directory path component: ${current}`);
+    }
+    if ((await dependencies.realpath(current)) !== current) {
+      throw new Error(`Refusing to use non-canonical directory path: ${current}`);
+    }
+  }
+  const requestedStat = await dependencies.lstat(directory);
+  if (requestedStat.isSymbolicLink() || !requestedStat.isDirectory()) {
+    throw new Error(`Refusing to use non-directory path: ${directory}`);
+  }
+  return canonicalDirectory;
+}
+
+async function prepareAuditDirectory(
+  directory: string,
+  dependencies: AuditDependencies,
+  identity = dependencies.resolveIdentity(),
+): Promise<{ identity: CloudHypervisorIdentity; directory: string }> {
+  const parent = path.dirname(directory);
+  if (path.basename(parent) === 'cloud-hypervisor') {
+    await prepareAuditDirectory(parent, dependencies, identity);
+  }
+  await assertExistingDiagnosticComponents(dependencies, directory);
+  await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
+  const canonicalDirectory = await realDirectoryPath(dependencies, directory);
+  const handle = await dependencies.open(
+    canonicalDirectory,
+    constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+  );
+  try {
+    const stat = await handle.stat();
+    if (!stat.isDirectory()) {
+      throw new Error(`Refusing to use non-directory path: ${canonicalDirectory}`);
+    }
+    await handle.chmod(0o700);
+    await handle.chown(identity.uid, identity.gid);
+  } finally {
+    await handle.close();
+  }
+  return { identity, directory: canonicalDirectory };
+}
+
+async function prepareRootOwnedDebugDirectory(
+  directory: string,
+  protectedRoot: string,
+  dependencies: AuditDependencies,
+): Promise<{ identity: CloudHypervisorIdentity; directory: string }> {
+  const canonicalRoot = path.resolve(protectedRoot);
+  const canonicalDirectory = path.resolve(directory);
+  const relative = path.relative(canonicalRoot, canonicalDirectory);
+  if (!relative || relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
+    throw new Error('Public enclave debug artifacts must be stored below their protected root');
+  }
+  const identity = { uid: 0, gid: 0 };
+  await assertExistingDiagnosticComponents(dependencies, canonicalDirectory);
+  const components = relative.split(path.sep);
+  let current = canonicalRoot;
+  for (const component of ['', ...components]) {
+    if (component) current = path.join(current, component);
+    await dependencies.mkdir(current, { recursive: true, mode: 0o700 });
+    const canonicalCurrent = await realDirectoryPath(dependencies, current);
+    const handle = await dependencies.open(
+      canonicalCurrent,
+      constants.O_RDONLY | (constants.O_DIRECTORY ?? 0) | (constants.O_NOFOLLOW ?? 0),
+    );
+    try {
+      const stat = await handle.stat();
+      if (!stat.isDirectory()) {
+        throw new Error(`Refusing to use non-directory path: ${canonicalCurrent}`);
+      }
+      await handle.chmod(0o700);
+      await handle.chown(identity.uid, identity.gid);
+    } finally {
+      await handle.close();
+    }
+  }
+  return { identity, directory: await realDirectoryPath(dependencies, canonicalDirectory) };
+}
+
+async function writeAuditFile(
+  dependencies: AuditDependencies,
+  destination: string,
+  contents: string | Buffer,
+  identity: CloudHypervisorIdentity,
+): Promise<void> {
+  const handle = await dependencies.open(
+    destination,
+    constants.O_WRONLY | constants.O_CREAT | (constants.O_NOFOLLOW ?? 0),
+    0o600,
+  );
+  let failure: { error: unknown } | undefined;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.nlink !== 1) {
+      throw new Error(`Refusing to write non-regular or multiply-linked file: ${destination}`);
+    }
+    await handle.chmod(0o600);
+    await handle.chown(identity.uid, identity.gid);
+    await handle.truncate(0);
+    await handle.writeFile(contents);
+    await handle.chmod(0o600);
+  } catch (error) {
+    failure = { error };
+  }
+  try {
+    await handle.close();
+  } catch (cleanupError) {
+    if (failure) throw new DiagnosticPersistenceCleanupError(failure.error, cleanupError);
+    throw cleanupError;
+  }
+  if (failure) throw failure.error;
+}
+
+/** Host-owned finite evidence; independent of VM stop/diagnostic collection. */
+export async function preserveHostExecutorInvocationEvidence(
+  directory: string,
+  evidence: readonly { name: string; contents: string }[],
+  dependencies: AuditDependencies,
+): Promise<void> {
+  if (!evidence.length) return;
+  const prepared = await prepareAuditDirectory(directory, dependencies);
+  for (const item of evidence) {
+    if (!/^[a-f0-9]{32}-[a-f0-9]{32}\.json$/.test(item.name)) {
+      throw new Error('Invalid host executor diagnostic filename');
+    }
+    await writeAuditFile(dependencies, path.join(prepared.directory, item.name), item.contents, prepared.identity);
+  }
+}
+
+/** Retain public-only engine evidence without widening ordinary audit disclosure. */
+export async function preservePublicEnclaveSession(
+  directory: string,
+  protectedRoot: string,
+  contents: string,
+  secrets: string[],
+  dependencies: AuditDependencies,
+): Promise<void> {
+  const prepared = await prepareRootOwnedDebugDirectory(directory, protectedRoot, dependencies);
+  const forms = secrets.flatMap((secret) => [secret, JSON.stringify(secret).slice(1, -1)]);
+  const redacted = redactSensitiveValues(contents, forms)
+    .replace(/\b((?:proxy-)?authorization\s*[:=]\s*)[^\r\n"\\]+/gi, '$1[REDACTED]')
+    .replace(/\bbearer\s+[^\s"\\]+/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:github_pat_[A-Za-z0-9_]+|gh[pousr]_[A-Za-z0-9_]+|sk-[A-Za-z0-9_-]+)\b/g, '[REDACTED]');
+  await writeAuditFile(
+    dependencies,
+    path.join(prepared.directory, 'enclave-session.log'),
+    Buffer.from(redacted).subarray(0, 1024 * 1024),
+    prepared.identity,
+  );
+}
+
+export async function writeGuestOutputAudit(
+  directory: string,
+  dependencies: AuditDependencies,
+  stdoutCapture: BoundedOutputCapture,
+  stderrCapture: BoundedOutputCapture,
+): Promise<void> {
+  const { identity, directory: auditDirectory } = await prepareAuditDirectory(directory, dependencies);
+  await writeAuditFile(
+    dependencies,
+    path.join(auditDirectory, 'guest-stdout.raw.log'),
+    stdoutCapture.contents(),
+    identity,
+  );
+  await writeAuditFile(
+    dependencies,
+    path.join(auditDirectory, 'guest-stderr.raw.log'),
+    stderrCapture.contents(),
+    identity,
+  );
 }
 
 export async function collectCloudHypervisorDiagnostics(
@@ -167,7 +494,11 @@ export async function collectCloudHypervisorDiagnostics(
   context: CloudHypervisorDiagnosticsContext,
 ): Promise<void> {
   const { dependencies, paths, config } = context;
-  await dependencies.mkdir(directory, { recursive: true, mode: 0o700 });
+  const preparedAuditDirectory = context.debugArtifactProtectedRoot
+    ? await prepareRootOwnedDebugDirectory(directory, context.debugArtifactProtectedRoot, dependencies)
+    : await prepareAuditDirectory(directory, dependencies);
+  const identity = preparedAuditDirectory.identity;
+  directory = preparedAuditDirectory.directory;
   // Prefer the snapshot stop() takes *before* any shutdown attempt (see
   // the comment at the top of stop()): by the time collectDiagnostics()
   // runs via the beforeCleanup hook, the API socket is already
@@ -192,33 +523,45 @@ export async function collectCloudHypervisorDiagnostics(
       vmInfo = null;
     }
   }
-  const writeBounded = async (fileName: string, contents: Buffer): Promise<void> => {
+  const writeBounded = async (fileName: string, contents: string | Buffer): Promise<void> => {
     const destination = path.join(directory, fileName);
-    await dependencies.writeFile(destination, contents, { mode: 0o600 });
+    await writeAuditFile(dependencies, destination, contents, identity);
   };
   await writeBounded('launcher-stdout.log', context.stdoutCapture.contents());
   await writeBounded('launcher-stderr.log', context.stderrCapture.contents());
+  if (context.captureGuestRawOutput !== false) {
+    await writeBounded('guest-stdout.raw.log', context.guestStdoutCapture.contents());
+    await writeBounded('guest-stderr.raw.log', context.guestStderrCapture.contents());
+  }
   await copyBoundedDiagnostic(
     dependencies,
     paths.logPath,
     path.join(directory, CLOUD_HYPERVISOR_LOG_NAME),
+    identity,
   );
   await copyBoundedDiagnostic(
     dependencies,
     paths.serialLogPath,
     path.join(directory, CLOUD_HYPERVISOR_SERIAL_LOG_NAME),
+    identity,
   );
   for (const [index, device] of context.fsDevices.entries()) {
     await copyBoundedDiagnostic(
       dependencies,
       device.logPath,
       path.join(directory, `virtiofs-${index}-${device.export.tag}.log`),
+      identity,
+    );
+    await copyBoundedDiagnostic(
+      dependencies,
+      device.evidencePath,
+      path.join(directory, `virtiofs-${index}-${device.export.tag}-confinement.json`),
+      identity,
     );
   }
-  await dependencies.writeFile(
-    path.join(directory, 'network-plan.json'),
+  await writeBounded(
+    'network-plan.json',
     `${JSON.stringify(context.networkPlan ?? null, null, 2)}\n`,
-    { mode: 0o600 },
   );
   // Best-effort, read-only host-side network diagnostics (live nftables
   // ruleset + interface counters), captured only while the namespace
@@ -235,23 +578,20 @@ export async function collectCloudHypervisorDiagnostics(
       networkDiagnostics = `(capture failed: ${formatError(error)})`;
     }
   }
-  await dependencies.writeFile(
-    path.join(directory, 'network-diagnostics.txt'),
+  await writeBounded(
+    'network-diagnostics.txt',
     `${networkDiagnostics}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'counters.json'),
+  await writeBounded(
+    'counters.json',
     `${JSON.stringify(counters, null, 2)}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'vm-info.json'),
+  await writeBounded(
+    'vm-info.json',
     `${JSON.stringify(vmInfo, null, 2)}\n`,
-    { mode: 0o600 },
   );
-  await dependencies.writeFile(
-    path.join(directory, 'runtime.json'),
+  await writeBounded(
+    'runtime.json',
     `${JSON.stringify({
       runtime: 'cloud-hypervisor',
       version: CLOUD_HYPERVISOR_RELEASE_VERSION,
@@ -259,7 +599,11 @@ export async function collectCloudHypervisorDiagnostics(
       vcpuCount: config.vcpuCount,
       memoryMib: config.memoryMib,
       instanceStarted: context.instanceStarted,
+      guestConnection: context.guestConnection ?? null,
     }, null, 2)}\n`,
-    { mode: 0o600 },
+  );
+  await writeBounded(
+    'confinement.json',
+    `${JSON.stringify(context.confinementEvidence ?? null, null, 2)}\n`,
   );
 }

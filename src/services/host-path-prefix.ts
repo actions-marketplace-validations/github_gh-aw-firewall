@@ -80,6 +80,64 @@ interface HostPathPrefixOptions {
   translateAlreadyPrefixedPaths?: boolean;
 }
 
+/**
+ * Applies the same rewrite `translateBindMountHostPath` uses for a mount's
+ * host-side path, but to a bare absolute path rather than a full mount spec.
+ *
+ * Callers that need to compare a *pre-translation* path (such as `workDir` or
+ * `$HOME`) against a *post-translation* mount source — for example a sysroot
+ * filter deciding whether a volume was derived from `workDir` — must apply
+ * this first, or the comparison silently stops matching as soon as
+ * `--docker-host-path-prefix` is set. This is exported precisely so those
+ * comparisons cannot drift from the rewrite `applyHostPathPrefixToVolumes`
+ * actually performs.
+ *
+ * Deliberately does not special-case kernel virtual filesystems or `/etc`
+ * identity files — those only matter for concrete mount specs, never for the
+ * `workDir`/`$HOME` roots this is meant for.
+ */
+export function prefixHostPath(
+  hostPath: string,
+  dockerHostPathPrefix: string,
+  options: HostPathPrefixOptions = {},
+): string {
+  if (!hostPath.startsWith('/') || dockerHostPathPrefix === '/') {
+    return hostPath;
+  }
+
+  if (
+    !options.translateAlreadyPrefixedPaths
+    && (hostPath === dockerHostPathPrefix || hostPath.startsWith(`${dockerHostPathPrefix}/`))
+  ) {
+    return hostPath;
+  }
+
+  return hostPath === '/' ? dockerHostPathPrefix : `${dockerHostPathPrefix}${hostPath}`;
+}
+
+/**
+ * Returns where the contents of a bind-mount source directory are visible on
+ * the *runner's* filesystem once `--docker-host-path-prefix` has been applied.
+ *
+ * - No prefix, or a daemon-only prefix (`/host`, `/tmp/gh-aw`, ...): the
+ *   daemon sees runner path `X` at `<prefix>X`, so writes land at `X` on the
+ *   runner and the path is returned unchanged.
+ * - Shared prefix (`/tmp`, see `isSharedDockerHostPathPrefix`): both sides see
+ *   `/tmp` at the same path, so a source outside `/tmp` (for example a log
+ *   directory under `${RUNNER_TEMP}`) is rewritten to `/tmp<X>` and the daemon
+ *   writes there — which the runner also sees at `/tmp<X>`, not at `X`.
+ *
+ * Use this when a host-side consumer (artifact preservation, token-usage
+ * discovery) must read files a container wrote through a translated bind.
+ */
+export function resolveRunnerVisibleHostPath(
+  hostPath: string,
+  dockerHostPathPrefix: string | undefined,
+): string {
+  if (!isSharedDockerHostPathPrefix(dockerHostPathPrefix)) return hostPath;
+  return prefixHostPath(hostPath, normalizeDockerHostPathPrefix(dockerHostPathPrefix as string));
+}
+
 function translateBindMountHostPath(
   mount: string,
   dockerHostPathPrefix: string,
@@ -110,20 +168,7 @@ function translateBindMountHostPath(
     return mount;
   }
 
-  if (dockerHostPathPrefix === '/') {
-    return mount;
-  }
-
-  if (
-    !options.translateAlreadyPrefixedPaths
-    && (hostPath === dockerHostPathPrefix || hostPath.startsWith(`${dockerHostPathPrefix}/`))
-  ) {
-    return mount;
-  }
-
-  const translatedHostPath = hostPath === '/'
-    ? dockerHostPathPrefix
-    : `${dockerHostPathPrefix}${hostPath}`;
+  const translatedHostPath = prefixHostPath(hostPath, dockerHostPathPrefix, options);
 
   return mode ? `${translatedHostPath}:${containerPath}:${mode}` : `${translatedHostPath}:${containerPath}`;
 }

@@ -1,4 +1,5 @@
 import { mainActionFsMocks } from './main-action-fs-mock.test-utils';
+import { constants as fsConstants } from 'fs';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.mock('fs', () => require('./main-action-fs-mock.test-utils').mainActionFsMockFactory());
@@ -11,6 +12,7 @@ jest.mock('../docker-manager');
 jest.mock('../host-iptables');
 jest.mock('../cli-workflow');
 jest.mock('../redact-secrets');
+jest.mock('../resolved-config-artifact');
 jest.mock('../option-parsers');
 jest.mock('../dind-probe');
 jest.mock('../dind-bootstrap');
@@ -19,7 +21,15 @@ jest.mock('./signal-handler');
 jest.mock('./validate-options');
 jest.mock('../sbx-manager');
 jest.mock('../enclave/gateway');
+jest.mock('../enclave/startup-diagnostics');
 jest.mock('../enclave/github-gateway');
+jest.mock('../enclave/cloud-hypervisor-lifecycle');
+jest.mock('../enclave/docker-lifecycle');
+jest.mock('../enclave/dynamic-delegation');
+jest.mock('../enclave/manager', () => ({
+  ...jest.requireActual('../enclave/manager'),
+  prepareEnclaves: jest.fn(),
+}));
 jest.mock('../external-runtime-backend-resolver', () => {
   const actual = jest.requireActual('../external-runtime-backend-resolver');
   return {
@@ -33,6 +43,7 @@ import * as dockerManager from '../docker-manager';
 import * as hostIptables from '../host-iptables';
 import * as cliWorkflow from '../cli-workflow';
 import * as redactSecrets from '../redact-secrets';
+import { publishEarlyResolvedConfig } from '../resolved-config-artifact';
 import * as optionParsers from '../option-parsers';
 import * as dindProbe from '../dind-probe';
 import * as dindBootstrap from '../dind-bootstrap';
@@ -41,9 +52,24 @@ import * as signalHandler from './signal-handler';
 import * as validateOptions from './validate-options';
 import * as sbxManager from '../sbx-manager';
 import * as enclaveGateway from '../enclave/gateway';
+import * as enclaveManager from '../enclave/manager';
+import { captureEnclaveStartupDiagnostics } from '../enclave/startup-diagnostics';
 import * as enclaveGithubGateway from '../enclave/github-gateway';
+import * as enclaveHostLifecycle from '../enclave/cloud-hypervisor-lifecycle';
+import * as dockerHostLifecycle from '../enclave/docker-lifecycle';
+import * as dynamicDelegation from '../enclave/dynamic-delegation';
 import * as externalRuntimeResolver from '../external-runtime-backend-resolver';
 import { MAIN_ACTION_STUB_CONFIG, setupMainActionTestHarness } from './main-action.test-utils';
+import type { WrapperConfig } from '../types';
+import { CloudHypervisorUnsupportedHostError } from '../cloud-hypervisor/errors';
+import { RoutingFailureExitError } from '../routing/bootstrap';
+import { initializeEnclaveStartupProgress, updateEnclaveStartupProgress } from '../enclave/startup-progress';
+import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
+import {
+  ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV,
+  releaseStaticGithubExecutorCapability,
+} from '../enclave/static-github-handoff';
+import * as enclaveMountPolicy from '../enclave/mount-policy';
 
 const {
   mkdirSync: mockMkdirSync,
@@ -51,6 +77,10 @@ const {
   chmodSync: mockChmodSync,
   openSync: mockOpenSync,
   closeSync: mockCloseSync,
+  lstatSync: mockLstatSync,
+  fstatSync: mockFstatSync,
+  fchmodSync: mockFchmodSync,
+  fsyncSync: mockFsyncSync,
 } = mainActionFsMocks;
 
 const mockedLogger = logger as jest.Mocked<typeof logger>;
@@ -69,13 +99,26 @@ const mockedEnclaveGateway = enclaveGateway as jest.Mocked<typeof enclaveGateway
 const mockedEnclaveGithubGateway =
   enclaveGithubGateway as jest.Mocked<typeof enclaveGithubGateway>;
 const mockedExternalRuntimeResolver = externalRuntimeResolver as jest.Mocked<typeof externalRuntimeResolver>;
+const mockedEnclaveHostLifecycle = enclaveHostLifecycle as jest.Mocked<typeof enclaveHostLifecycle>;
+const mockedEnclaveManager = enclaveManager as jest.Mocked<typeof enclaveManager>;
 
 describe('createMainAction', () => {
+  const originalPlatform = process.platform;
   let processExitSpy: jest.SpyInstance;
   let consoleErrorSpy: jest.SpyInstance;
+  let effectiveUidSpy: jest.SpyInstance;
   let getOptionValueSource: jest.Mock;
 
+  beforeAll(() => {
+    Object.defineProperty(process, 'platform', { value: 'linux' });
+  });
+
+  afterAll(() => {
+    Object.defineProperty(process, 'platform', { value: originalPlatform });
+  });
+
   beforeEach(() => {
+    effectiveUidSpy = jest.spyOn(process, 'geteuid').mockReturnValue(0);
     const harness = setupMainActionTestHarness({
       mockedPreflight,
       mockedValidateOptions,
@@ -88,6 +131,14 @@ describe('createMainAction', () => {
       mockedCliWorkflow,
       mockedSbxManager,
     });
+    mockedEnclaveManager.prepareEnclaves.mockResolvedValue(undefined);
+    mockedDockerManager.runAgentCommand.mockResolvedValue({ exitCode: 0, blockedDomains: [] });
+    mockedRedactSecrets.deriveSensitiveEndpointForms.mockImplementation((domains?: string[]) =>
+      domains ?? []
+    );
+    mockedRedactSecrets.redactSensitiveValues.mockImplementation((value: string, values: string[]) =>
+      values.reduce((redacted, sensitive) => redacted.split(sensitive).join('[REDACTED]'), value)
+    );
     processExitSpy = harness.processExitSpy;
     consoleErrorSpy = harness.consoleErrorSpy;
     getOptionValueSource = harness.getOptionValueSource;
@@ -96,6 +147,7 @@ describe('createMainAction', () => {
   afterEach(() => {
     processExitSpy.mockRestore();
     consoleErrorSpy.mockRestore();
+    effectiveUidSpy.mockRestore();
   });
 
   describe('when args is empty', () => {
@@ -126,6 +178,12 @@ describe('createMainAction', () => {
         expect.anything(),
         expect.anything(),
       );
+      const persistedConfig = jest.mocked(publishEarlyResolvedConfig).mock.calls
+        .map((call) => call[0])
+        .find((contents) => contents.includes('"allowedDomains"'));
+      expect(persistedConfig).toBeDefined();
+      expect(persistedConfig).not.toContain('"containerRuntime": "cloud-hypervisor"');
+      expect(persistedConfig).not.toContain('"cloudHypervisor"');
     });
   });
 
@@ -148,6 +206,88 @@ describe('createMainAction', () => {
       expect(mockedValidateOptions.validateOptions).toHaveBeenCalledWith(
         expect.anything(),
         'echo $HOME'
+      );
+    });
+
+    describe('work directory selection', () => {
+      it('atomically creates a unique default work directory', async () => {
+        mockedValidateOptions.validateOptions
+          .mockReturnValueOnce({
+            ...MAIN_ACTION_STUB_CONFIG,
+            workDir: undefined,
+          } as unknown as WrapperConfig)
+          .mockReturnValueOnce({
+            ...MAIN_ACTION_STUB_CONFIG,
+            workDir: undefined,
+          } as unknown as WrapperConfig);
+        mainActionFsMocks.mkdtempSync
+          .mockReturnValueOnce('/synthetic/awf-first')
+          .mockReturnValueOnce('/synthetic/awf-second');
+        const action = createMainAction(getOptionValueSource);
+
+        await action(['echo first'], {});
+        await action(['echo second'], {});
+
+        expect(mainActionFsMocks.mkdtempSync).toHaveBeenNthCalledWith(
+          1,
+          expect.stringMatching(/awf-$/),
+        );
+        expect(mainActionFsMocks.mkdtempSync).toHaveBeenNthCalledWith(
+          2,
+          expect.stringMatching(/awf-$/),
+        );
+        expect(mockedCliWorkflow.runMainWorkflow).toHaveBeenNthCalledWith(
+          1,
+          expect.objectContaining({ workDir: '/synthetic/awf-first' }),
+          expect.anything(),
+          expect.anything(),
+        );
+        expect(mockedCliWorkflow.runMainWorkflow).toHaveBeenNthCalledWith(
+          2,
+          expect.objectContaining({ workDir: '/synthetic/awf-second' }),
+          expect.anything(),
+          expect.anything(),
+        );
+      });
+
+      it('preserves an explicit work directory', async () => {
+        mockedValidateOptions.validateOptions.mockReturnValue({
+          ...MAIN_ACTION_STUB_CONFIG,
+          workDir: '/synthetic/explicit-workdir',
+        } as unknown as WrapperConfig);
+        const action = createMainAction(getOptionValueSource);
+        await action(['echo explicit'], { workDir: '/synthetic/explicit-workdir' });
+
+        expect(mainActionFsMocks.mkdtempSync).not.toHaveBeenCalled();
+        expect(mockedValidateOptions.validateOptions).toHaveBeenCalledWith(
+          expect.objectContaining({ workDir: '/synthetic/explicit-workdir' }),
+          'echo explicit',
+        );
+      });
+
+      it.each(['probe', 'bootstrap'] as const)(
+        'cleans an auto-created work directory when %s setup fails',
+        async failurePoint => {
+          mockedValidateOptions.validateOptions.mockReturnValue({
+            ...MAIN_ACTION_STUB_CONFIG,
+            workDir: undefined,
+          } as unknown as WrapperConfig);
+          mainActionFsMocks.mkdtempSync.mockReturnValue('/synthetic/awf-setup-failure');
+          if (failurePoint === 'probe') {
+            mockedDindProbe.probeSplitFilesystem.mockRejectedValue(new Error('probe failed'));
+          } else {
+            mockedDindBootstrap.runDindBootstrap.mockRejectedValue(new Error('bootstrap failed'));
+          }
+
+          const action = createMainAction(getOptionValueSource);
+          await expect(action(['echo setup'], {})).rejects.toThrow('process.exit: 1');
+
+          const cleanupCalls = mockedDockerManager.cleanup.mock.calls;
+          expect(cleanupCalls[cleanupCalls.length - 1]?.slice(0, 2)).toEqual([
+            '/synthetic/awf-setup-failure',
+            false,
+          ]);
+        },
       );
     });
   });
@@ -232,6 +372,20 @@ describe('createMainAction', () => {
       expect(mockedDindBootstrap.runDindBootstrap).toHaveBeenCalledWith(MAIN_ACTION_STUB_CONFIG);
     });
 
+    it('checks retained debug artifacts before a primary run without enclaves', async () => {
+      const check = jest.spyOn(enclaveMountPolicy, 'assertPersistentDebugArtifactsIsolated')
+        .mockImplementation(() => undefined);
+      try {
+        const action = createMainAction(getOptionValueSource);
+        await action(['echo hi'], {});
+        expect(check).toHaveBeenCalledTimes(1);
+        expect(check.mock.calls[0][0].workDir).toBe(MAIN_ACTION_STUB_CONFIG.workDir);
+        expect(check.mock.calls[0][0].enclaves).toBeUndefined();
+      } finally {
+        check.mockRestore();
+      }
+    });
+
     it('skips probe and DinD bootstrap when dockerHostPathPrefix is already set', async () => {
       mockedValidateOptions.validateOptions.mockReturnValue({
         ...MAIN_ACTION_STUB_CONFIG,
@@ -243,6 +397,61 @@ describe('createMainAction', () => {
 
       expect(mockedDindProbe.probeSplitFilesystem).not.toHaveBeenCalled();
       expect(mockedDindBootstrap.runDindBootstrap).not.toHaveBeenCalled();
+    });
+
+    it('takes scoped GitHub capability custody before the Docker filesystem probe', async () => {
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        enclaves: normalizeEnclavesConfig([{
+          runtime: 'cloud-hypervisor',
+          agent: {
+            model: 'gpt-test',
+            tools: { github: { allowed: ['issue_read'], allowedRepos: ['octo/private'] } },
+          },
+          repos: [{ repo: 'octo/private', sensitivity: 'confidential' }],
+        }]),
+      } as WrapperConfig;
+      const envNames = [
+        ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV,
+        'AWF_ENCLAVE_GITHUB_MCP_AGENT_ID',
+        'AWF_ENCLAVE_MCP_GATEWAY_IDENTITY',
+      ];
+      const previousEnv = Object.fromEntries(envNames.map((name) => [name, process.env[name]]));
+      const agentId = 'a'.repeat(40);
+      const now = Date.now();
+      Object.assign(process.env, {
+        AWF_ENCLAVE_MCP_GATEWAY_IDENTITY: 'compiler-run-123',
+        AWF_ENCLAVE_GITHUB_MCP_AGENT_ID: agentId,
+        [ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV]: JSON.stringify({
+          version: 1,
+          gatewayIdentity: 'compiler-run-123',
+          executor: 'agent',
+          agentId,
+          bearer: 'scoped-executor-capability-for-cli-ordering-test',
+          issuedAt: now - 1000,
+          expiresAt: now + 300_000,
+          allowedTools: ['issue_read'],
+          allowedRepos: ['octo/private'],
+          minIntegrity: null,
+        }),
+      });
+      mockedValidateOptions.validateOptions.mockReturnValueOnce(config);
+      mockedDindProbe.probeSplitFilesystem.mockImplementationOnce(async () => {
+        expect(process.env[ENCLAVE_GITHUB_EXECUTOR_CAPABILITY_ENV]).toBeUndefined();
+        expect(process.env.AWF_ENCLAVE_GITHUB_MCP_AGENT_ID).toBeUndefined();
+        return { prefix: undefined, splitDetected: false, inconclusive: false };
+      });
+
+      try {
+        await createMainAction(getOptionValueSource)(['echo hi'], {});
+      } finally {
+        releaseStaticGithubExecutorCapability(config);
+        for (const [name, value] of Object.entries(previousEnv)) {
+          if (value === undefined) delete process.env[name];
+          else process.env[name] = value;
+        }
+      }
+      expect(mockedDindProbe.probeSplitFilesystem).toHaveBeenCalledTimes(1);
     });
 
     it('auto-applies detected DinD prefix and logs info', async () => {
@@ -328,6 +537,29 @@ describe('createMainAction', () => {
       expect(processExitSpy).toHaveBeenCalledWith(42);
     });
 
+    it('emits an enclave exit marker before cleanup for a non-zero agent result', async () => {
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        enclaves: normalizeEnclavesConfig([
+          { script: {}, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        ]),
+      } as unknown as import('../types').WrapperConfig;
+      mockedValidateOptions.validateOptions.mockReturnValue(config);
+      mockedDockerManager.runAgentCommand.mockResolvedValue({ exitCode: 42, blockedDomains: [] });
+      mockedCliWorkflow.runMainWorkflow.mockImplementation(async (_config, dependencies) => {
+        const result = await dependencies.runAgentCommand('/tmp/awf-test', ['github.com']);
+        return result.exitCode;
+      });
+      const write = jest.spyOn(process.stderr, 'write').mockImplementation(() => true);
+      const action = createMainAction(getOptionValueSource);
+
+      await action(['echo hi'], {});
+
+      expect(write).toHaveBeenCalledWith(expect.stringMatching(
+        /^AWF_STARTUP_EXIT .*"exitCode":42.*"cleanup":"pending"/,
+      ));
+    });
+
     describe('sbx runtime wiring', () => {
       it('passes configured mounts/workdir/environment into sbx create/exec', async () => {
         const sbxConfig = {
@@ -397,9 +629,155 @@ describe('createMainAction', () => {
         MAIN_ACTION_STUB_CONFIG.imageTag,
         MAIN_ACTION_STUB_CONFIG.agentImage,
         MAIN_ACTION_STUB_CONFIG.images,
+        MAIN_ACTION_STUB_CONFIG.tokenLogDir,
       );
       expect(mockedHostIptables.cleanupHostIptables).not.toHaveBeenCalled();
       expect(processExitSpy).toHaveBeenCalledWith(1);
+    });
+
+    it('writes a startup diagnostic marker for fatal workflow errors', async () => {
+      mockedCliWorkflow.runMainWorkflow.mockRejectedValue(new Error('Refusing to use symlink as bind mountpoint: /usr/local/bin/npm'));
+      const action = createMainAction(getOptionValueSource);
+
+      await expect(action(['echo hi'], {})).rejects.toThrow('process.exit: 1');
+
+      expect(mockMkdirSync).toHaveBeenCalledWith('/synthetic/awf-test/squid-logs', {
+        recursive: true,
+        mode: 0o700,
+      });
+      expect(mockWriteFileSync).toHaveBeenCalledWith(
+        42,
+        expect.stringContaining('Refusing to use symlink as bind mountpoint: /usr/local/bin/npm'),
+      );
+      expect(mockFchmodSync).toHaveBeenNthCalledWith(1, 42, 0o600);
+      expect(mockFsyncSync).toHaveBeenCalledWith(42);
+      expect(mockFchmodSync).toHaveBeenNthCalledWith(2, 42, 0o644);
+    });
+
+    it('does not classify agent command failures as startup failures', async () => {
+      mockedCliWorkflow.runMainWorkflow.mockImplementationOnce(async (_config, dependencies) => {
+        await dependencies.runAgentCommand('/tmp/awf-test', ['github.com']);
+        throw new Error('agent command failed');
+      });
+      const action = createMainAction(getOptionValueSource);
+
+      await expect(action(['echo hi'], {})).rejects.toThrow('process.exit: 1');
+
+      expect(mockWriteFileSync).not.toHaveBeenCalledWith(
+        42,
+        expect.stringContaining('"phase": "startup"'),
+      );
+    });
+
+    it('redacts startup diagnostic error messages', async () => {
+      mockedRedactSecrets.redactSecrets.mockReturnValue('[REDACTED]');
+
+      testHelpers.writeStartupFailureDiagnostic(
+        { ...MAIN_ACTION_STUB_CONFIG, proxyLogsDir: '/tmp/custom-logs' } as import('../types').WrapperConfig,
+        new Error('secret-bearing failure'),
+      );
+
+      expect(mockWriteFileSync).toHaveBeenCalledWith(
+        42,
+        expect.stringContaining('[REDACTED]'),
+      );
+    });
+
+    it('refuses symlinked log directories and diagnostic files', () => {
+      (mockLstatSync as jest.Mock).mockReturnValueOnce({ isSymbolicLink: () => true });
+      testHelpers.writeStartupFailureDiagnostic(MAIN_ACTION_STUB_CONFIG, new Error('startup failed'));
+      expect(mockOpenSync).not.toHaveBeenCalled();
+      expect(mockWriteFileSync).not.toHaveBeenCalled();
+
+      (mockLstatSync as jest.Mock).mockReturnValue({ isSymbolicLink: () => false });
+      const symlinkError = Object.assign(new Error('ELOOP'), { code: 'ELOOP' });
+      mockOpenSync.mockImplementationOnce(() => { throw symlinkError; });
+      testHelpers.writeStartupFailureDiagnostic(MAIN_ACTION_STUB_CONFIG, new Error('startup failed'));
+      expect(mockWriteFileSync).not.toHaveBeenCalled();
+    });
+
+    it('refuses non-regular diagnostic files', () => {
+      (mockFstatSync as jest.Mock).mockReturnValueOnce({ isFile: () => false });
+      testHelpers.writeStartupFailureDiagnostic(MAIN_ACTION_STUB_CONFIG, new Error('startup failed'));
+      expect(mockWriteFileSync).not.toHaveBeenCalled();
+      expect(mockCloseSync).toHaveBeenCalledWith(42);
+    });
+
+    it.each([
+      { nlink: 2, uid: process.getuid?.() },
+      { nlink: 1, uid: (process.getuid?.() ?? 0) + 1 },
+    ])('does not truncate a hardlinked or foreign-owned diagnostic', (stat) => {
+      (mockFstatSync as jest.Mock).mockReturnValueOnce({ isFile: () => true, ...stat });
+      testHelpers.writeStartupFailureDiagnostic(MAIN_ACTION_STUB_CONFIG, new Error('startup failed'));
+      expect(mainActionFsMocks.ftruncateSync).not.toHaveBeenCalled();
+      expect(mockWriteFileSync).not.toHaveBeenCalled();
+      expect(mockOpenSync.mock.calls[0][1] & fsConstants.O_TRUNC).toBe(0);
+      expect(mockCloseSync).toHaveBeenCalledWith(42);
+    });
+
+    it('persists bounded safe progress alongside fatal errors without copying their fields', () => {
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        enclaves: normalizeEnclavesConfig([
+          { script: {}, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        ]),
+      };
+      initializeEnclaveStartupProgress(config);
+      updateEnclaveStartupProgress(config, {
+        stage: 'initialize', readiness: 'attempted', attempts: 1,
+        code: 'dns-not-found',
+      });
+      const sentinel = 'PRIVATE_TOKEN_PATH_IP_HOSTNAME_repository-sentinel';
+      testHelpers.writeStartupFailureDiagnostic(config, Object.assign(
+        new Error(sentinel.repeat(1024)), { code: sentinel, cause: sentinel, headers: sentinel },
+      ));
+      const record = JSON.parse(mockWriteFileSync.mock.calls[0][1]);
+      expect(record.enclaveStartup).toEqual({
+        schemaVersion: 1, perspective: 'awf-host', stage: 'initialize',
+        readiness: 'attempted', code: 'dns-not-found', attempts: 1, httpStatus: null,
+      });
+      expect(record.phase).toBe('startup');
+      expect(JSON.stringify(record)).not.toContain(sentinel);
+      expect(Buffer.byteLength(mockWriteFileSync.mock.calls[0][1])).toBeLessThan(16 * 1024);
+    });
+
+    it('publishes progress before host bootstrap and preserves a not-attempted fatal record', async () => {
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        enclaves: normalizeEnclavesConfig([
+          { script: {}, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        ]),
+      };
+      mockedValidateOptions.validateOptions.mockReturnValueOnce(config);
+      mockedDindProbe.probeSplitFilesystem.mockRejectedValueOnce(new Error('bootstrap failed'));
+      await expect(createMainAction(getOptionValueSource)(['echo hi'], {}))
+        .rejects.toThrow('process.exit: 1');
+      const records = mockWriteFileSync.mock.calls
+        .filter((call) => call[0] === 42)
+        .map((call) => JSON.parse(call[1]));
+      expect(records[0]).toMatchObject({
+        phase: 'enclave-startup-progress', message: 'Enclave startup in progress',
+        enclaveStartup: { stage: 'host-bootstrap', readiness: 'not-attempted', attempts: 0 },
+      });
+      expect(records[1]).toMatchObject({
+        phase: 'startup', enclaveStartup: { stage: 'host-bootstrap', readiness: 'not-attempted' },
+      });
+    });
+
+    it('redacts secret-derived endpoint forms from startup diagnostics', () => {
+      mockedRedactSecrets.deriveSensitiveEndpointForms.mockReturnValue([
+        'sensitive.example.com:443',
+        'sensitive.example.com',
+      ]);
+      testHelpers.writeStartupFailureDiagnostic({
+        ...MAIN_ACTION_STUB_CONFIG,
+        sensitiveAllowedDomains: ['https://sensitive.example.com'],
+      } as import('../types').WrapperConfig, new Error('failed to reach sensitive.example.com:443'));
+
+      expect(mockWriteFileSync).toHaveBeenCalledWith(
+        42,
+        expect.not.stringContaining('sensitive.example.com'),
+      );
     });
 
     describe('when external runtime resolution fails', () => {
@@ -422,6 +800,52 @@ describe('createMainAction', () => {
     });
 
     describe('when external runtime preflight fails', () => {
+      it('falls back to the Docker backend when Cloud Hypervisor host support is missing', async () => {
+        const fallbackConfig = {
+          ...MAIN_ACTION_STUB_CONFIG,
+          containerRuntime: 'cloud-hypervisor',
+          cloudHypervisor: { previewEnabled: true },
+        } as WrapperConfig;
+        const backend = {
+          runtime: 'cloud-hypervisor',
+          preflight: jest.fn().mockRejectedValue(
+            new CloudHypervisorUnsupportedHostError(
+              'Cloud Hypervisor requires readable and writable /dev/kvm: ENOENT',
+            ),
+          ),
+          start: jest.fn(),
+          exec: jest.fn(),
+          collectDiagnostics: jest.fn(),
+          stop: jest.fn(),
+        };
+        mockedValidateOptions.validateOptions.mockReturnValueOnce(fallbackConfig);
+        mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockReturnValueOnce(backend);
+        mockedCliWorkflow.runMainWorkflow.mockImplementationOnce(
+          async (_config, _dependencies, lifecycle) => {
+            lifecycle.onContainersStarted?.();
+            await lifecycle.performCleanup();
+            return 0;
+          },
+        );
+
+        const action = createMainAction(getOptionValueSource);
+        await action(['echo hi'], {});
+
+        expect(mockedLogger.warn).toHaveBeenCalledWith(
+          expect.stringContaining('falling back to the standard Docker backend'),
+        );
+        expect(mockedCliWorkflow.runMainWorkflow).toHaveBeenCalledWith(
+          expect.objectContaining({
+            containerRuntime: undefined,
+            cloudHypervisor: undefined,
+          }),
+          expect.objectContaining({
+            startContainers: mockedDockerManager.startContainers,
+          }),
+          expect.anything(),
+        );
+      });
+
       it('aborts before entering the main workflow', async () => {
         mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockImplementationOnce(() => ({
           runtime: 'sbx',
@@ -439,6 +863,100 @@ describe('createMainAction', () => {
         expect(mockedLogger.error).toHaveBeenCalledWith(
           'Fatal error:',
           expect.objectContaining({ message: 'preflight failed' }),
+        );
+      });
+
+      it('does not fall back across workload backends when enclaves are enabled', async () => {
+        const selectedConfig = {
+          ...MAIN_ACTION_STUB_CONFIG,
+          containerRuntime: 'cloud-hypervisor',
+          cloudHypervisor: { previewEnabled: true },
+          enclaves: { enabled: true },
+        } as WrapperConfig;
+        const failure = new CloudHypervisorUnsupportedHostError('KVM unavailable');
+        mockedValidateOptions.validateOptions.mockReturnValueOnce(selectedConfig);
+        mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockReturnValueOnce({
+          runtime: 'cloud-hypervisor',
+          preflight: jest.fn().mockRejectedValue(failure),
+          start: jest.fn(), exec: jest.fn(), collectDiagnostics: jest.fn(), stop: jest.fn(),
+        });
+        const action = createMainAction(getOptionValueSource);
+        await expect(action(['echo hi'], {})).rejects.toThrow('process.exit: 1');
+        expect(selectedConfig.containerRuntime).toBe('cloud-hypervisor');
+        expect(selectedConfig.cloudHypervisor).toBeDefined();
+        expect(mockedCliWorkflow.runMainWorkflow).not.toHaveBeenCalled();
+        expect(mockedLogger.warn).not.toHaveBeenCalledWith(
+          expect.stringContaining('falling back to the standard Docker backend'),
+        );
+        const startupDiagnostic = mockWriteFileSync.mock.calls
+          .map((call) => String(call[1]))
+          .filter((contents) => contents.includes('"enclave-runtime/primary-runtime"'))
+          .slice(-1)[0];
+        expect(startupDiagnostic).toContain('"enclave-runtime/primary-runtime":["failed","unknown"]');
+      });
+
+      it('does not hand successful primary preflight evidence to a different config', async () => {
+        const selectedConfig = {
+          ...MAIN_ACTION_STUB_CONFIG,
+          containerRuntime: 'cloud-hypervisor',
+          cloudHypervisor: { previewEnabled: true },
+          enclaves: { enabled: true },
+        } as WrapperConfig;
+        const preflight = jest.fn().mockResolvedValue(undefined);
+        mockedValidateOptions.validateOptions.mockReturnValueOnce(selectedConfig);
+        mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockReturnValueOnce({
+          runtime: 'cloud-hypervisor',
+          preflight,
+          start: jest.fn(), exec: jest.fn(), collectDiagnostics: jest.fn(), stop: jest.fn(),
+        });
+        mockedCliWorkflow.runMainWorkflow.mockImplementationOnce(async (_config, dependencies) => {
+          await expect(dependencies.prepareEnclaves!({
+            ...selectedConfig,
+          })).rejects.toThrow('Cloud Hypervisor primary runtime preflight evidence is unavailable for this run');
+          return 0;
+        });
+
+        const action = createMainAction(getOptionValueSource);
+        await action(['echo hi'], {});
+
+        expect(preflight).toHaveBeenCalledTimes(1);
+      });
+
+      it('hands successful primary preflight evidence to enclave preparation for the selected config', async () => {
+        const selectedConfig = {
+          ...MAIN_ACTION_STUB_CONFIG,
+          containerRuntime: 'cloud-hypervisor',
+          cloudHypervisor: { previewEnabled: true },
+          enclaves: { enabled: true },
+        } as WrapperConfig;
+        const preflight = jest.fn().mockResolvedValue(undefined);
+        mockedValidateOptions.validateOptions.mockReturnValueOnce(selectedConfig);
+        mockedExternalRuntimeResolver.resolveExternalRuntimeBackend.mockReturnValueOnce({
+          runtime: 'cloud-hypervisor',
+          preflight,
+          start: jest.fn(), exec: jest.fn(), collectDiagnostics: jest.fn(), stop: jest.fn(),
+        });
+        mockedEnclaveManager.prepareEnclaves.mockImplementation(async (candidate, dependencies) => {
+          await dependencies?.assertCloudHypervisorPrimaryPreflight?.(candidate);
+        });
+        mockedCliWorkflow.runMainWorkflow.mockImplementationOnce(async (_config, dependencies) => {
+          expect(preflight).toHaveBeenCalledTimes(1);
+          await dependencies.prepareEnclaves!(selectedConfig);
+          return 0;
+        });
+
+        try {
+          await createMainAction(getOptionValueSource)(['echo hi'], {});
+        } finally {
+          mockedEnclaveManager.prepareEnclaves.mockResolvedValue(undefined);
+        }
+
+        expect(preflight).toHaveBeenCalledTimes(1);
+        expect(mockedEnclaveManager.prepareEnclaves).toHaveBeenCalledWith(
+          selectedConfig,
+          expect.objectContaining({
+            assertCloudHypervisorPrimaryPreflight: expect.any(Function),
+          }),
         );
       });
     });
@@ -494,6 +1012,61 @@ describe('createMainAction', () => {
   });
 
   describe('external runtime cleanup failures', () => {
+    it.each([false, true])('drains Docker host executions before broker/network teardown (keep=%s)', async (keepContainers) => {
+      const cleanup = testHelpers.buildCleanupFn(
+        { ...MAIN_ACTION_STUB_CONFIG, keepContainers }, () => true, () => false,
+      );
+      await cleanup('SIGTERM');
+      expect(jest.mocked(dockerHostLifecycle.closeDockerEnclaveAdmissions).mock.invocationCallOrder[0])
+        .toBeLessThan(jest.mocked(dockerHostLifecycle.stopDockerEnclaveLifecycle).mock.invocationCallOrder[0]);
+      expect(jest.mocked(dockerHostLifecycle.stopDockerEnclaveLifecycle).mock.invocationCallOrder[0])
+        .toBeLessThan(mockedEnclaveGateway.shutdownEnclaveGateway.mock.invocationCallOrder[0]);
+      expect(jest.mocked(dockerHostLifecycle.stopDockerEnclaveLifecycle).mock.invocationCallOrder[0])
+        .toBeLessThan(mockedDockerManager.stopContainers.mock.invocationCallOrder[0]);
+    });
+
+    it('retains seeds and infrastructure when Docker host cleanup is uncertain', async () => {
+      jest.mocked(dockerHostLifecycle.stopDockerEnclaveLifecycle)
+        .mockRejectedValueOnce(new Error('Docker recovery pending'));
+      const cleanup = testHelpers.buildCleanupFn(
+        { ...MAIN_ACTION_STUB_CONFIG }, () => true, () => false,
+      );
+      await expect(cleanup()).rejects.toThrow('Docker recovery pending');
+      expect(mockedEnclaveGateway.shutdownEnclaveGateway).not.toHaveBeenCalled();
+      expect(mockedDockerManager.stopContainers).not.toHaveBeenCalled();
+      expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+    });
+
+    it('sweeps delegated identities after Docker drain failure and preserves the Docker error', async () => {
+      const dockerError = new Error('Docker recovery pending');
+      jest.mocked(dockerHostLifecycle.isDockerEnclaveSelected).mockReturnValueOnce(true);
+      jest.mocked(dockerHostLifecycle.stopDockerEnclaveLifecycle).mockRejectedValueOnce(dockerError);
+      const cleanup = testHelpers.buildCleanupFn(
+        { ...MAIN_ACTION_STUB_CONFIG }, () => false, () => false,
+      );
+      await expect(cleanup()).rejects.toBe(dockerError);
+      expect(dynamicDelegation.stopEnclaveDynamicDelegation).toHaveBeenCalledTimes(1);
+      expect(mockedEnclaveGateway.shutdownEnclaveGateway).not.toHaveBeenCalled();
+      expect(mockedDockerManager.stopContainers).not.toHaveBeenCalled();
+      expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+    });
+
+    it.each([false, true])('drains Docker before delegation shutdown and preserves failed revocation (containers started=%s)', async (containersStarted) => {
+      jest.mocked(dockerHostLifecycle.isDockerEnclaveSelected).mockReturnValueOnce(true);
+      jest.mocked(dynamicDelegation.stopEnclaveDynamicDelegation)
+        .mockRejectedValueOnce(new Error('delegation revocation pending'));
+      const cleanup = testHelpers.buildCleanupFn(
+        { ...MAIN_ACTION_STUB_CONFIG }, () => containersStarted, () => false,
+      );
+      await expect(cleanup()).rejects.toThrow('delegation revocation pending');
+      expect(jest.mocked(dockerHostLifecycle.stopDockerEnclaveLifecycle).mock.invocationCallOrder[0])
+        .toBeLessThan(jest.mocked(dynamicDelegation.stopEnclaveDynamicDelegation).mock.invocationCallOrder[0]);
+      expect(mockedEnclaveGateway.shutdownEnclaveGateway).not.toHaveBeenCalled();
+      expect(mockedEnclaveGithubGateway.disconnectEnclaveGithubGateway).not.toHaveBeenCalled();
+      expect(mockedDockerManager.stopContainers).not.toHaveBeenCalled();
+      expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+    });
+
     it('continues generic cleanup and then rethrows the runtime failure', async () => {
       const runtimeError = new Error('External runtime teardown failed');
       const backend = {
@@ -522,6 +1095,96 @@ describe('createMainAction', () => {
         'External runtime cleanup failed; continuing with infrastructure teardown.',
         runtimeError,
       );
+    });
+
+    describe('Cloud Hypervisor enclave cleanup ordering', () => {
+      it('preserves supporting infrastructure and private state when primary VM cleanup fails', async () => {
+        const failure = new Error('primary VMM cleanup uncertain');
+        const backend = {
+          runtime: 'cloud-hypervisor',
+          preflight: jest.fn(), start: jest.fn(), exec: jest.fn(),
+          collectDiagnostics: jest.fn(), stop: jest.fn().mockRejectedValue(failure),
+        };
+        const cleanup = testHelpers.buildCleanupFn(
+          {
+            ...MAIN_ACTION_STUB_CONFIG, containerRuntime: 'cloud-hypervisor',
+            enclaves: { enabled: true },
+          } as WrapperConfig,
+          () => true, () => false, backend,
+        );
+        await expect(cleanup('SIGTERM')).rejects.toBe(failure);
+        expect(mockedEnclaveHostLifecycle.closeCloudHypervisorEnclaveAdmissions)
+          .toHaveBeenCalled();
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle)
+          .toHaveBeenCalled();
+        expect(mockedEnclaveGithubGateway.disconnectEnclaveGithubGateway).not.toHaveBeenCalled();
+        expect(mockedDockerManager.stopContainers).not.toHaveBeenCalled();
+        expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+      });
+
+      it('closes host admissions before broker shutdown on the shared cleanup path', async () => {
+        const cleanup = testHelpers.buildCleanupFn(
+          { ...MAIN_ACTION_STUB_CONFIG }, () => true, () => false,
+        );
+        await cleanup('SIGTERM');
+        expect(mockedEnclaveHostLifecycle.closeCloudHypervisorEnclaveAdmissions)
+          .toHaveBeenCalledWith(expect.objectContaining({ workDir: MAIN_ACTION_STUB_CONFIG.workDir }));
+        expect(mockedEnclaveHostLifecycle.closeCloudHypervisorEnclaveAdmissions.mock.invocationCallOrder[0])
+          .toBeLessThan(mockedEnclaveGateway.shutdownEnclaveGateway.mock.invocationCallOrder[0]);
+        expect(mockedEnclaveGateway.shutdownEnclaveGateway.mock.invocationCallOrder[0])
+          .toBeLessThan(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle.mock.invocationCallOrder[0]);
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle.mock.invocationCallOrder[0])
+          .toBeLessThan(mockedDockerManager.stopContainers.mock.invocationCallOrder[0]);
+      });
+
+      it('closes the host backend before propagating container teardown failure', async () => {
+        const failure = new Error('compose down failed');
+        mockedDockerManager.stopContainers.mockRejectedValueOnce(failure);
+        const cleanup = testHelpers.buildCleanupFn(
+          { ...MAIN_ACTION_STUB_CONFIG }, () => true, () => false,
+        );
+        await expect(cleanup()).rejects.toBe(failure);
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle).toHaveBeenCalledTimes(1);
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle.mock.invocationCallOrder[0])
+          .toBeLessThan(mockedDockerManager.stopContainers.mock.invocationCallOrder[0]);
+        expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+      });
+
+      it('closes the host backend when broker draining fails, before disconnecting its data plane', async () => {
+        mockedEnclaveGateway.shutdownEnclaveGateway.mockRejectedValueOnce(new Error('broker shutdown failed'));
+        const cleanup = testHelpers.buildCleanupFn(
+          { ...MAIN_ACTION_STUB_CONFIG }, () => true, () => false,
+        );
+        await cleanup();
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle).toHaveBeenCalledTimes(1);
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle.mock.invocationCallOrder[0])
+          .toBeLessThan(mockedEnclaveGithubGateway.disconnectEnclaveGithubGateway.mock.invocationCallOrder[0]);
+      });
+
+      it('closes the host backend before propagating audit-preservation failure', async () => {
+        const failure = new Error('audit preservation failed');
+        mockedDockerManager.preserveIptablesAudit.mockImplementationOnce(() => { throw failure; });
+        const cleanup = testHelpers.buildCleanupFn(
+          { ...MAIN_ACTION_STUB_CONFIG }, () => true, () => false,
+        );
+        await expect(cleanup()).rejects.toBe(failure);
+        expect(mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle).toHaveBeenCalledTimes(1);
+        expect(mockedDockerManager.stopContainers).not.toHaveBeenCalled();
+        expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+      });
+
+      it('does not delete generic work state when host backend cleanup is uncertain', async () => {
+        mockedEnclaveHostLifecycle.stopCloudHypervisorEnclaveLifecycle
+          .mockRejectedValueOnce(new Error('host cleanup uncertain'));
+        const cleanup = testHelpers.buildCleanupFn(
+          { ...MAIN_ACTION_STUB_CONFIG, enclaves: { enabled: true } } as WrapperConfig,
+          () => true, () => false,
+        );
+        await expect(cleanup()).rejects.toThrow('host cleanup uncertain');
+        expect(mockedDockerManager.stopContainers).not.toHaveBeenCalled();
+        expect(mockedEnclaveGithubGateway.disconnectEnclaveGithubGateway).not.toHaveBeenCalled();
+        expect(mockedDockerManager.cleanup).not.toHaveBeenCalled();
+      });
     });
   });
 
@@ -633,6 +1296,54 @@ describe('createMainAction', () => {
   });
 
   describe('fatal error cleanup after containers started', () => {
+    it('preserves the routing exit code through an infrastructure readiness error', async () => {
+      const routingFailure = new RoutingFailureExitError('Model routing selection timed out');
+      const readinessFailure = Object.assign(
+        new Error('Model routing selection timed out'),
+        { cause: routingFailure },
+      );
+      mockedCliWorkflow.runMainWorkflow.mockRejectedValueOnce(readinessFailure);
+
+      const action = createMainAction(getOptionValueSource);
+      await action(['echo hi'], {});
+
+      expect(processExitSpy).toHaveBeenCalledWith(78);
+    });
+
+    it('does not repeat cleanup and keeps exit 78 when routing fails after the workflow cleaned up', async () => {
+      mockedCliWorkflow.runMainWorkflow.mockImplementation(
+        async (_config, _deps, callbacks) => {
+          callbacks.onContainersStarted?.();
+          await callbacks.performCleanup();
+          throw new RoutingFailureExitError('Model routing failed (provider_unavailable): Routed execution failed');
+        }
+      );
+      mockedDockerManager.stopContainers.mockResolvedValue(undefined);
+      mockedDockerManager.cleanup.mockResolvedValue(undefined);
+
+      const action = createMainAction(getOptionValueSource);
+      await action(['echo hi'], {});
+
+      expect(mockedDockerManager.stopContainers).toHaveBeenCalledTimes(1);
+      expect(processExitSpy).toHaveBeenCalledWith(78);
+    });
+
+    it('keeps exit 78 when cleanup after a routing failure throws', async () => {
+      mockedCliWorkflow.runMainWorkflow.mockImplementation(
+        async (_config, _deps, callbacks) => {
+          callbacks.onContainersStarted?.();
+          throw new RoutingFailureExitError('Model routing selection timed out');
+        }
+      );
+      mockedDockerManager.stopContainers.mockRejectedValueOnce(new Error('spawn docker ENOENT'));
+
+      const action = createMainAction(getOptionValueSource);
+      await action(['echo hi'], {});
+
+      expect(mockedLogger.warn).toHaveBeenCalledWith('Cleanup after a fatal error failed.', expect.any(Error));
+      expect(processExitSpy).toHaveBeenCalledWith(78);
+    });
+
     it('stops containers during cleanup when workflow fails after startup callbacks', async () => {
       mockedCliWorkflow.runMainWorkflow.mockImplementation(
         async (_config, _deps, callbacks) => {
@@ -693,7 +1404,7 @@ describe('createMainAction', () => {
 
     afterEach(() => jest.restoreAllMocks());
 
-    it('writes awf-resolved-config.json to audit dir when set', async () => {
+    it('publishes independently of the shared audit directory', async () => {
       const configWithAudit = {
         ...MAIN_ACTION_STUB_CONFIG,
         auditDir: '/tmp/awf-audit',
@@ -704,18 +1415,9 @@ describe('createMainAction', () => {
       const action = createMainAction(getOptionValueSource);
       await action(['echo hi'], {});
 
-      expect(mockMkdirSync).toHaveBeenCalledWith('/tmp/awf-audit', { recursive: true, mode: 0o700 });
-      expect(mockOpenSync).toHaveBeenCalledWith('/tmp/awf-audit/awf-resolved-config.json', 'wx', 0o600);
-      expect(mockWriteFileSync).toHaveBeenCalledWith(
-        42,
-        expect.stringContaining('"allowedDomains"'),
-      );
-      // Verify secret key names are excluded from the artifact
-      const written = mockWriteFileSync.mock.calls.find(
-        (c) => typeof c[0] === 'number'
-      );
-      expect(written).toBeDefined();
-      const writtenJson = String(written![1]);
+      expect(publishEarlyResolvedConfig).toHaveBeenCalledWith(expect.stringContaining('"allowedDomains"'));
+      const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+      const writtenJson = calls[calls.length - 1][0];
       expect(writtenJson).not.toContain('ApiKey');
       expect(writtenJson).not.toContain('GithubToken');
     });
@@ -738,29 +1440,20 @@ describe('createMainAction', () => {
       const action = createMainAction(getOptionValueSource);
       await action(['echo hi'], {});
 
-      const written = mockWriteFileSync.mock.calls.find(
-        (c) => typeof c[0] === 'number'
-      );
-      expect(written).toBeDefined();
-      const writtenJson = String(written![1]);
+      const calls = jest.mocked(publishEarlyResolvedConfig).mock.calls;
+      const writtenJson = calls[calls.length - 1][0];
       expect(writtenJson).not.toContain(secretValue);
       expect(writtenJson).toContain('[REDACTED]');
     });
 
-    it('falls back to workDir/audit when auditDir is not set', async () => {
+    it('does not place the early artifact beneath a private workDir', async () => {
       mockedValidateOptions.validateOptions.mockReturnValue(MAIN_ACTION_STUB_CONFIG);
       const action = createMainAction(getOptionValueSource);
       await action(['echo hi'], {});
 
-      expect(mockOpenSync).toHaveBeenCalledWith(
-        '/tmp/awf-test/audit/awf-resolved-config.json',
-        'wx',
-        0o600,
-      );
-      expect(mockWriteFileSync).toHaveBeenCalledWith(
-        42,
-        expect.any(String),
-      );
+      expect(publishEarlyResolvedConfig).toHaveBeenCalledWith(expect.any(String));
+      expect(mockOpenSync).not.toHaveBeenCalledWith(
+        '/synthetic/awf-test/audit/awf-resolved-config.json', 'wx', 0o600);
     });
   });
 
@@ -813,15 +1506,15 @@ describe('createMainAction', () => {
       expect(redacted.additionalEnv).toBe('raw-env-string');
     });
 
-    it('persistConfigAuditArtifact logs debug when writing the artifact fails', () => {
-      mockMkdirSync.mockImplementationOnce(() => {
+    it('persistConfigAuditArtifact warns when publishing the artifact fails', () => {
+      jest.mocked(publishEarlyResolvedConfig).mockImplementationOnce(() => {
         throw new Error('write failed');
       });
 
       testHelpers.persistConfigAuditArtifact(MAIN_ACTION_STUB_CONFIG, { foo: 'bar' });
 
-      expect(mockedLogger.debug).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to write resolved config artifact:')
+      expect(mockedLogger.warn).toHaveBeenCalledWith(
+        'Failed to publish resolved config artifact:', expect.any(Error),
       );
     });
 
@@ -836,21 +1529,13 @@ describe('createMainAction', () => {
 
       expect(mockedDockerManager.preserveIptablesAudit).toHaveBeenCalledWith(
         MAIN_ACTION_STUB_CONFIG.workDir,
-        MAIN_ACTION_STUB_CONFIG.auditDir,
-        false
+        MAIN_ACTION_STUB_CONFIG.auditDir
       );
       expect(mockedEnclaveGateway.shutdownEnclaveGateway).toHaveBeenCalledWith(
         MAIN_ACTION_STUB_CONFIG
       );
-      expect(mockedEnclaveGithubGateway.shutdownEnclaveGithubCliProxy)
-        .toHaveBeenCalledWith(MAIN_ACTION_STUB_CONFIG);
       expect(
         mockedEnclaveGateway.shutdownEnclaveGateway.mock.invocationCallOrder[0]
-      ).toBeLessThan(
-        mockedEnclaveGithubGateway.shutdownEnclaveGithubCliProxy.mock.invocationCallOrder[0]
-      );
-      expect(
-        mockedEnclaveGithubGateway.shutdownEnclaveGithubCliProxy.mock.invocationCallOrder[0]
       ).toBeLessThan(
         mockedDockerManager.preserveIptablesAudit.mock.invocationCallOrder[0]
       );
@@ -868,18 +1553,61 @@ describe('createMainAction', () => {
       );
       expect(mockedDockerManager.stopContainers).toHaveBeenCalledWith(
         MAIN_ACTION_STUB_CONFIG.workDir,
-        MAIN_ACTION_STUB_CONFIG.keepContainers
+        MAIN_ACTION_STUB_CONFIG.keepContainers,
+        { routerLogsDir: undefined },
       );
       expect(mockedHostIptables.cleanupHostIptables).toHaveBeenCalled();
       expect(mockedDockerManager.cleanup).toHaveBeenCalled();
     });
 
-    it('preserves audits after an enclave drain failure', async () => {
-      mockedEnclaveGateway.shutdownEnclaveGateway.mockRejectedValueOnce(
-        new Error('drain failed')
+    it.each([
+      ['the work directory', undefined, '/synthetic/awf-test/router-logs'],
+      ['proxyLogsDir', '/tmp/custom-logs', '/tmp/custom-logs/router-logs'],
+    ])('buildCleanupFn saves the router logs under %s when the run has a router', async (
+      _where, proxyLogsDir, routerLogsDir,
+    ) => {
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        proxyLogsDir,
+        experimentalModelRouting: true,
+        modelRouting: { objective: { goal: 'cost', mode: 'balanced' }, task: { conversationFile: '/c.json' } },
+        modelRoutingBootstrap: { root: '/synthetic/routing' },
+      } as unknown as import('../types').WrapperConfig;
+
+      await testHelpers.buildCleanupFn(config, () => true, () => true)();
+
+      expect(mockedDockerManager.stopContainers).toHaveBeenCalledWith(
+        config.workDir, false, { routerLogsDir },
       );
+    });
+
+    it('buildCleanupFn tears down only once across repeated calls', async () => {
       const performCleanup = testHelpers.buildCleanupFn(
         MAIN_ACTION_STUB_CONFIG,
+        () => true,
+        () => true,
+      );
+
+      await Promise.all([performCleanup(), performCleanup('SIGTERM')]);
+      await performCleanup();
+
+      expect(mockedDockerManager.stopContainers).toHaveBeenCalledTimes(1);
+      expect(mockedHostIptables.cleanupHostIptables).toHaveBeenCalledTimes(1);
+      expect(mockedDockerManager.cleanup).toHaveBeenCalledTimes(1);
+    });
+
+    it('preserves audits after an enclave drain failure', async () => {
+      mockedEnclaveGateway.shutdownEnclaveGateway.mockRejectedValueOnce(
+        new Error('drain failed: Bearer SECRET repository seed')
+      );
+      const config = {
+        ...MAIN_ACTION_STUB_CONFIG,
+        enclaves: normalizeEnclavesConfig([
+          { script: {}, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        ]),
+      };
+      const performCleanup = testHelpers.buildCleanupFn(
+        config,
         () => true,
         () => false,
       );
@@ -888,8 +1616,13 @@ describe('createMainAction', () => {
 
       expect(mockedLogger.warn).toHaveBeenCalledWith(
         'Enclave gateway did not complete graceful shutdown; preserved enclave audit is marked incomplete.',
-        expect.any(Error)
       );
+      expect(JSON.stringify(mockedLogger.warn.mock.calls)).not.toContain('SECRET');
+      expect(captureEnclaveStartupDiagnostics).toHaveBeenCalledWith(
+        config.workDir, config.proxyLogsDir, 'shutdown-failure',
+      );
+      expect(jest.mocked(captureEnclaveStartupDiagnostics).mock.invocationCallOrder[0])
+        .toBeLessThan(mockedDockerManager.stopContainers.mock.invocationCallOrder[0]);
       expect(mockedDockerManager.preserveIptablesAudit).toHaveBeenCalled();
       expect(mockedDockerManager.stopContainers).toHaveBeenCalled();
     });
@@ -920,11 +1653,17 @@ describe('createMainAction', () => {
       expect(mockedLogger.warn).toHaveBeenCalledWith(
         'One or more protected enclave audit artifacts could not be preserved.'
       );
-      expect(mockWriteFileSync).toHaveBeenCalledWith(
+      expect(mockOpenSync).toHaveBeenCalledWith(
         expect.stringContaining('enclave-audit-incomplete.txt'),
-        expect.stringContaining('protected audit preservation'),
-        { mode: 0o644 },
+        expect.any(Number),
+        0o600,
       );
+      expect(mockWriteFileSync).toHaveBeenCalledWith(
+        42,
+        expect.stringContaining('protected audit preservation'),
+        { encoding: 'utf8' },
+      );
+      expect(mockFchmodSync).toHaveBeenLastCalledWith(42, 0o644);
     });
   });
 });

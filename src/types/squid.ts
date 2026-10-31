@@ -4,6 +4,12 @@
 
 import type { UpstreamProxyConfig } from './upstream-proxy';
 
+export interface OtlpEndpoint {
+  hostname: string;
+  port: number;
+  protocol: 'http' | 'https';
+}
+
 /**
  * Configuration for the Squid proxy server
  * 
@@ -154,6 +160,9 @@ export interface SquidConfig {
    */
   apiProxyPorts?: number[];
 
+  /** Exact custom-port upstreams reachable only from the trusted API proxy. */
+  apiProxyUpstreams?: Array<{ hostname: string; port: number }>;
+
   /**
    * IP address of the credential-isolated CLI proxy sidecar.
    *
@@ -179,4 +188,18 @@ export interface SquidConfig {
    * external `dns_nameservers` cannot resolve them.
    */
   topologyPeers?: string[];
+
+  /**
+   * Exact OTLP collector host/port/protocol tuples. Unlike ordinary domains,
+   * these do not expand to subdomains.
+   */
+  otlpEndpoints?: OtlpEndpoint[];
+
+  /**
+   * Effective `awf-net` subnet in effect for this run (rebased when
+   * `--network-subnet` / `network.subnet` relocates the network away from the
+   * fixed policy default). Recorded in the policy manifest so log analysis can
+   * classify denied in-subnet IPs as AWF-internal rather than external.
+   */
+  networkSubnet?: string;
 }

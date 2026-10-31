@@ -13,16 +13,46 @@ function buildWithDefaults(overrides: Partial<Parameters<typeof buildConfigSecti
   });
 }
 
+function parseSecondsDirective(section: string, directive: string): number {
+  const directiveLine = section.split('\n').find(line => line.startsWith(`${directive} `));
+  const value = directiveLine?.split(/\s+/)[1];
+  if (!value) {
+    throw new Error(`Missing ${directive} directive`);
+  }
+  return Number(value);
+}
+
+function canReachFallbackResolver(options: {
+  dnsRetransmitIntervalSeconds: number;
+  dnsTimeoutSeconds: number;
+  resolverOutcomes: ('stall' | 'success')[];
+}): boolean {
+  const { dnsRetransmitIntervalSeconds, dnsTimeoutSeconds, resolverOutcomes } = options;
+  let elapsedSeconds = 0;
+  for (const resolverOutcome of resolverOutcomes) {
+    if (elapsedSeconds >= dnsTimeoutSeconds) {
+      return false;
+    }
+    if (resolverOutcome === 'success') {
+      return true;
+    }
+    elapsedSeconds += dnsRetransmitIntervalSeconds;
+  }
+  return false;
+}
+
 describe('buildConfigSections', () => {
   describe('portConfig', () => {
-    it('emits http_port with the configured port', () => {
-      const { portConfig } = buildWithDefaults({ port: 3128 });
-      expect(portConfig).toContain('http_port 3128');
+    it('uses the guard-only SSL Bump listener by default', () => {
+      const { portConfig, sslBumpSection } = buildWithDefaults({ port: 3128 });
+      expect(portConfig).toBe('');
+      expect(sslBumpSection).toContain('http_port 3128 ssl-bump');
+      expect(sslBumpSection).toContain('generate-host-certificates=off');
     });
 
-    it('emits IPv6 port entry', () => {
-      const { portConfig } = buildWithDefaults({ port: 3128 });
-      expect(portConfig).toContain('http_port [::]:3128');
+    it('emits an IPv6 guard-only listener', () => {
+      const { sslBumpSection } = buildWithDefaults({ port: 3128 });
+      expect(sslBumpSection).toContain('http_port [::]:3128 ssl-bump');
     });
 
     it('returns empty portConfig when sslBump is enabled with caFiles and sslDbPath', () => {
@@ -36,14 +66,16 @@ describe('buildConfigSections', () => {
   });
 
   describe('sslBumpSection', () => {
-    it('is empty when sslBump is not enabled', () => {
+    it('enforces TLS SNI when full SSL Bump is not enabled', () => {
       const { sslBumpSection } = buildWithDefaults();
-      expect(sslBumpSection).toBe('');
+      expect(sslBumpSection).toContain('TLS SNI allowlist enforcement');
+      expect(sslBumpSection).toContain('ssl_bump peek tls_sni_guard_step1');
+      expect(sslBumpSection).toContain('ssl_bump terminate tls_sni_guard_step2');
     });
 
-    it('is empty when sslBump enabled but caFiles missing', () => {
+    it('falls back to guard-only enforcement when full SSL Bump files are missing', () => {
       const { sslBumpSection } = buildWithDefaults({ sslBump: true });
-      expect(sslBumpSection).toBe('');
+      expect(sslBumpSection).toContain('TLS SNI allowlist enforcement');
     });
 
     it('generates sslBump config when sslBump, caFiles, and sslDbPath are all provided', () => {
@@ -90,6 +122,88 @@ describe('buildConfigSections', () => {
         sslDbPath: '/tmp/ssl_db',
       });
       expect(sslBumpUrlAccessSection).toBe('');
+    });
+
+    it('allows both unrestricted and HTTPS-only domains as TLS SNI', () => {
+      const { sslBumpSection } = buildWithDefaults({
+        domainsByProto: {
+          http: ['plain-http.example.com'],
+          https: ['secure.example.com'],
+          both: ['github.com'],
+        },
+      });
+      expect(sslBumpSection).toContain(
+        'acl tls_sni_guard_allowed ssl::server_name --client-requested .github.com'
+      );
+      expect(sslBumpSection).toContain(
+        'acl tls_sni_guard_allowed ssl::server_name --client-requested .secure.example.com'
+      );
+      expect(sslBumpSection).not.toContain('.plain-http.example.com');
+    });
+
+    it('generates SNI regex ACLs for HTTPS-capable wildcard patterns', () => {
+      const { sslBumpSection } = buildWithDefaults({
+        patternsByProto: {
+          http: [],
+          https: [{ regex: '^secure-[a-z]+\\.example\\.com$', protocol: 'https', original: 'secure-*.example.com' }],
+          both: [{ regex: '^[a-z]+\\.github\\.com$', protocol: 'both', original: '*.github.com' }],
+        },
+      });
+      expect(sslBumpSection).toContain(
+        'acl tls_sni_guard_allowed_regex ssl::server_name_regex --client-requested -i ^secure-[a-z]+\\.example\\.com$'
+      );
+      expect(sslBumpSection).toContain(
+        'ssl_bump splice tls_sni_guard_step2 tls_sni_guard_allowed_regex'
+      );
+    });
+
+    it('splices trusted API and CLI proxy sources before inspecting SNI', () => {
+      const { sslBumpSection } = buildWithDefaults({
+        apiProxyIp: '172.30.0.30',
+        cliProxyIp: '172.30.0.50',
+      });
+      const apiSplice = sslBumpSection.indexOf('ssl_bump splice tls_sni_guard_api_proxy');
+      const cliSplice = sslBumpSection.indexOf('ssl_bump splice tls_sni_guard_cli_proxy');
+      const peek = sslBumpSection.indexOf('ssl_bump peek tls_sni_guard_step1');
+      expect(apiSplice).toBeGreaterThan(-1);
+      expect(cliSplice).toBeGreaterThan(-1);
+      expect(apiSplice).toBeLessThan(peek);
+      expect(cliSplice).toBeLessThan(peek);
+    });
+
+    it('terminates blocked SNI before allowing a parent domain', () => {
+      const { sslBumpSection } = buildWithDefaults({
+        domains: ['example.com'],
+        blockedDomains: ['blocked.example.com'],
+        domainsByProto: {
+          http: [],
+          https: [],
+          both: ['example.com'],
+        },
+      });
+      const blocked = sslBumpSection.indexOf(
+        'ssl_bump terminate tls_sni_guard_step2 tls_sni_guard_blocked'
+      );
+      const allowed = sslBumpSection.indexOf(
+        'ssl_bump splice tls_sni_guard_step2 tls_sni_guard_allowed'
+      );
+      expect(blocked).toBeGreaterThan(-1);
+      expect(blocked).toBeLessThan(allowed);
+    });
+
+    it('preserves explicitly allowlisted HTTPS IP destinations', () => {
+      const { sslBumpSection } = buildWithDefaults({
+        domains: ['192.0.2.10'],
+        domainsByProto: {
+          http: [],
+          https: [],
+          both: ['192.0.2.10'],
+        },
+      });
+      expect(sslBumpSection).toContain('acl tls_sni_guard_allowed_ip dst 192.0.2.10');
+      expect(sslBumpSection).not.toContain(
+        'ssl::server_name --client-requested .192.0.2.10'
+      );
     });
   });
 
@@ -186,7 +300,31 @@ describe('buildConfigSections', () => {
 
     it('uses custom DNS servers when provided', () => {
       const { dnsSection } = buildWithDefaults({ dnsServers: ['1.1.1.1', '1.0.0.1'] });
-expect(dnsSection).toBe('dns_nameservers 1.1.1.1 1.0.0.1');
+      expect(dnsSection).toMatch(/^dns_nameservers 1\.1\.1\.1 1\.0\.0\.1$/m);
+    });
+
+    it('shrinks negative_dns_ttl to avoid caching a single transient SERVFAIL', () => {
+      const { dnsSection } = buildWithDefaults();
+      expect(dnsSection).toMatch(/^negative_dns_ttl 1 seconds$/m);
+    });
+
+    it('uses a short retransmit interval with enough total timeout for resolver fallback', () => {
+      const { dnsSection } = buildWithDefaults();
+      expect(dnsSection).toMatch(/^dns_retransmit_interval 1 seconds$/m);
+      expect(dnsSection).toMatch(/^dns_timeout 10 seconds$/m);
+    });
+
+    it('keeps DNS timeout above retransmit interval so fallback nameservers are queried', () => {
+      const { dnsSection } = buildWithDefaults();
+      const dnsRetransmitIntervalSeconds = parseSecondsDirective(dnsSection, 'dns_retransmit_interval');
+      const dnsTimeoutSeconds = parseSecondsDirective(dnsSection, 'dns_timeout');
+
+      expect(dnsRetransmitIntervalSeconds).toBeLessThan(dnsTimeoutSeconds);
+      expect(canReachFallbackResolver({
+        dnsRetransmitIntervalSeconds,
+        dnsTimeoutSeconds,
+        resolverOutcomes: ['stall', 'success'],
+      })).toBe(true);
     });
   });
 

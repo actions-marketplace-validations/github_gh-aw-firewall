@@ -1,57 +1,9 @@
 import { buildConfig } from './build-config';
 import { mapAwfFileConfigToCliOptions } from '../config-mapper';
 import { testHelpers as apiProxyEnvTestHelpers } from '../services/api-proxy-env-config';
+import { buildMinimalBuildConfigInput } from '../test-helpers/build-config.test-utils';
 
-/** Minimal valid inputs for buildConfig */
-function makeInputs(overrides: Partial<Parameters<typeof buildConfig>[0]> = {}): Parameters<typeof buildConfig>[0] {
-  return {
-    options: {
-      keepContainers: false,
-      tty: false,
-      workDir: '/tmp/awf-test',
-      buildLocal: false,
-      skipPull: false,
-      imageRegistry: 'ghcr.io/github/gh-aw-firewall',
-      imageTag: 'latest',
-      envAll: false,
-      enableHostAccess: false,
-      sslBump: false,
-      enableDind: false,
-      enableDlp: false,
-      enableApiProxy: false,
-      anthropicAutoCache: false,
-      diagnosticLogs: false,
-    },
-    agentCommand: 'echo hello',
-    logLevel: 'info',
-    allowedDomains: ['github.com'],
-    blockedDomains: [],
-    localhostDetected: false,
-    additionalEnv: {},
-    volumeMounts: undefined,
-    upstreamProxy: undefined,
-    dnsServers: ['8.8.8.8'],
-    dnsOverHttps: undefined,
-    allowedUrls: undefined,
-    memoryLimit: undefined,
-    pidsLimit: undefined,
-    agentImage: undefined,
-    modelAliases: undefined,
-    allowedModels: undefined,
-    disallowedModels: undefined,
-    maxEffectiveTokens: undefined,
-    maxAiCredits: undefined,
-    effectiveTokenModelMultipliers: undefined,
-    effectiveTokenDefaultModelMultiplier: undefined,
-    maxRuns: undefined,
-    maxPermissionDenied: undefined,
-    maxCacheMisses: undefined,
-    resolvedCopilotApiTarget: undefined,
-    resolvedCopilotApiBasePath: undefined,
-    dockerHostPathPrefix: undefined,
-    ...overrides,
-  };
-}
+const makeInputs = buildMinimalBuildConfigInput;
 
 const ENV_KEYS = [
   'OPENAI_API_KEY',
@@ -78,6 +30,44 @@ const ENV_KEYS = [
 ] as const;
 
 describe('buildConfig', () => {
+  it('inherits the primary backend while retaining its original CLI selection', () => {
+    const config = buildConfig(makeInputs({
+      options: {
+        ...makeInputs().options,
+        containerRuntime: 'cloud-hypervisor',
+        enclaves: [
+          { script: {}, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        ],
+      },
+    }));
+    expect(config.containerRuntime).toBe('cloud-hypervisor');
+    expect(config.enclaves?.executors.script.runtime).toBe('cloud-hypervisor');
+  });
+
+  it('rejects a mixed-backend configuration during assembly', () => {
+    expect(() => buildConfig(makeInputs({
+      options: {
+        ...makeInputs().options,
+        enclaves: [
+          { script: {}, runtime: 'cloud-hypervisor', repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        ],
+      },
+    }))).toThrow(/primary backend "docker"/);
+  });
+
+  it('maps protected command output CLI options into the runtime config', () => {
+    const config = buildConfig(makeInputs({
+      options: {
+        ...makeInputs().options,
+        captureCommandOutput: '/var/tmp/awf-output',
+        captureCommandOutputMaxBytes: '1024',
+      },
+    }));
+
+    expect(config.commandOutputCaptureDir).toBe('/var/tmp/awf-output');
+    expect(config.commandOutputCaptureMaxBytes).toBe(1024);
+  });
+
   let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>>;
 
   beforeEach(() => {
@@ -126,10 +116,30 @@ describe('buildConfig', () => {
           },
         };
         const defaultPricing = { input: 3, output: 15, cachedInput: 0.3 };
+        const modelPricingCatalog = {
+          schemaVersion: 1 as const,
+          unit: 'USD_PER_1M_TOKENS' as const,
+          catalogId: 'github/gh-aw/model-pricing',
+          version: 'sha256:test-catalog',
+          providers: {
+            anthropic: {
+              models: {
+                'custom-model': {
+                  input: 3,
+                  output: 15,
+                  cachedInput: 0.3,
+                  cacheWrite: null,
+                  reasoning: 15,
+                },
+              },
+            },
+          },
+        };
         const options = mapAwfFileConfigToCliOptions({
           apiProxy: {
             providers,
             defaultAiCreditsPricing: defaultPricing,
+            modelPricingCatalog,
           },
         });
         const config = buildConfig(makeInputs({ options: { ...makeInputs().options, ...options } }));
@@ -137,6 +147,7 @@ describe('buildConfig', () => {
 
         expect(JSON.parse(env.AWF_API_PROXY_PROVIDERS)).toEqual(providers);
         expect(JSON.parse(env.AWF_DEFAULT_AI_CREDITS_PRICING)).toEqual(defaultPricing);
+        expect(JSON.parse(env.AWF_MODEL_PRICING_CATALOG)).toEqual(modelPricingCatalog);
       });
     });
 
@@ -150,6 +161,20 @@ describe('buildConfig', () => {
         options: { ...makeInputs().options, apiProxyCaCert: '/tmp/upstream-ca.crt' },
       }));
       expect(config.apiProxyCaCert).toBe('/tmp/upstream-ca.crt');
+    });
+
+    it('should pass through task-level model routing', () => {
+      const modelRouting = {
+        objective: { goal: 'cost' as const, mode: 'auto' as const },
+        task: { conversationFile: '/tmp/gh-aw/conversation.json' },
+      };
+      const config = buildConfig(makeInputs({
+        options: { ...makeInputs().options, experimentalModelRouting: true, modelRouting },
+      }));
+
+      expect(config.modelRouting).toEqual(modelRouting);
+      expect(config.experimentalModelRouting).toBe(true);
+      expect(buildConfig(makeInputs()).experimentalModelRouting).toBeUndefined();
     });
 
     it('should set logLevel from inputs', () => {

@@ -3,13 +3,146 @@
 package main
 
 import (
+	"encoding/base64"
+	"fmt"
 	"net"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"syscall"
 	"testing"
+	"time"
 )
+
+func TestStartValidatesCWDForEnclaveAndPrimaryRoles(t *testing.T) {
+	workspace := t.TempDir()
+	seed := t.TempDir()
+	nonDirectory := filepath.Join(seed, "file")
+	if err := os.WriteFile(nonDirectory, nil, 0600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		name   string
+		config bootConfig
+		cwd    string
+		want   string
+	}{
+		{"networked-agent-root", bootConfig{EnclaveRole: "agent"}, "/", "command not found in PATH:"},
+		{"networked-agent-seed", bootConfig{EnclaveRole: "agent"}, seed, "command not found in PATH:"},
+		{"script-root", bootConfig{EnclaveRole: "script", NoNetwork: true}, "/", "command not found in PATH:"},
+		{"legacy-no-network-root", bootConfig{NoNetwork: true}, "/", "command not found in PATH:"},
+		{"primary-workspace", bootConfig{WorkspaceMount: workspace}, workspace, "command not found in PATH:"},
+		{"primary-root-denied", bootConfig{WorkspaceMount: workspace}, "/", "cwd must remain under the workspace mount"},
+		{"primary-outside-denied", bootConfig{WorkspaceMount: workspace}, seed, "cwd must remain under the workspace mount"},
+		{"agent-relative-denied", bootConfig{EnclaveRole: "agent"}, ".", "cwd must be an absolute path"},
+		{"agent-file-denied", bootConfig{EnclaveRole: "agent"}, nonDirectory, "cwd is not a directory"},
+		{"agent-missing-denied", bootConfig{EnclaveRole: "agent"}, filepath.Join(seed, "missing"), "resolve cwd:"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := session{config: test.config}
+			err := s.start(Frame{
+				Argv: []string{"awf-test-missing-command"},
+				Env:  map[string]string{"PATH": t.TempDir()},
+				Cwd:  test.cwd,
+				UID:  65534,
+				GID:  65534,
+			})
+			if err == nil || !strings.HasPrefix(err.Error(), test.want) {
+				t.Fatalf("start returned %v, want prefix %q", err, test.want)
+			}
+			if s.active != nil {
+				t.Fatal("validation test unexpectedly started a process")
+			}
+		})
+	}
+}
+
+func TestIPCommandRequiresExecutableFromFixedPaths(t *testing.T) {
+	root := t.TempDir()
+	missing := filepath.Join(root, "missing")
+	directory := filepath.Join(root, "directory")
+	nonExecutable := filepath.Join(root, "non-executable")
+	executable := filepath.Join(root, "ip")
+	if err := os.Mkdir(directory, 0755); err != nil {
+		t.Fatal(err)
+	}
+	for file, mode := range map[string]os.FileMode{nonExecutable: 0644, executable: 0755} {
+		if err := os.WriteFile(file, []byte("#!/bin/sh\nexit 0\n"), mode); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("PATH", root)
+	if _, err := findIPCommand([]string{missing, directory, nonExecutable}); err == nil {
+		t.Fatal("accepted a missing, directory, non-executable or ambient PATH candidate")
+	}
+	got, err := findIPCommand([]string{missing, directory, nonExecutable, executable})
+	if err != nil || got != executable {
+		t.Fatalf("executable fixed path: got %q, %v", got, err)
+	}
+}
+
+func TestWorkspaceLessNoNetworkSupervisorBootReachesVsock(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "seed")
+	originalMount := mountFilesystem
+	defer func() { mountFilesystem = originalMount }()
+	mounted := false
+	mountFilesystem = func(source, destination, fstype string, flags uintptr, data string) error {
+		if source != "seed" || destination != target || fstype != "virtiofs" || flags&syscall.MS_RDONLY == 0 {
+			t.Fatalf("unexpected guest mount: %q %q %q %#x", source, destination, fstype, flags)
+		}
+		mounted = true
+		return nil
+	}
+	cmdline := fmt.Sprintf("awf.network-mode=none awf.vsock-port=1024 awf.virtiofs=seed:%s:ro",
+		base64.RawURLEncoding.EncodeToString([]byte(target)))
+	socketPath := filepath.Join(t.TempDir(), "supervisor.sock")
+	socket, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen on test socket: %v", err)
+	}
+	defer socket.Close()
+	file, err := socket.(*net.UnixListener).File()
+	if err != nil {
+		t.Fatalf("obtain test listener: %v", err)
+	}
+	defer file.Close()
+	done := make(chan error, 1)
+	go func() {
+		done <- runSupervisorWithCmdline(cmdline, func(port uint32) (*vsockListener, error) {
+			if port != 1024 || !mounted {
+				return nil, fmt.Errorf("listener started before guest mount or with wrong port: %d, mounted=%t", port, mounted)
+			}
+			return &vsockListener{fd: int(file.Fd())}, nil
+		})
+	}()
+	connection, err := net.Dial("unix", socketPath)
+	if err != nil {
+		t.Fatalf("connect to booted supervisor: %v", err)
+	}
+	if err := connection.SetReadDeadline(time.Now().Add(2 * time.Second)); err != nil {
+		t.Fatalf("set deadline: %v", err)
+	}
+	ready, err := ReadFrame(connection)
+	if err != nil {
+		t.Fatalf("read booted supervisor ready frame: %v", err)
+	}
+	if ready.Type != "ready" || ready.Version != ProtocolVersion {
+		t.Fatalf("unexpected supervisor readiness: %#v", ready)
+	}
+	connection.Close()
+	if err := syscall.Shutdown(int(file.Fd()), syscall.SHUT_RDWR); err != nil {
+		t.Fatalf("stop test listener: %v", err)
+	}
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("supervisor unexpectedly exited cleanly without shutdown")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("supervisor did not stop after closing test listener")
+	}
+}
 
 func TestResolveCommandUsesRequestPath(t *testing.T) {
 	directory := t.TempDir()

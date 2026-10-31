@@ -8,6 +8,23 @@ const lockPath = path.join(workflowsDir, 'self-hosted-runner-doctor.lock.yml');
 const portableAgentPath = path.resolve(__dirname, '../../.github/agents/self-hosted-runner-doctor.md');
 
 describe('self-hosted runner doctor workflow config', () => {
+  it('documents A29 token-usage discovery and the remaining gh-aw parser gap', () => {
+    const source = fs.readFileSync(sourcePath, 'utf-8');
+    const shared = fs.readFileSync(sharedPath, 'utf-8');
+
+    expect(shared).toContain('| A29 | On arc-dind, post-run consumers cannot find');
+    expect(shared).toContain('**Fixed in AWF v0.28.31 (PR github/gh-aw-firewall#9357');
+    expect(shared).toContain('is rewritten to `/tmp<dir>`');
+    expect(shared).toContain('pre-creates the rewritten api-proxy log dir (mode 0777)');
+    for (const content of [shared, source]) {
+      expect(content).toContain('`token-usage.jsonl` not found / missing `gh-aw.aic` or `gen_ai.usage.*` telemetry on arc-dind');
+      expect(content).toContain('A29 / github/gh-aw-firewall#9352 — gh-aw `parse_token_usage.cjs` must consume `AWF_TOKEN_USAGE_LOG`');
+      expect(content).toContain('ls -l "${AWF_TOKEN_USAGE_LOG:-/dev/null}"');
+    }
+    expect(source).toContain('check `AWF_TOKEN_USAGE_LOG` first');
+    expect(source).toContain('Do not hardcode `/tmp/gh-aw/...` or print the file contents');
+  });
+
   it('defines a community-facing slash command workflow with the shared failure-mode import', () => {
     const source = fs.readFileSync(sourcePath, 'utf-8');
     const shared = fs.readFileSync(sharedPath, 'utf-8');
@@ -22,6 +39,46 @@ describe('self-hosted runner doctor workflow config', () => {
     expect(shared).toContain('| A10 | `Docker socket not found` plus `Invalid container ID format: arc-...` |');
   });
 
+  it('documents B35 and D16 in the shared catalog and diagnostic playbook', () => {
+    const source = fs.readFileSync(sourcePath, 'utf-8');
+    const shared = fs.readFileSync(sharedPath, 'utf-8');
+
+    expect(shared).toContain('| B35 | After a workflow using `tools.cache-memory` completes inside AWF');
+    expect(shared).toContain('**Fixed in AWF (PR github/gh-aw-firewall#9029, merged 2026-09-26; closes github/gh-aw-firewall#9028):**');
+    expect(shared).toContain('`relax_gh_aw_shared_permissions()`');
+    expect(shared).toContain('B35 (UID-remapped agent left shared `/tmp/gh-aw` paths unwritable by the host runner; fixed in github/gh-aw-firewall#9029)');
+    expect(shared).not.toContain('UNVERIFIED');
+    expect(shared).not.toContain('## Provisional remediation tracking');
+    expect(shared).toContain('github/gh-aw#63472, github/gh-aw-firewall#9028, github/gh-aw-firewall#9029');
+    expect(shared).toContain('| D16 | `--container-runtime nvx` or `cloud-hypervisor` intermittently aborts');
+    expect(shared).toContain('github/gh-aw-firewall#9012, github/gh-aw-firewall#9016, github/gh-aw-firewall#9017');
+    expect(source).toContain('→ B35 (UID-remapped agent leaves shared `/tmp/gh-aw` paths unwritable by the host runner; fixed in github/gh-aw-firewall#9029)');
+    expect(source).toContain('→ D16 (false positive from benign VMM thread churn during TOCTOU re-verification; fixed in github/gh-aw-firewall#9016/#9017)');
+    expect(source).toContain('B35 / github/gh-aw-firewall#9028, github/gh-aw-firewall#9029 — ');
+    expect(source).toContain('**Fixed in AWF (PR github/gh-aw-firewall#9029, merged 2026-09-26):**');
+    expect(source).not.toContain('Pending remediation status snapshot');
+    expect(source).toContain('D16 / github/gh-aw-firewall#9012, github/gh-aw-firewall#9016, github/gh-aw-firewall#9017');
+  });
+
+  it('documents B36 setup-uv paths under RUNNER_TEMP across doctor sources', () => {
+    const source = fs.readFileSync(sourcePath, 'utf-8');
+    const shared = fs.readFileSync(sharedPath, 'utf-8');
+    const portableAgent = fs.readFileSync(portableAgentPath, 'utf-8');
+
+    expect(shared).toContain('| B36 | The first `uv` command fails with `Permission denied` under `UV_CACHE_DIR` or `UV_PYTHON_INSTALL_DIR`');
+    expect(shared).toContain('github/gh-aw-firewall#9701, github/gh-aw-firewall#9705');
+    expect(shared).toContain('`UV_CACHE_DIR` defaults to `$HOME/.cache/uv`');
+    expect(shared).toContain('`UV_PYTHON_INSTALL_DIR` to `$HOME/.local/share/uv/python`');
+    expect(source).toContain('→ B36 (setup-uv paths under unmounted `$RUNNER_TEMP`; fixed in github/gh-aw-firewall#9705)');
+    expect(source).toContain('For `uv` permission errors under `UV_CACHE_DIR` or `UV_PYTHON_INSTALL_DIR`');
+    expect(source).toContain('outside the `gh-aw` subtree (B36)');
+    expect(portableAgent).toContain('| B36 | With `runtimes: uv` and `--env-all`');
+    expect(portableAgent).toContain('github/gh-aw-firewall#9701, github/gh-aw-firewall#9705');
+    expect(portableAgent).toContain('For `uv` permission errors under `UV_CACHE_DIR` or `UV_PYTHON_INSTALL_DIR`');
+    expect(portableAgent).toContain('| `uv` `Permission denied` with `UV_CACHE_DIR` or `UV_PYTHON_INSTALL_DIR`');
+    expect(portableAgent).toContain('`UV_PYTHON_INSTALL_DIR` to `$HOME/.local/share/uv/python`');
+  });
+
   it('compiles the trigger, safe outputs, and knowledge-base references into the lock workflow', () => {
     const lock = fs.readFileSync(lockPath, 'utf-8');
 
@@ -30,7 +87,8 @@ describe('self-hosted runner doctor workflow config', () => {
     expect(lock).toContain('pull-requests: read');
     expect(lock).toContain('🩺 Runner Doctor');
     expect(lock).toContain('shared/self-hosted-failure-modes.md');
-    expect(lock).toMatch(/github\/gh-aw(?:-actions\/|\/actions\/)setup@(?:[a-f0-9]{40}|v\d+\.\d+\.\d+)/);
+    expect(lock).toContain('{{#runtime-import .github/workflows/shared/self-hosted-failure-modes.md}}');
+    expect(lock).toMatch(/github\/gh-aw(?:-actions\/|\/actions\/)setup@[a-f0-9]{40}/);
   });
 
   it('keeps the shared catalog, workflow playbook, and portable agent aligned for new failure modes', () => {
@@ -65,9 +123,30 @@ describe('self-hosted runner doctor workflow config', () => {
       expect(content).toContain('The non-zero exit code comes from `runAgentCommand()` before cleanup; cleanup warnings do not override it.');
       expect(content).toContain('| `[WARN] Rootless artifact permission repair failed ... (exit 1)` with little/no stderr detail, plus cleanup warnings around chroot-home removal and `Command completed with exit code: 1` | B11 |');
       expect(content).toContain('| B12 | `getaddrinfo EAI_AGAIN <awmg-cli-proxy>` or `ENOTFOUND <awmg-cli-proxy>`');
+      expect(content).toContain('Kubernetes search domains inherited by DinD, often with `ndots:5`');
+      expect(content).toContain('`dns_search: []`');
+      expect(content).toContain('github/gh-aw-firewall#9100');
+      expect(content).toContain('| A28 | On `runner.topology: arc-dind`, Pi\'s `tee` fails');
+      expect(content).toContain('tee: /tmp/gh-aw/pi-streaming.jsonl: Read-only file system');
+      expect(content).toContain('/tmp/gh-aw/sandbox/agent/logs/pi-streaming.jsonl');
+      expect(content).toContain('the symlink is not the mount destination');
+      expect(content).toContain('github/gh-aw-firewall#9183, github/gh-aw-firewall#9188');
+      expect(content).toContain('| B27 | Docker Compose refuses to start AWF containers');
+      expect(content).toContain('github/gh-aw-firewall#9121, github/gh-aw-firewall#9130');
+      expect(content).toContain('| C5 | `malformed version:` from `gh pr list --search`');
+      expect(content).toContain('github/gh-aw-firewall#9184, github/gh-aw-firewall#9189');
+      expect(content).toContain('Alpine/musl');
+      expect(content).toContain("nslookup awmg-cli-proxy.`: if the bare lookup fails");
+      expect(content).toContain('`SERVFAIL`');
       expect(content).toContain('`detectDnsResolutionFailure()`');
       expect(content).toContain('docker run --rm alpine nslookup awmg-cli-proxy');
       expect(content).toContain('github/gh-aw-firewall#6326, github/gh-aw-firewall#6328');
+      // B2 update — explicit upstream proxy port preserved
+      expect(content).toContain('**Additional fix (PR github/gh-aw-firewall#8887, merged 2026-09-22, fixes github/gh-aw-firewall#8877):**');
+      expect(content).toContain('`parseProxyUrl()` in `src/upstream-proxy.ts`');
+      expect(content).toContain('captures the raw authority port (`getExplicitProxyPort()`) before `URL` normalization');
+      expect(content).toContain('on patched AWF the `cache_peer` port matches the explicit `:80`');
+      expect(content).toMatch(/^\| B2 \|.*github\/gh-aw-firewall#8877, github\/gh-aw-firewall#8887 \|$/m);
       expect(content).toContain('**Further fixed in AWF (PR github/gh-aw-firewall#6460, merged 2026-07-21):** `/etc/pki/ca-trust` and `/etc/pki/tls` are now included in the chroot mount policy');
       expect(content).toContain('github/gh-aw-firewall#5733, github/gh-aw-firewall#5783, github/gh-aw-firewall#6460');
       expect(content).toContain('**Fixed in AWF (PR github/gh-aw-firewall#6473, merged 2026-07-21):** Topology peer hostnames and `difcProxyHost` are also auto-added to the Squid ACL allowlist');
@@ -112,6 +191,36 @@ describe('self-hosted runner doctor workflow config', () => {
       expect(content).toContain('`CapBnd`');
       expect(content).toContain('github/gh-aw#56127, github/gh-aw-firewall#7788, github/gh-aw-firewall#7795');
       expect(content).toContain('| `invalid CapDrop: capability not supported by your kernel or not available in the current environment` | A22');
+      // A23 new failure mode (arc-dind /dev/null credential overlay EROFS with --docker-host-path-prefix)
+      expect(content).toContain('| A23 | On `runner.topology: arc-dind` with `--docker-host-path-prefix` set, `docker compose up` fails with `error mounting "/dev/null" to .../home/.npmrc: create mountpoint ...: read-only file system`');
+      expect(content).toContain('`filterAgentVolumesForSysroot()` (`src/services/optional-services.ts`) is meant to drop the bogus AWF-owned chroot-home mount');
+      expect(content).toContain('extracted `prefixHostPath()` in `src/services/host-path-prefix.ts`');
+      expect(content).toContain('`filterAgentVolumesForSysroot()` now prefixes `config.workDir`/`effectiveHome` before comparing against mount sources');
+      expect(content).toContain('github/gh-aw#57468, github/gh-aw-firewall#7994, github/gh-aw-firewall#7998');
+      expect(content).toContain('| `error mounting "/dev/null" to .../home/.npmrc: create mountpoint ...: read-only file system` (or `.docker/config.json`, `.composer/auth.json`) on `arc-dind` with `--docker-host-path-prefix` set | A23');
+      expect(content).toContain('surviving prefixed `${workDir}-chroot-home:/host$HOME` mount');
+      // A24 new failure mode (real read-only ARC/DinD home with credential overlay)
+      expect(content).toContain('| A24 | On `runner.topology: arc-dind`, `docker compose up -d --pull never` fails with `error mounting "/dev/null" to rootfs at ".../gh-aw/home/.npmrc": create mountpoint for .../.npmrc mount: ... openat .npmrc: read-only file system`');
+      expect(content).toContain('`pruneUnmountableCredentialOverlays` (`src/services/agent-volumes/credential-hiding.ts`)');
+      expect(content).toContain('github/gh-aw#57468, github/gh-aw-firewall#8076, github/gh-aw-firewall#8086');
+      expect(content).toContain('| `error mounting "/dev/null" to .../.npmrc: create mountpoint ...: read-only file system` on `arc-dind` persisting even after upgrading past github/gh-aw-firewall#7998 (A23\'s fix), where the credential mountpoint is missing under a declared-`rw` home bind backed by a genuinely read-only directory | A24');
+      expect(content).toContain('| A25 | On `runner.topology: arc-dind`, workloads inside the AWF sandbox need a GitHub Actions `services:` container');
+      expect(content).toContain('github/gh-aw-firewall#8075, github/gh-aw-firewall#8085');
+      // A26 new failure mode (OpenShift/ARO service-CIDR collision)
+      expect(content).toContain('| A26 | On `runner.topology: arc-dind` deployed on OpenShift/ARO clusters');
+      expect(content).toContain('`--network-subnet <cidr>` CLI flag / `network.subnet` config key');
+      expect(content).toContain('`assertNetworkSubnetUsable()`');
+      expect(content).toContain('github/gh-aw#59880, github/gh-aw-firewall#8390, github/gh-aw-firewall#8398');
+      expect(content).toContain('| `503 HIER_NONE` on every Squid `CONNECT` on `runner.topology: arc-dind` deployed on OpenShift/ARO | A26');
+      // A27 new failure mode (daemon-visible safe-output staging)
+      expect(content).toContain('| A27 | On `runner.topology: arc-dind`, safe-output payload files staged under `/tmp/gh-aw/agent`');
+      expect(content).toContain('`ensureAgentStagingDirectories()` in `src/dind-bootstrap.ts`');
+      expect(content).toContain('github/gh-aw#63045, github/gh-aw#62924, github/gh-aw-firewall#8932, github/gh-aw-firewall#8933, github/gh-aw-firewall#8938');
+      expect(content).toContain('| A28 | On `runner.topology: arc-dind`, Pi\'s `tee` fails');
+      expect(content).toContain('| Safe-output field (e.g. PR body) comes back empty on `runner.topology: arc-dind`, with no write error, and the payload was staged under `/tmp/gh-aw/agent` | A27');
+      expect(content).toContain('| `threat-detect` (or another non-engine CLI tool invoked inside the AWF sandbox) exits 127, or its `--output` path is unwritable/unreadable, on `runner.topology: arc-dind` |');
+      expect(content).toContain('`--mount /tmp/gh-aw/<tool>:/tmp/gh-aw/<tool>:rw`');
+      expect(content).toContain('github/gh-aw-firewall#8457, tracks github/gh-aw#59935');
       // B23 update: PR #7245 fixes the AWF-side gap
       expect(content).toContain('**Fixed on the AWF side (PR github/gh-aw-firewall#7245, merged 2026-08-11):**');
       expect(content).toContain('`ensure_usr_local_bin_shims()`');
@@ -142,6 +251,9 @@ describe('self-hosted runner doctor workflow config', () => {
       expect(content).toContain('| `Host workspace is not writable by the sandbox identity (<uid>:<gid>): <path>` | B25 |');
     }
 
+    expect(source).toContain('surviving prefixed `${workDir}-chroot-home:/host$HOME` mount');
+    expect(portableAgent).toContain('surviving prefixed `${workDir}-chroot-home:/host$HOME` mount');
+
     // B26 new failure mode (network-isolation artifact ZIP download via blob storage egress)
     for (const content of [shared, portableAgent]) {
       expect(content).toContain('| B26 | In `--network-isolation` mode');
@@ -152,49 +264,157 @@ describe('self-hosted runner doctor workflow config', () => {
       expect(content).toContain('| `error connecting to productionresultssa*.blob.core.windows.net` from `gh run download`/artifact ZIP fetch in `--network-isolation` mode | B26');
       // B27 new failure mode (stale awf-net collision on persistent self-hosted runners)
       expect(content).toContain('| B27 | Docker Compose refuses to start AWF containers with repeated warnings: `a network with name awf-net exists but was not created for project');
-      expect(content).toContain('`generateDockerCompose()` in `src/compose-generator.ts` names the Docker network `awf-net`');
-      expect(content).toContain('**Fixed in AWF (PR github/gh-aw-firewall#7817, merged 2026-08-28):**');
-      expect(content).toContain('github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817');
+      expect(content).toContain('`com.docker.network.bridge.name` option');
+      expect(content).toContain('**Additional fix (PR github/gh-aw-firewall#9130, merged 2026-09-28, fixes github/gh-aw-firewall#9121):**');
+      expect(content).toContain('github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817, github/gh-aw-firewall#9121, github/gh-aw-firewall#9130');
       expect(content).toContain('| `a network with name awf-net exists but was not created for project` | B27');
+      expect(content).toContain('| B28 | Custom `apiProxy` targets pointing at an internal/corporate LLM router (`--openai-api-target`, `--anthropic-api-target`, etc.) fail TLS verification when the upstream endpoint\'s certificate chains to a private or corporate CA not present in the api-proxy sidecar\'s trust store |');
+      expect(content).toContain('`apiProxy.caCert` config field and `--api-proxy-ca-cert <path>` CLI flag');
+      expect(content).toContain('github/gh-aw-firewall#7807, github/gh-aw-firewall#7816');
+      expect(content).toContain('| TLS/certificate verification failure from api-proxy against a custom `--openai-api-target`/`--anthropic-api-target` internal endpoint using a private/corporate CA | B28');
+      expect(content).toContain('| B29 | `codex`-engine (and similar) workflows abort with `report_incomplete`');
+      expect(content).toContain('github/gh-aw-firewall#8015, github/gh-aw-firewall#8021');
+      expect(content).toContain('| B30 | AWF-sandbox workflows fail before Squid starts');
+      expect(content).toContain('github/gh-aw-firewall#8014, github/gh-aw-firewall#8023');
+      expect(content).toContain('| B31 | Under `sandbox.agent.runtime: docker-sudo-iptables`');
+      expect(content).toContain('**Fixed in gh-aw (PR github/gh-aw#58625, merged 2026-09-05):** privileged AWF startup preserves the caller `PATH`.');
+      expect(content).toContain('merged PR github/gh-aw-firewall#8173 adds regression coverage');
+      expect(content).toContain('no AWF production-code change was needed.');
+      expect(content).toContain('github/gh-aw#58458, github/gh-aw#58625, github/gh-aw-firewall#8141, github/gh-aw-firewall#8173');
+      expect(content).toContain('| B32 | A repeated/persistent-runner workflow intermittently blocks allowlisted');
+      expect(content).toContain('negative_dns_ttl 1 seconds');
+      expect(content).toContain('dns_retransmit_interval 1 seconds');
+      expect(content).toContain('dns_timeout 10 seconds');
+      expect(content).toContain('github/gh-aw-firewall#8168, github/gh-aw-firewall#8171');
+      expect(content).toContain('| B33 | `[DEBUG] Could not check Squid logs: EACCES');
+      expect(content).toContain('github/gh-aw-firewall#8249, github/gh-aw-firewall#8251');
+      expect(content).toContain('| B34 | `host.docker.internal` or `(host.docker.internal/redacted)` appears in `network.allowDomains`');
+      expect(content).toContain('github/gh-aw-firewall#8172');
+      expect(content).toContain('| C9 | `400 bad request: Authorization header is badly formatted` specifically on the **derived GHEC data-residency Copilot target**');
+      expect(content).toContain('receives `token` instead of required `Bearer` prefix');
+      expect(content).toContain('| C10 | Fine-grained GitHub PATs (`github_pat_...`) sent to Copilot Business, Enterprise, and canonical GHEC');
+      expect(content).toContain('github/gh-aw-firewall#8035, github/gh-aw-firewall#8038');
     }
+
+    expect(shared).toContain('| D13 | Under `--container-runtime sbx` with `network.verifySbxEgress`/`--verify-sbx-egress` enabled, AWF reports `Direct sbx egress reached 1.1.1.1 without proxy environment variables`');
+    expect(shared).toContain('github/gh-aw-firewall#8250, github/gh-aw-firewall#8252, github/gh-aw-firewall#8568, github/gh-aw-firewall#8575');
+    expect(shared).toContain('github/gh-aw-firewall#8249, github/gh-aw-firewall#8251, github/gh-aw-firewall#8615, github/gh-aw-firewall#8624');
+    expect(shared).toContain('| `Direct sbx egress reached 1.1.1.1 without proxy environment variables` (or a similar denied-destination reach) despite Squid healthchecks passing | D13');
+    expect(shared).toContain('| D14 | On `--container-runtime cloud-hypervisor`, the agent run aborts before the engine starts');
+    expect(shared).toContain('github/gh-aw-firewall#8620, github/gh-aw-firewall#8622, github/gh-aw-firewall#8727, github/gh-aw-firewall#8728');
+    expect(shared).not.toContain('github/gh-aw-firewall#8747');
+    expect(shared).not.toContain('github/gh-aw-firewall#8748');
+    expect(shared).toContain('| `"cloud-hypervisor --version" exited with code undefined` under `--container-runtime cloud-hypervisor` | D14');
+    expect(shared).toContain('| D15 | On `--container-runtime cloud-hypervisor`, the run aborts before the engine starts with `Unable to execute');
+    expect(shared).toContain('github/gh-aw-firewall#8827, github/gh-aw-firewall#8834, github/gh-aw-firewall#8835, github/gh-aw-firewall#8866');
+    expect(shared).toContain('and is complete: code=EACCES` under `--container-runtime cloud-hypervisor` | D15');
+    expect(shared).toContain('trusted artifact root "<path>" is on a mount that rejects execution` under `--container-runtime cloud-hypervisor` | D15');
 
     expect(source).toContain('- `unknown shorthand flag: \'d\' in -d` from `docker compose up -d` → A14 (DinD sidecar missing `docker-compose-plugin`)');
     expect(source).toContain('- `Rootless artifact permission repair failed` on ARC/DinD squid logs → A15 (`dockerHostPathPrefix` not applied to repair bind mount)');
-    expect(source).toContain('- `EAI_AGAIN` / `ENOTFOUND` resolving a topology-attached DIFC proxy (for example `awmg-cli-proxy`) in network-isolation + topology-attach: if DinD `nslookup` fails, match B12; otherwise B5');
+    expect(source).toContain('- `EAI_AGAIN` / `ENOTFOUND` resolving a topology-attached DIFC proxy (for example `awmg-cli-proxy`) in network-isolation + topology-attach: inherited Kubernetes `search` domains / `ndots:5`, or an unreachable resolver, match B12; if DNS works when checked after the peer is attached and no search/ndots issue is present, match B5');
     expect(source).toContain('- `403 ERR_ACCESS_DENIED` for MCP tool calls (`safeoutputs`, `github`) to `172.30.0.1/redacted` under `--container-runtime gvisor` or raw `runsc`; safe-output validation fails even though the agent completed → D8');
     expect(source).toContain('- credential files such as `~/.aws/credentials`, `~/.ssh/id_rsa`, or `~/.docker/config.json` are visible inside an `--container-runtime sbx` microVM → D9');
     expect(source).toContain('- `SIGABRT` / `signal=SIGABRT duration=0s stdout=0B` for Copilot CLI all retries under `--container-runtime gvisor`; or exit 139 / `Segmentation fault` on bash wrapper, often before any model or tool call → D11');
     expect(source).toContain('- `Model "auto" has no AI credits pricing and no default pricing is configured` together with `awf-reflect: request failed: fetch failed` under `--container-runtime gvisor` or `sbx` → D12');
+    expect(source).toContain('- `Direct sbx egress reached 1.1.1.1 without proxy environment variables` (or a similar denied-destination reach) despite Squid healthchecks passing → D13');
+    expect(source).toContain('- `Direct sbx egress reached 1.1.1.1 without proxy environment variables` that clears after a brief retry while Squid starts → D13 update');
+    expect(source).toContain('- `"cloud-hypervisor --version" exited with code undefined` under `--container-runtime cloud-hypervisor` → D14');
+    expect(source).toContain('and is complete: code=EACCES` under `--container-runtime cloud-hypervisor` → D15');
+    expect(source).toContain('trusted artifact root "<path>" is on a mount that rejects execution` under `--container-runtime cloud-hypervisor` → D15');
     expect(source).toContain('- `awf-agent` fails to start under `runner.topology: arc-dind` (runc cannot create the `/dev/null` credential-hiding overlay mountpoints under `/host$HOME`), or the entrypoint aborts with `mkdir -p /host$HOME/.m2` failing under `set -e` → A20 (sysroot filter dropped every mount targeting `/host$HOME`, including a caller-supplied writable home; fixed in github/gh-aw-firewall#7244)');
     expect(source).toContain('- `mkdirat ... : read-only file system` at agent container startup while a `filesystem.allowWrite` policy is active (not the `chroot.binariesSourcePath`-specific A12 case) → A21; `[entrypoint][WARN] Could not copy one-shot-token library to /tmp/awf-lib` followed by `Token protection will be disabled` → A21');
     expect(source).toContain('- `invalid CapDrop: capability not supported by your kernel or not available in the current environment` → A22');
-    expect(source).toContain('- `a network with name awf-net exists but was not created for project` → B27');
-    expect(source).toContain('B12 / github/gh-aw-firewall#6326, github/gh-aw-firewall#6328 — On ARC/DinD, a topology-attached DIFC proxy addressed by Kubernetes Service name can remain unresolvable from DinD containers even after the ordering fix.');
+    expect(source).toContain('- `error mounting "/dev/null" to .../.npmrc: create mountpoint ...: read-only file system` on `arc-dind` persisting even after upgrading past github/gh-aw-firewall#7998 (A23\'s fix), where the credential mountpoint is missing under a declared-`rw` home bind backed by a genuinely read-only directory → A24');
+    expect(source).toContain('- `a network with name awf-net exists but was not created for project`, or a missing bridge in legacy iptables mode → B27');
+    expect(source).toContain('- `docker network connect --alias <name> awf-net <service_container>` is needed for raw-protocol GitHub Actions `services:` containers under `runner.topology: arc-dind` → A25');
+    expect(source).toContain('does not mention ARC, DinD, OpenShift, ARO, `HIER_NONE`, self-hosted');
+    for (const playbook of [source, portableAgent]) {
+      expect(playbook).toContain('OpenShift');
+      expect(playbook).toContain('ARO');
+      expect(playbook).toContain('HIER_NONE');
+    }
+    expect(source).toContain('- `host.docker.internal` or `(host.docker.internal/redacted)` appears in `network.allowDomains` but the host service still cannot be reached from inside AWF → B34');
+    expect(source).toContain('- TLS/certificate verification failure from api-proxy against a custom `--openai-api-target`/`--anthropic-api-target` internal endpoint using a private/corporate CA → B28 (api-proxy sidecar had no custom CA trust extension point; fixed in github/gh-aw-firewall#7816 with `apiProxy.caCert`/`--api-proxy-ca-cert`)');
+    expect(source).toContain('- `context-rebuild circuit breaker tripped` together with a failed `cd` into the expected workspace path → B29');
+    expect(source).toContain('- `awf logs summary` reports "no log sources found" after a pre-egress startup failure with no Squid `access.log` → B30');
+    expect(source).toContain('- A setup-action-selected toolchain version is shadowed by the system-default version inside the AWF agent under `sandbox.agent.runtime: docker-sudo-iptables` → B31');
+    expect(source).toContain('- Recurring intermittent `403`/DNS `SERVFAIL` blocking an allowlisted domain');
+    expect(source).toContain('→ B32 (Squid\'s default 60-second `negative_dns_ttl`');
+    expect(source).toContain('`dns_retransmit_interval 1 seconds`');
+    expect(source).toContain('`dns_timeout 10 seconds`');
+    expect(source).toContain('- `[DEBUG] Could not check Squid logs: EACCES ... access.log` mid-run');
+    expect(source).toContain('→ B33 (the previous shutdown-time repair only changed mode bits');
+    expect(source).toContain('`docker compose up -d` fails after AWF topology recreates Squid mid-run (new `extra_hosts`), with stale/unwritable Squid log files → B33 update');
+    expect(source).toContain('- Copilot calls on Business/Enterprise/GHEC use the wrong Authorization scheme specifically for a fine-grained PAT (`github_pat_...`) → C10');
+    expect(source).toContain('- `400 bad request: Authorization header is badly formatted` on derived `copilot-api.*.ghe.com` target specifically (not `api.business.githubcopilot.com`) → C9 (derived GHEC Copilot API target incorrectly using the GitHub `token` prefix instead of `Bearer`; fixed in github/gh-aw-firewall#8113)');
+    expect(source).toContain('B12 / github/gh-aw-firewall#6326, github/gh-aw-firewall#6328, github/gh-aw-firewall#9100 — On ARC/DinD, `EAI_AGAIN`/`ENOTFOUND` for a topology-attached DIFC proxy can persist even after the ordering fix.');
+    expect(source).toContain('Kubernetes `search` domains plus `ndots:5` can make Alpine/musl expand the single-label Docker peer name before its direct lookup');
     expect(source).toContain('D8 / github/gh-aw-firewall#6401, github/gh-aw-firewall#6326 — Under `--container-runtime gvisor` or raw `runsc`, MCP calls to the gateway at `172.30.0.1:8080` could be misrouted through Squid and fail with `403 ERR_ACCESS_DENIED`');
     expect(source).toContain('D9 / github/gh-aw-firewall#6336 — sbx microVMs previously mounted the entire host `$HOME`, exposing credentials such as `~/.aws/credentials`, `~/.ssh/id_rsa`, and `~/.docker/config.json`.');
     expect(source).toContain('D11 / github/gh-aw-firewall#6558 — gVisor + Node.js v22 V8 ESM startup crash root cause remains unresolved (`SIGABRT` `StringBytes::Encode` assertion and occasional exit 139).');
     expect(source).toContain('D12 / github/gh-aw-firewall#6810, github/gh-aw-firewall#6811 — Copilot runs using `model: auto` under isolated runtimes (`--container-runtime gvisor` or `sbx`) could fail before agent start with `awf-reflect: request failed: fetch failed` plus `Model "auto" has no AI credits pricing and no default pricing is configured` when `apiProxy.maxAiCredits` was enabled.');
+    expect(source).toContain('D13 / github/gh-aw-firewall#8250, github/gh-aw-firewall#8252, github/gh-aw-firewall#8568, github/gh-aw-firewall#8575 — With `--container-runtime sbx`');
+    expect(source).toContain('B33 / github/gh-aw-firewall#8249, github/gh-aw-firewall#8251, github/gh-aw-firewall#8615, github/gh-aw-firewall#8624');
+    expect(source).toContain('D14 / github/gh-aw-firewall#8620, github/gh-aw-firewall#8622, github/gh-aw-firewall#8727, github/gh-aw-firewall#8728');
+    expect(source).toContain('D15 / github/gh-aw-firewall#8827, github/gh-aw-firewall#8834, github/gh-aw-firewall#8835, github/gh-aw-firewall#8866');
+    expect(source).not.toContain('github/gh-aw-firewall#8747');
+    expect(source).not.toContain('github/gh-aw-firewall#8748');
     expect(source).toContain('A20 / github/gh-aw-firewall#7239, github/gh-aw-firewall#7244 — Under `runner.topology: arc-dind`, `filterAgentVolumesForSysroot()` (`src/services/optional-services.ts`) dropped every mount targeting `/host$HOME`');
     expect(source).toContain('A21 / github/gh-aw-firewall#7678, github/gh-aw-firewall#7679, github/gh-aw-firewall#7681, github/gh-aw-firewall#7728 — When a `filesystem.allowWrite` policy narrows `/tmp` to read-only, `awf-agent` startup can fail with `runc create failed: ... mkdirat ... read-only file system`');
     expect(source).toContain('A22 / github/gh-aw#56127, github/gh-aw-firewall#7788, github/gh-aw-firewall#7795 — `arc-dind` topology fails to start when Docker rejects AWF\'s compose `cap_drop` list');
-    expect(source).toContain('B27 / github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817 — Docker Compose refuses to start AWF containers with repeated warnings');
+    expect(source).toContain('B27 / github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817');
+    expect(source).toContain('A28 / github/gh-aw-firewall#9183 — gh-aw compiler must relocate Pi\'s log to `/tmp/gh-aw/sandbox/agent/logs/pi-streaming.jsonl`');
+    expect(portableAgent).toContain('B31 / github/gh-aw#58458, github/gh-aw#58625, github/gh-aw-firewall#8141, github/gh-aw-firewall#8173 — Under `sandbox.agent.runtime: docker-sudo-iptables`');
     expect(portableAgent).toContain('- `unknown shorthand flag: \'d\' in -d` from `docker compose up -d` → A14 (DinD sidecar missing `docker-compose-plugin`)');
     expect(portableAgent).toContain('- `Rootless artifact permission repair failed` on ARC/DinD squid logs → A15 (`dockerHostPathPrefix` not applied to repair bind mount)');
-    expect(portableAgent).toContain('- `EAI_AGAIN` / `ENOTFOUND` resolving a topology-attached DIFC proxy (for example `awmg-cli-proxy`) in network-isolation + topology-attach: if DinD `nslookup` fails, match B12; otherwise B5');
+    expect(portableAgent).toContain('- `EAI_AGAIN` / `ENOTFOUND` resolving a topology-attached DIFC proxy (for example `awmg-cli-proxy`) in network-isolation + topology-attach: inherited Kubernetes `search` domains / `ndots:5`, or an unreachable resolver, match B12; if DNS works when checked after the peer is attached and no search/ndots issue is present, match B5');
     expect(portableAgent).toContain('- `403 ERR_ACCESS_DENIED` for MCP tool calls (`safeoutputs`, `github`) to `172.30.0.1/redacted` under `--container-runtime gvisor` or raw `runsc`; safe-output validation fails even though the agent completed → D8');
     expect(portableAgent).toContain('- credential files such as `~/.aws/credentials`, `~/.ssh/id_rsa`, or `~/.docker/config.json` are visible inside an `--container-runtime sbx` microVM → D9');
     expect(portableAgent).toContain('- `SIGABRT` / `signal=SIGABRT duration=0s stdout=0B` for Copilot CLI all retries under `--container-runtime gvisor`; or exit 139 / `Segmentation fault` on bash wrapper, often before any model or tool call → D11');
     expect(portableAgent).toContain('- `Model "auto" has no AI credits pricing and no default pricing is configured` together with `awf-reflect: request failed: fetch failed` under `--container-runtime gvisor` or `sbx` → D12');
+    expect(portableAgent).toContain('- `Direct sbx egress reached 1.1.1.1 without proxy environment variables` (or a similar denied-destination reach) despite Squid healthchecks passing → D13');
+    expect(portableAgent).toContain('- `Direct sbx egress reached 1.1.1.1 without proxy environment variables` that clears after a brief retry while Squid starts → D13 update');
+    expect(portableAgent).toContain('- `"cloud-hypervisor --version" exited with code undefined` under `--container-runtime cloud-hypervisor` → D14');
+    expect(portableAgent).toContain('and is complete: code=EACCES` under `--container-runtime cloud-hypervisor` → D15');
+    expect(portableAgent).toContain('trusted artifact root "<path>" is on a mount that rejects execution` under `--container-runtime cloud-hypervisor` → D15');
+    expect(portableAgent).toContain('| D13 | Under `--container-runtime sbx` with `network.verifySbxEgress`/`--verify-sbx-egress` enabled, AWF reports `Direct sbx egress reached 1.1.1.1 without proxy environment variables`');
+    expect(portableAgent).toContain('| D14 | On `--container-runtime cloud-hypervisor`, the agent run aborts before the engine starts');
+    expect(portableAgent).toContain('| D15 | On `--container-runtime cloud-hypervisor`, the run aborts before the engine starts with `Unable to execute');
+    expect(portableAgent).toContain('trusted artifact root "<path>" is on a mount that rejects execution` under `--container-runtime cloud-hypervisor` | D15');
+    expect(portableAgent).toContain('| `Direct sbx egress reached 1.1.1.1 without proxy environment variables` (or a similar denied-destination reach) despite Squid healthchecks passing | D13');
+    expect(portableAgent).toContain('D13 / github/gh-aw-firewall#8250, github/gh-aw-firewall#8252, github/gh-aw-firewall#8568, github/gh-aw-firewall#8575 — With `--container-runtime sbx`');
+    expect(portableAgent).toContain('B33 / github/gh-aw-firewall#8249, github/gh-aw-firewall#8251, github/gh-aw-firewall#8615, github/gh-aw-firewall#8624');
+    expect(portableAgent).toContain('D14 / github/gh-aw-firewall#8620, github/gh-aw-firewall#8622');
+    expect(portableAgent).toContain('D15 / github/gh-aw-firewall#8827, github/gh-aw-firewall#8834, github/gh-aw-firewall#8835, github/gh-aw-firewall#8866');
+    expect(portableAgent).toMatch(/^\| D13 \|.*github\/gh-aw-firewall#8575 \|$/m);
+    expect(portableAgent).toMatch(/^\| B33 \|.*github\/gh-aw-firewall#8624 \|$/m);
+    expect(portableAgent).toMatch(/^\| D14 \|.*github\/gh-aw-firewall#8801 \|$/m);
+    expect(portableAgent).toMatch(/^\| D15 \|.*github\/gh-aw-firewall#8866 \|$/m);
+    expect(portableAgent).toContain('| `Direct sbx egress reached 1.1.1.1 without proxy environment variables` that clears after a brief retry while Squid starts | D13 update');
+    expect(portableAgent).toContain('- `docker compose up -d` fails after AWF topology recreates Squid mid-run (new `extra_hosts`), with stale/unwritable Squid log files → B33 update (topology-restart-triggered Squid log repair fixed in github/gh-aw-firewall#8624)');
+    expect(portableAgent).toContain('| `"cloud-hypervisor --version" exited with code undefined` under `--container-runtime cloud-hypervisor` | D14');
+    expect(portableAgent).toContain('and is complete: code=EACCES` under `--container-runtime cloud-hypervisor` | D15');
     expect(portableAgent).toContain('D11 / github/gh-aw-firewall#6558 — gVisor + Node.js v22 V8 ESM startup crash root cause remains unresolved (`SIGABRT` `StringBytes::Encode` assertion and occasional exit 139).');
     expect(portableAgent).toContain('D12 / github/gh-aw-firewall#6810, github/gh-aw-firewall#6811 — Copilot runs using `model: auto` under isolated runtimes (`--container-runtime gvisor` or `sbx`) could fail before agent start with `awf-reflect: request failed: fetch failed` plus `Model "auto" has no AI credits pricing and no default pricing is configured` when `apiProxy.maxAiCredits` was enabled.');
     expect(portableAgent).toContain('- `awf-agent` fails to start under `runner.topology: arc-dind` (runc cannot create the `/dev/null` credential-hiding overlay mountpoints under `/host$HOME`), or the entrypoint aborts with `mkdir -p /host$HOME/.m2` failing under `set -e` → A20 (sysroot filter dropped every mount targeting `/host$HOME`, including a caller-supplied writable home; fixed in github/gh-aw-firewall#7244)');
     expect(portableAgent).toContain('A20 / github/gh-aw-firewall#7239, github/gh-aw-firewall#7244 — Under `runner.topology: arc-dind`, `filterAgentVolumesForSysroot()` (`src/services/optional-services.ts`) dropped every mount targeting `/host$HOME`');
     expect(portableAgent).toContain('- `mkdirat ... : read-only file system` at agent container startup while a `filesystem.allowWrite` policy is active (not the `chroot.binariesSourcePath`-specific A12 case) → A21; `[entrypoint][WARN] Could not copy one-shot-token library to /tmp/awf-lib` followed by `Token protection will be disabled` → A21');
     expect(portableAgent).toContain('- `invalid CapDrop: capability not supported by your kernel or not available in the current environment` → A22');
-    expect(portableAgent).toContain('- `a network with name awf-net exists but was not created for project` → B27');
+    expect(portableAgent).toContain('- `a network with name awf-net exists but was not created for project`, or a missing bridge in legacy iptables mode → B27');
+    expect(portableAgent).toContain('- `malformed version:` from `gh pr list --search`, `gh issue list --search`, or `gh search prs or issues` in cli-proxy gh-proxy mode → C5');
+    expect(portableAgent).toContain('- `tee: /tmp/gh-aw/pi-streaming.jsonl: Read-only file system` on arc-dind → A28');
+    expect(portableAgent).toContain('- `docker network connect --alias <name> awf-net <service_container>` is needed for raw-protocol GitHub Actions `services:` containers under `runner.topology: arc-dind` → A25');
+    expect(portableAgent).toContain('- `host.docker.internal` or `(host.docker.internal/redacted)` appears in `network.allowDomains` but the host service still cannot be reached from inside AWF → B34');
+    expect(portableAgent).toContain('- `context-rebuild circuit breaker tripped` together with a failed `cd` into the expected workspace path → B29');
+    expect(portableAgent).toContain('- `awf logs summary` reports "no log sources found" after a pre-egress startup failure with no Squid `access.log` → B30');
+    expect(portableAgent).toContain('- A setup-action-selected toolchain version is shadowed by the system-default version inside the AWF agent under `sandbox.agent.runtime: docker-sudo-iptables` → B31');
+    expect(portableAgent).toContain('- Copilot calls on Business/Enterprise/GHEC use the wrong Authorization scheme specifically for a fine-grained PAT (`github_pat_...`) → C10');
+    expect(portableAgent).toContain('- `400 bad request: Authorization header is badly formatted` on derived `copilot-api.*.ghe.com` target specifically (not `api.business.githubcopilot.com`) → C9 (derived GHEC Copilot API target incorrectly using the GitHub `token` prefix instead of `Bearer`; fixed in github/gh-aw-firewall#8113)');
     expect(portableAgent).toContain('A21 / github/gh-aw-firewall#7678, github/gh-aw-firewall#7679, github/gh-aw-firewall#7681, github/gh-aw-firewall#7728 — When a `filesystem.allowWrite` policy narrows `/tmp` to read-only, `awf-agent` startup can fail with `runc create failed: ... mkdirat ... read-only file system`');
     expect(portableAgent).toContain('A22 / github/gh-aw#56127, github/gh-aw-firewall#7788, github/gh-aw-firewall#7795 — `arc-dind` topology fails to start when Docker rejects AWF\'s compose `cap_drop` list');
-    expect(portableAgent).toContain('B27 / github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817 — Docker Compose refuses to start AWF containers with repeated warnings');
+    expect(portableAgent).toContain('B27 / github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817');
+    expect(portableAgent).toContain('A28 / github/gh-aw-firewall#9183 — gh-aw compiler must relocate Pi\'s log to `/tmp/gh-aw/sandbox/agent/logs/pi-streaming.jsonl`');
     expect(source).toContain('B23 / github/gh-aw-firewall#7130 (still open), github/gh-aw-firewall#7147, github/gh-aw-firewall#7151, github/gh-aw-firewall#7245');
     expect(source).toContain('**Fixed on the AWF side (PR github/gh-aw-firewall#7245, merged 2026-08-11):**');
     expect(portableAgent).toContain('**Fixed on the AWF side (PR github/gh-aw-firewall#7245, merged 2026-08-11):**');
@@ -209,7 +429,36 @@ describe('self-hosted runner doctor workflow config', () => {
       expect(playbook).toContain('- `error connecting to productionresultssa*.blob.core.windows.net` from `gh run download`/artifact ZIP fetch in `--network-isolation` mode → B26');
       expect(playbook).toContain('B26 / github/gh-aw#54371, github/gh-aw-firewall#7615, github/gh-aw-firewall#7635 — In `--network-isolation` mode');
       expect(playbook).toContain('github/gh-aw-mcpg#10350');
-      expect(playbook).toContain('B27 / github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817 — Docker Compose refuses to start AWF containers with repeated warnings');
+      expect(playbook).toContain('B27 / github/gh-aw#56463, github/gh-aw-firewall#7809, github/gh-aw-firewall#7817');
+      expect(playbook).toContain('A28 / github/gh-aw-firewall#9183 — gh-aw compiler must relocate Pi\'s log to `/tmp/gh-aw/sandbox/agent/logs/pi-streaming.jsonl`');
+      expect(playbook).toContain("docker network inspect awf-net --format '{{json .Options}} {{json .Containers}}'");
+      expect(playbook).toContain('empty containers map identify an unoccupied orphaned `awf-net`');
+      expect(playbook).toContain('empty containers map identify an unoccupied orphan; fixed in github/gh-aw-firewall#9130');
+      expect(playbook).toContain('B29 / github/gh-aw-firewall#8015, github/gh-aw-firewall#8021 — `codex`-engine workflows can abort');
+      expect(playbook).toContain('B30 / github/gh-aw-firewall#8014, github/gh-aw-firewall#8023 — A pre-egress AWF startup failure');
+      expect(playbook).toContain('C10 / github/gh-aw-firewall#8035, github/gh-aw-firewall#8038 — Fine-grained GitHub PATs');
+      expect(playbook).toContain('- Recurring intermittent `403`/DNS `SERVFAIL` blocking an allowlisted domain');
+      expect(playbook).toContain('→ B32 (Squid\'s default 60-second `negative_dns_ttl`');
+      expect(playbook).toContain('`dns_retransmit_interval 1 seconds`');
+      expect(playbook).toContain('`dns_timeout 10 seconds`');
+      expect(playbook).toContain('- `[DEBUG] Could not check Squid logs: EACCES ... access.log` mid-run');
+      expect(playbook).toContain('→ B33 (the previous shutdown-time repair only changed mode bits');
+    }
+  });
+
+  it('keeps the Pi A28 workaround aligned across all runner-doctor sources', () => {
+    const source = fs.readFileSync(sourcePath, 'utf-8');
+    const shared = fs.readFileSync(sharedPath, 'utf-8');
+    const portableAgent = fs.readFileSync(portableAgentPath, 'utf-8');
+
+    for (const content of [shared, source, portableAgent]) {
+      expect(content).toContain('tee: /tmp/gh-aw/pi-streaming.jsonl: Read-only file system');
+      expect(content).toContain('/tmp/gh-aw/sandbox/agent/logs/pi-streaming.jsonl');
+      expect(content).toContain('runner-side source');
+      expect(content).toContain('sandbox.agent.mounts');
+      expect(content).toContain(':rw');
+      expect(content).toContain('the symlink is not the mount destination');
+      expect(content).not.toContain('${RUNNER_TEMP}/gh-aw/sandbox/agent/pi-streaming.jsonl');
     }
   });
 });

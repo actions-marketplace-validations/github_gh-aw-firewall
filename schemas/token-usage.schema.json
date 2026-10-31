@@ -61,6 +61,22 @@
       "type": "string",
       "description": "API endpoint path for this request (e.g. '/v1/messages', '/v1/chat/completions')."
     },
+    "requested_endpoint": {
+      "type": "string",
+      "enum": [
+        "/responses",
+        "/chat/completions"
+      ],
+      "description": "Copilot wire endpoint requested by the client when AWF translated it to another endpoint."
+    },
+    "upstream_endpoint": {
+      "type": "string",
+      "enum": [
+        "/responses",
+        "/chat/completions"
+      ],
+      "description": "Copilot wire endpoint used upstream when AWF translated the request."
+    },
     "status": {
       "type": "integer",
       "minimum": 100,
@@ -100,6 +116,131 @@
       "type": "integer",
       "minimum": 0,
       "description": "Total number of bytes in the response body (optional, omitted for WebSocket upgrades)."
+    },
+    "purpose": {
+      "type": "string",
+      "enum": [
+        "routing_classification",
+        "agent",
+        "subagent"
+      ],
+      "description": "Who the request is attributed to. \"routing_classification\" is an AWF-internal router classifier call (caller_source \"awf\"); it always wins over any caller header. \"agent\" (x-awf-caller: main) and \"subagent\" (x-awf-caller: subagent/<name>) come from the optional, unauthenticated x-awf-caller request header (caller_source \"caller_header\"). Absent when the request carries no AWF purpose and no valid x-awf-caller header."
+    },
+    "agent_name": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_.:/-]+$",
+      "maxLength": 119,
+      "description": "Sub-agent definition name declared by x-awf-caller: subagent/<name>. Present only when purpose is \"subagent\". Caller-declared attribution metadata, not an authenticated identity."
+    },
+    "caller_source": {
+      "type": "string",
+      "enum": [
+        "caller_header",
+        "awf"
+      ],
+      "description": "Source of purpose: \"awf\" for a trusted AWF in-process purpose, \"caller_header\" for a valid x-awf-caller header declared from inside the sandbox. Present exactly when purpose is present."
+    },
+    "steering": {
+      "type": "object",
+      "required": [
+        "type",
+        "threshold"
+      ],
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "timeout",
+            "ai_credit",
+            "token"
+          ],
+          "description": "Kind of advisory steering notice injected into this request."
+        },
+        "threshold": {
+          "type": "integer",
+          "enum": [
+            80,
+            90,
+            95,
+            99
+          ],
+          "description": "Percent threshold that triggered the injected notice."
+        }
+      },
+      "additionalProperties": false,
+      "description": "Present when an advisory steering notice was injected into this request."
+    },
+    "model_fallback": {
+      "type": "object",
+      "description": "Present only when the ordered fallback chain (apiProxy.fallbackModels / AWF_FALLBACK_MODELS) switched away from the requested model. The top-level 'model' and 'provider' fields identify the model and provider that actually served the request.",
+      "properties": {
+        "requested_model": {
+          "type": "string",
+          "description": "Model originally requested by the agent (after alias resolution)."
+        },
+        "requested_provider": {
+          "type": "string",
+          "description": "Provider whose listener received the agent's request."
+        },
+        "model": {
+          "type": "string",
+          "description": "Fallback model the request was re-sent with."
+        },
+        "provider": {
+          "type": "string",
+          "description": "Provider that served the fallback attempt. Differs from requested_provider for provider-qualified (cross-provider) fallback entries."
+        },
+        "from_model": {
+          "type": "string",
+          "description": "Model of the attempt that failed immediately before this one."
+        },
+        "from_provider": {
+          "type": "string",
+          "description": "Provider of the attempt that failed immediately before this one."
+        },
+        "failures": {
+          "type": "array",
+          "description": "Every failed attempt in chain order, starting with the originally requested model.",
+          "items": {
+            "type": "object",
+            "properties": {
+              "provider": {
+                "type": "string"
+              },
+              "model": {
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              },
+              "status": {
+                "type": "integer"
+              }
+            },
+            "additionalProperties": true
+          }
+        },
+        "attempt": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "1-based index of the fallback attempt that served the request."
+        },
+        "reason": {
+          "type": "string",
+          "enum": [
+            "upstream_5xx",
+            "upstream_timeout",
+            "upstream_connection_error",
+            "model_not_supported"
+          ],
+          "description": "Why the previous model was abandoned."
+        },
+        "status": {
+          "type": "integer",
+          "description": "Upstream HTTP status of the failed attempt (absent for connection errors)."
+        }
+      },
+      "additionalProperties": true
     },
     "x_initiator": {
       "type": "string",
@@ -198,6 +339,14 @@
       "type": "string",
       "description": "API version of the pricing data source used to resolve this model's cost, when known. Present only when apiProxy.maxAiCredits is configured and the pricing source reports a version."
     },
+    "ai_credits_pricing_catalog_id": {
+      "type": "string",
+      "description": "Identifier of the shared pricing catalog used for AI-credit accounting, when supplied."
+    },
+    "ai_credits_pricing_catalog_version": {
+      "type": "string",
+      "description": "Pinned version of the shared pricing catalog used for AI-credit accounting, when supplied."
+    },
     "ai_credits_pricing_discount_percent": {
       "type": "number",
       "minimum": 0,
@@ -226,21 +375,6 @@
       "type": "number",
       "minimum": 0,
       "description": "Cumulative AI credits consumed since the start of the run. Present only when apiProxy.maxAiCredits is configured."
-    },
-    "effective_tokens_this_response": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Weighted effective tokens consumed by this API call (input×1 + cache_read×0.1 + output×4 + reasoning×4), scaled by the model multiplier. Present only when apiProxy.maxEffectiveTokens is configured."
-    },
-    "effective_tokens_total": {
-      "type": "number",
-      "minimum": 0,
-      "description": "Cumulative weighted effective tokens consumed since the start of the run. Present only when apiProxy.maxEffectiveTokens is configured."
-    },
-    "model_multiplier": {
-      "type": "number",
-      "exclusiveMinimum": 0,
-      "description": "Per-model cost multiplier applied to the effective token calculation for this request. Present only when apiProxy.maxEffectiveTokens is configured."
     },
     "reasoning_tokens": {
       "type": "integer",

@@ -4,13 +4,27 @@ import { promises as fs } from 'fs';
 import execa from 'execa';
 import * as os from 'os';
 import * as path from 'path';
+import type { WrapperConfig } from '../types';
 import type { CloudHypervisorOptions } from '../types/runtime-options';
+import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
+import {
+  assertEnclaveStartupChecklistComplete, getEnclaveStartupProgress, updateEnclaveStartupProgress,
+} from '../enclave/startup-progress';
+import { CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG } from './artifact-manifest';
+import { CloudHypervisorUnsupportedHostError } from './errors';
+import { CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT } from './manager-types';
+import {
+  HostPreflightReporter, type HostPreflightProgress, type HostPreflightCheck,
+} from './host-preflight-progress';
+import { schema } from './host-preflight-schema';
 import {
   calculateSha256,
   cloudHypervisorPreflightTestHelpers,
   parseCloudHypervisorVersion,
   parseVirtiofsdVersion,
   runCloudHypervisorPreflight,
+  runCloudHypervisorCommonPreflight,
+  VIRTIOFSD_RELEASE_VERSION,
   type CloudHypervisorPreflightDependencies,
 } from './preflight';
 
@@ -19,13 +33,37 @@ jest.mock('execa');
 const digest = 'a'.repeat(64);
 const mockedExeca = execa as jest.MockedFunction<typeof execa>;
 
+function manifest(): string {
+  return JSON.stringify({
+    schemaVersion: 1,
+    architecture: 'x86_64',
+    release: {
+      repository: 'github/gh-aw-firewall',
+      workflow: 'github/gh-aw-firewall/.github/workflows/release.yml',
+      tag: CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG,
+      sourceCommit: 'b'.repeat(40),
+    },
+    artifacts: {
+      cloudHypervisor: { file: 'cloud-hypervisor', version: '53.0', sha256: digest },
+      virtiofsd: { file: 'virtiofsd', version: '1.13.3', sha256: digest },
+      kernel: { file: 'vmlinux.bin', version: '6.1.141', sha256: digest },
+      rootfs: { file: 'rootfs.ext4', version: CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG, sha256: digest },
+      supervisor: { file: 'awf-supervisor', version: CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG, sha256: digest },
+    },
+  });
+}
+
 function config(overrides: Partial<CloudHypervisorOptions> = {}): CloudHypervisorOptions {
   return {
     previewEnabled: true,
+    mountPolicy: 'workspace-only',
     cloudHypervisorBinary: '/opt/cloud-hypervisor',
-    kernelPath: '/opt/vmlinux',
+    kernelPath: '/opt/vmlinux.bin',
     rootfsPath: '/opt/rootfs.ext4',
     supervisorPath: '/opt/awf-supervisor',
+    artifactManifestPath: '/opt/manifest.json',
+    artifactManifestBundlePath: '/opt/manifest.sigstore.jsonl',
+    artifactReleaseTag: CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG,
     vcpuCount: 2,
     memoryMib: 512,
     apiTimeoutMs: 5000,
@@ -45,12 +83,39 @@ function dependencies(
       isFile: () => true,
       isSymbolicLink: () => false,
       mode: 0o100755,
+      size: 1,
       uid: 0,
     }),
     runVersion: jest.fn(async (binaryPath: string) => (
-      binaryPath.endsWith('/virtiofsd') ? 'virtiofsd backend 1.10.0' : 'cloud-hypervisor v53.0'
+      binaryPath.endsWith('/virtiofsd') ? 'virtiofsd 1.13.3' : 'cloud-hypervisor v53.0'
     )),
     sha256: jest.fn().mockResolvedValue(digest),
+    readFile: jest.fn().mockResolvedValue(manifest()),
+    createArtifactSnapshot: jest.fn(async (sources) => ({
+      directory: `${CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT}/run-test`,
+      cloudHypervisorBinary: '/snapshot/cloud-hypervisor',
+      virtiofsdBinary: '/snapshot/virtiofsd',
+      kernelPath: '/snapshot/vmlinux.bin',
+      rootfsPath: '/snapshot/rootfs.ext4',
+      supervisorPath: '/snapshot/awf-supervisor',
+      ...(sources.rootfsSbomPath ? { rootfsSbomPath: '/snapshot/rootfs.sbom.spdx.json' } : {}),
+      ...(sources.manifestPath ? { manifestPath: '/snapshot/manifest.json' } : {}),
+      ...(sources.bundlePath
+        ? { bundlePath: '/snapshot/manifest.sigstore.jsonl' }
+        : {}),
+    })),
+    createCommonArtifactSnapshot: jest.fn(async (sources) => ({
+      directory: `${CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT}/run-common`,
+      cloudHypervisorBinary: '/snapshot/cloud-hypervisor',
+      virtiofsdBinary: '/snapshot/virtiofsd',
+      kernelPath: '/snapshot/vmlinux.bin',
+      supervisorPath: '/snapshot/awf-supervisor',
+      ...(sources.manifestPath ? { manifestPath: '/snapshot/manifest.json' } : {}),
+      ...(sources.bundlePath ? { bundlePath: '/snapshot/manifest.sigstore.jsonl' } : {}),
+    })),
+    copySparseFile: jest.fn().mockResolvedValue(undefined),
+    removeArtifactSnapshot: jest.fn().mockResolvedValue(undefined),
+    verifyManifestAttestation: jest.fn().mockResolvedValue(undefined),
     assertToolAvailable: jest.fn(async (tool: string) => `/usr/bin/${tool}`),
     assertHostPolicy: jest.fn().mockResolvedValue(2),
     assertDockerInfrastructure: jest.fn().mockResolvedValue(undefined),
@@ -60,6 +125,126 @@ function dependencies(
 }
 
 describe('Cloud Hypervisor preflight (foundation only)', () => {
+  it('retains the resolved physical id path for downstream identity and cleanup tools', async () => {
+    const physicalId = '/usr/lib/cargo/bin/coreutils/id';
+    const deps = dependencies({
+      assertToolAvailable: jest.fn(async (tool: string) =>
+        tool === 'id' ? physicalId : `/usr/bin/${tool}`),
+    });
+    const result = await runCloudHypervisorPreflight(config(), deps);
+    expect(result.tools.id).toBe(physicalId);
+  });
+
+  it.each(['common', 'primary'] as const)('completes readiness after successful %s preflight', async (profile) => {
+    const wrapper = { enclaves: normalizeEnclavesConfig([{ script: {}, repos: [] }]) } as WrapperConfig;
+    const publish = (hostPreflight: HostPreflightProgress) =>
+      updateEnclaveStartupProgress(wrapper, { hostPreflight });
+    const report = new HostPreflightReporter('bounded-runtime', publish);
+    const deps = dependencies({ hostPreflightReporter: report });
+    if (profile === 'common') {
+      await runCloudHypervisorCommonPreflight(config({ rootfsPath: undefined }), deps);
+    } else {
+      await runCloudHypervisorPreflight(config(), deps);
+    }
+    for (const id of ['rootfs-trust', 'rootfs-digest']) {
+      expect(getEnclaveStartupProgress(wrapper)?.startupChecks?.checks[`bounded-runtime/${id}`])
+        .toEqual([profile === 'common' ? 'not-required' : 'passed', 'none']);
+    }
+    expect(deps.sha256).toHaveBeenCalledTimes(profile === 'common' ? 4 : 5);
+
+    // These gates belong to the bounded-storage wrapper or the mocked host probes.
+    for (const id of [
+      'configured-role', 'tool-mount', 'tool-umount', 'invocation-root', 'invocation-parent',
+      'resource-journal', 'storage-allocation', 'storage-ancestor', 'storage-parent', 'storage-root',
+      'storage-tmpfs', 'storage-propagation-set', 'storage-propagation', 'storage-layout',
+      'storage-artifact-mount', 'storage-run-mounts', 'invocation-directory', 'invocation-mount',
+      'storage-verification', 'snapshot-journal', 'root', 'ipv4-control', 'ipv6-control',
+      'seccomp-control', 'cgroup-v2', 'docker-info', 'docker-compose',
+    ] as const) {
+      report.checkSync(id, () => undefined);
+    }
+    const startup = new HostPreflightReporter('startup', publish);
+    for (const id of Object.keys(schema.scopes.startup) as HostPreflightCheck[]) {
+      if (id !== 'readiness') startup.checkSync(id, () => undefined);
+    }
+    startup.checkSync('readiness', () => assertEnclaveStartupChecklistComplete(wrapper, true));
+    expect(() => assertEnclaveStartupChecklistComplete(wrapper)).not.toThrow();
+    expect(getEnclaveStartupProgress(wrapper)?.startupChecks?.ready).toBe(true);
+  });
+
+  it('attests common artifacts without trusting, staging, or hashing the primary rootfs or SBOM', async () => {
+    const checked: string[] = [];
+    const deps = dependencies();
+    const originalLstat = deps.lstat!;
+    deps.lstat = jest.fn(async (file) => {
+      checked.push(file);
+      if (file.includes('rootfs')) throw new Error('primary rootfs must not be checked');
+      return originalLstat(file);
+    });
+    const result = await runCloudHypervisorCommonPreflight(config({ rootfsPath: undefined }), deps);
+    expect(result).not.toHaveProperty('rootfsPath');
+    expect(result.artifactDigests).not.toHaveProperty('rootfs');
+    expect(deps.createArtifactSnapshot).not.toHaveBeenCalled();
+    expect(deps.createCommonArtifactSnapshot).toHaveBeenCalledWith(
+      expect.not.objectContaining({ rootfsPath: expect.anything(), rootfsSbomPath: expect.anything() }),
+      expect.any(Function),
+    );
+    expect(checked.some((file) => file.includes('rootfs'))).toBe(false);
+    expect(deps.verifyManifestAttestation).toHaveBeenCalledWith(
+      '/usr/bin/gh', '/snapshot/manifest.json', '/snapshot/manifest.sigstore.jsonl',
+    );
+  });
+
+  it('fails closed on a common artifact digest mismatch and removes its snapshot', async () => {
+    const deps = dependencies({
+      sha256: jest.fn(async (file) => file.includes('vmlinux') ? 'f'.repeat(64) : digest),
+    });
+    await expect(runCloudHypervisorCommonPreflight(config({ rootfsPath: undefined }), deps))
+      .rejects.toThrow(/guest kernel.*SHA-256 mismatch/);
+    expect(deps.removeArtifactSnapshot).toHaveBeenCalledWith(
+      `${CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT}/run-common`,
+    );
+  });
+
+  it.each([
+    {
+      failure: 'attestation',
+      override: { verifyManifestAttestation: async () => { throw new Error('attestation rejected'); } },
+      message: /attestation rejected/,
+    },
+    {
+      failure: 'version',
+      override: { runVersion: async () => 'v52.0' },
+      message: /pinned to v53.0/,
+    },
+    {
+      failure: 'host',
+      override: { platform: 'darwin' as const },
+      message: /requires Linux with KVM/,
+    },
+  ])('fails closed when common $failure validation fails', async ({ override, message }) => {
+    const deps = dependencies(override);
+    await expect(runCloudHypervisorCommonPreflight(config({ rootfsPath: undefined }), deps))
+      .rejects.toThrow(message);
+    expect(deps.removeArtifactSnapshot).toHaveBeenCalledWith(
+      `${CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT}/run-common`,
+    );
+  });
+
+  it('rejects unattested enclave common preflight even when the development bypass is configured', async () => {
+    const publish = jest.fn();
+    const deps = dependencies({
+      hostPreflightReporter: new HostPreflightReporter('bounded-runtime', publish),
+    });
+    await expect(runCloudHypervisorCommonPreflight(config({
+      rootfsPath: undefined, developmentAllowUnattestedArtifacts: true,
+    }), deps)).rejects.toThrow(/attested primary manifest/);
+    const progress: HostPreflightProgress = publish.mock.lastCall[0];
+    expect(progress.checks.filter((check) => check.result === 'failed')).toEqual([
+      { id: 'artifact-configuration', result: 'failed', reason: 'unknown' },
+    ]);
+    expect(deps.createCommonArtifactSnapshot).not.toHaveBeenCalled();
+  });
   let originalPath: string | undefined;
 
   beforeEach(() => {
@@ -69,9 +254,156 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
 
   afterEach(() => {
     delete process.env.SUDO_UID;
+    delete process.env.AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS;
     jest.restoreAllMocks();
     if (originalPath === undefined) delete process.env.PATH;
     else process.env.PATH = originalPath;
+  });
+
+  it.each([
+    'getent', 'getfacl', 'groupdel', 'id', 'ip', 'nft', 'sysctl', 'flock',
+    'mke2fs', 'debugfs', 'e2fsck', 'rsync', 'mount', 'umount', 'setfacl', 'setpriv',
+    'useradd', 'userdel', 'gh', 'docker',
+  ])('identifies a failure of required trusted tool %s before a gateway can start', async (tool) => {
+    const records: HostPreflightProgress[] = [];
+    const error = Object.assign(new Error('/private/SECRET\nBearer credential'), { code: 'EACCES' });
+    const deps = dependencies({
+      hostPreflightReporter: new HostPreflightReporter('bounded-runtime', (record) => records.push(record)),
+      assertToolAvailable: jest.fn(async (candidate) => {
+        if (candidate === tool) throw error;
+        return `/trusted/${candidate}`;
+      }),
+    });
+    await expect(runCloudHypervisorPreflight(config(), deps)).rejects.toThrow(/requires host tool|SECRET/);
+    const last = records[records.length - 1];
+    expect(last.checks.filter((check) => check.result === 'failed'))
+      .toEqual([{ id: `tool-${tool}`, result: 'failed', reason: 'EACCES' }]);
+    expect(JSON.stringify(last)).not.toMatch(/private|SECRET|Bearer|credential/);
+    expect(last.checks.find((check) => check.id === 'docker-infrastructure')?.result).toBe('not-attempted');
+  });
+
+  it.each([
+    { check: 'cloud-hypervisor-trust', file: '/opt/cloud-hypervisor' },
+    { check: 'virtiofsd-trust', file: '/opt/virtiofsd' },
+    { check: 'kernel-trust', file: '/opt/vmlinux.bin' },
+    { check: 'rootfs-trust', file: '/opt/rootfs.ext4' },
+    { check: 'supervisor-trust', file: '/opt/awf-supervisor' },
+    { check: 'manifest-trust', file: '/opt/manifest.json' },
+    { check: 'bundle-trust', file: '/opt/manifest.sigstore.jsonl' },
+    { check: 'kvm-access', file: '/dev/kvm' },
+  ])('records the actual $check access failure and not unexecuted later checks', async ({ check, file }) => {
+    const publish = jest.fn();
+    await expect(runCloudHypervisorPreflight(config(), dependencies({
+      hostPreflightReporter: new HostPreflightReporter('bounded-runtime', publish),
+      access: async (candidate) => {
+        if (candidate === file) throw Object.assign(new Error('/private/SECRET'), { code: 'EPERM' });
+      },
+    }))).rejects.toThrow();
+    const record = publish.mock.calls[publish.mock.calls.length - 1][0] as HostPreflightProgress;
+    expect(record.checks.filter((item) => item.result === 'failed'))
+      .toEqual([{ id: check, result: 'failed', reason: 'EPERM' }]);
+    expect(record.checks.find((item) => item.id === 'docker-info')?.result).toBe('not-attempted');
+    expect(JSON.stringify(record)).not.toContain(file);
+  });
+
+  it.each([
+    { reason: 'file-symlink', stat: { isSymbolicLink: () => true } },
+    { reason: 'file-type', stat: { isFile: () => false } },
+    { reason: 'file-owner', stat: { uid: 2000 } },
+    { reason: 'file-writable', stat: { mode: 0o100777 } },
+  ])('rejects $reason on the snapshot source before allocating or probing any snapshot', async ({ reason, stat }) => {
+    const published: HostPreflightProgress[] = [];
+    const deps = dependencies({
+      hostPreflightReporter: new HostPreflightReporter('bounded-runtime', (value) => published.push(value)),
+    });
+    const original = deps.lstat!;
+    deps.lstat = async (file) => ({
+      ...await original(file), ...(file === '/opt/rootfs.ext4' ? stat : {}),
+    });
+    await expect(runCloudHypervisorPreflight(config(), deps)).rejects.toThrow();
+    const record = published[published.length - 1];
+    expect(record.checks.filter((check) => check.result === 'failed')).toEqual([
+      { id: 'rootfs-trust', result: 'failed', reason },
+    ]);
+    expect(record.checks.find((check) => check.id === 'artifact-snapshot')?.result).toBe('not-attempted');
+    expect(deps.createArtifactSnapshot).not.toHaveBeenCalled();
+    expect(deps.verifyManifestAttestation).not.toHaveBeenCalled();
+    expect(deps.runVersion).not.toHaveBeenCalled();
+    expect(JSON.stringify(published)).not.toContain('/opt/');
+  });
+
+  it.each([
+    { check: 'artifact-configuration', setup: { kernelPath: undefined }, reason: 'unknown' },
+    { check: 'artifact-snapshot', override: { createArtifactSnapshot: async () => { throw Object.assign(new Error('secret'), { code: 'ENOSPC' }); } }, reason: 'ENOSPC' },
+    { check: 'manifest-attestation', override: { verifyManifestAttestation: async () => { throw new Error('secret'); } }, reason: 'unknown' },
+    { check: 'manifest-contents', override: { readFile: async () => '{"secret":true}' }, reason: 'unknown' },
+    { check: 'cloud-hypervisor-digest', override: { sha256: async () => 'f'.repeat(64) }, reason: 'digest-mismatch' },
+    { check: 'cloud-hypervisor-version', override: { runVersion: async () => 'secret' }, reason: 'version-format' },
+    { check: 'cloud-hypervisor-version', override: { runVersion: async () => 'v52.0' }, reason: 'version-mismatch' },
+    { check: 'platform', override: { platform: 'darwin' as const }, reason: 'requirement-not-met' },
+    { check: 'architecture', override: { arch: 'arm64' }, reason: 'requirement-not-met' },
+    { check: 'kvm-group', override: { resolveKvmGid: async () => { throw Object.assign(new Error('secret'), { code: 'ENOENT' }); } }, reason: 'ENOENT' },
+    { check: 'host-policy', override: { assertHostPolicy: async () => { throw new Error('secret'); } }, reason: 'unknown' },
+    { check: 'docker-infrastructure', override: { assertDockerInfrastructure: async () => { throw new Error('secret'); } }, reason: 'unknown' },
+  ])('preserves the actual $check error while reporting safe reason $reason', async ({ check, override, setup, reason }) => {
+    const publish = jest.fn();
+    await expect(runCloudHypervisorPreflight(config(setup), dependencies({
+      ...override, hostPreflightReporter: new HostPreflightReporter('bounded-runtime', publish),
+    }))).rejects.toThrow();
+    const record = publish.mock.calls[publish.mock.calls.length - 1][0] as HostPreflightProgress;
+    expect(record.checks.filter((item) => item.result === 'failed'))
+      .toEqual([{ id: check, result: 'failed', reason }]);
+    expect(JSON.stringify(record)).not.toContain('secret');
+  });
+
+  it.each([
+    ['virtiofsd-digest', '/snapshot/virtiofsd'],
+    ['kernel-digest', '/snapshot/vmlinux.bin'],
+    ['rootfs-digest', '/snapshot/rootfs.ext4'],
+    ['supervisor-digest', '/snapshot/awf-supervisor'],
+  ])('retains per-artifact digest attribution for %s', async (check, file) => {
+    const publish = jest.fn();
+    await expect(runCloudHypervisorPreflight(config(), dependencies({
+      hostPreflightReporter: new HostPreflightReporter('bounded-runtime', publish),
+      sha256: async (candidate) => candidate === file ? 'f'.repeat(64) : digest,
+    }))).rejects.toThrow(/SHA-256 mismatch/);
+    const record = publish.mock.calls[publish.mock.calls.length - 1][0] as HostPreflightProgress;
+    expect(record.checks.find((item) => item.id === check))
+      .toEqual({ id: check, result: 'failed', reason: 'digest-mismatch' });
+  });
+
+  it.each([
+    ['ipv4-control', '/proc/sys/net/ipv4/ip_forward'],
+    ['ipv6-control', '/proc/sys/net/ipv6/conf/all/disable_ipv6'],
+    ['seccomp-control', '/proc/sys/kernel/seccomp/actions_avail'],
+    ['cgroup-v2', '/sys/fs/cgroup/cgroup.controllers'],
+  ] as [HostPreflightCheck, string][])('distinguishes the default host-policy check %s', async (check, file) => {
+    jest.spyOn(process, 'getuid').mockReturnValue(0);
+    jest.spyOn(fs, 'access').mockImplementation(async (candidate) => {
+      if (candidate === file) throw Object.assign(new Error('/private/SECRET'), { code: 'EACCES' });
+    });
+    const publish = jest.fn();
+    await expect(cloudHypervisorPreflightTestHelpers.defaultDependencies.assertHostPolicy(
+      new HostPreflightReporter('bounded-runtime', publish),
+    )).rejects.toBeInstanceOf(CloudHypervisorUnsupportedHostError);
+    const record = publish.mock.calls[publish.mock.calls.length - 1][0] as HostPreflightProgress;
+    expect(record.checks.filter((item) => item.result === 'failed'))
+      .toEqual([{ id: check, result: 'failed', reason: 'EACCES' }]);
+  });
+
+  it.each(['docker-info', 'docker-compose'])('distinguishes the real Docker command gate %s', async (check) => {
+    mockedExeca.mockImplementation((async (_binary: string, args: string[]) => ({
+      exitCode: args[0] === (check === 'docker-info' ? 'info' : 'compose') ? 1 : 0,
+      stdout: '/private/SECRET', stderr: '/private/SECRET',
+    })) as typeof execa);
+    const publish = jest.fn();
+    await expect(cloudHypervisorPreflightTestHelpers.defaultDependencies.assertDockerInfrastructure(
+      '/trusted/docker', new HostPreflightReporter('bounded-runtime', publish),
+    )).rejects.toThrow(/failed with code 1/);
+    const record = publish.mock.calls[publish.mock.calls.length - 1][0] as HostPreflightProgress;
+    expect(record.checks.find((item) => item.id === check))
+      .toEqual({ id: check, result: 'failed', reason: 'command-failed' });
+    expect(JSON.stringify(record)).not.toContain('SECRET');
   });
 
   it('runs default version, tool, and digest host probes', async () => {
@@ -94,9 +426,30 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
       /--version" exited with code/,
     );
 
-    process.env.PATH = `${path.delimiter}/usr/bin`;
+    const mountPath = process.platform === 'darwin' ? '/sbin/mount' : '/usr/bin/mount';
+    const mountDirectory = path.dirname(mountPath);
+    const mountPaths = [mountPath];
+    for (let ancestor = mountDirectory; ancestor !== path.parse(ancestor).root; ancestor = path.dirname(ancestor)) {
+      mountPaths.push(ancestor);
+    }
+    jest.spyOn(fs, 'lstat').mockImplementation(async (filePath) => {
+      if (!['/trusted', '/trusted/bin', '/trusted/bin/false', ...mountPaths].includes(String(filePath))) {
+        throw Object.assign(new Error('missing tool'), { code: 'ENOENT' });
+      }
+      return {
+        isFile: () => true,
+        isSymbolicLink: () => false,
+        mode: 0o100755,
+        size: 1,
+        uid: 0,
+      } as Awaited<ReturnType<typeof fs.lstat>>;
+    });
+    jest.spyOn(fs, 'access').mockResolvedValue(undefined);
+    process.env.PATH = `${path.delimiter}/trusted/bin${path.delimiter}${mountDirectory}`;
     await expect(defaults.assertToolAvailable('false'))
-      .resolves.toBe('/usr/bin/false');
+      .resolves.toBe('/trusted/bin/false');
+    await expect(defaults.assertToolAvailable('mount'))
+      .resolves.toBe(mountPath);
     await expect(defaults.assertToolAvailable('definitely-not-an-awf-tool'))
       .rejects.toThrow(/was not found on PATH/);
 
@@ -110,6 +463,105 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
     } finally {
       await fs.rm(directory, { recursive: true, force: true });
     }
+  });
+
+  it('reports actionable version probe failures for signals and spawn errors', async () => {
+    const defaults = cloudHypervisorPreflightTestHelpers.defaultDependencies;
+    mockedExeca
+      .mockResolvedValueOnce({
+        exitCode: null,
+        signal: 'SIGKILL',
+        stdout: '',
+        stderr: 'killed by host',
+      } as never)
+      .mockResolvedValueOnce({
+        exitCode: undefined,
+        signal: undefined,
+        code: 'EACCES',
+        shortMessage: 'Command failed with EACCES: spawn EACCES',
+        stdout: '',
+        stderr: '',
+      } as never);
+
+    await expect(defaults.runVersion('/snapshot/cloud-hypervisor')).rejects.toThrow(
+      /terminated by signal SIGKILL \(exitCode=null, signalCode=SIGKILL\): killed by host/,
+    );
+    await expect(defaults.runVersion('/snapshot/cloud-hypervisor')).rejects.toThrow(
+      /Permission denied executing "\/snapshot\/cloud-hypervisor --version".*exec-capable mount: code=EACCES; Command failed with EACCES: spawn EACCES/,
+    );
+    mockedExeca.mockResolvedValueOnce({
+      exitCode: undefined,
+      signal: undefined,
+      code: 'EACCES',
+      shortMessage: 'Command failed with EACCES: spawn EACCES',
+      stdout: '',
+      stderr: '',
+    } as never);
+    await expect(defaults.runVersion('/snapshot/cloud-hypervisor')).rejects.toMatchObject({
+      code: 'EACCES',
+    });
+  });
+
+  it('includes identity, mount, stat, and ACL diagnostics for EACCES version probes', async () => {
+    const defaults = cloudHypervisorPreflightTestHelpers.defaultDependencies;
+    (mockedExeca as unknown as jest.Mock).mockImplementation(async (
+      command: string,
+      args?: string[],
+    ) => {
+      if (command === '/snapshot/cloud-hypervisor') {
+        return {
+          exitCode: undefined,
+          signal: undefined,
+          code: 'EACCES',
+          shortMessage: 'Command failed with EACCES: spawn EACCES',
+          stdout: '',
+          stderr: '',
+        } as never;
+      }
+      if (command === '/usr/bin/getfacl') {
+        return {
+          exitCode: 0,
+          stdout: `user::rwx\nuser:${args?.[3] ?? 'unknown'}:r-x`,
+          stderr: '',
+        } as never;
+      }
+      throw new Error(`unexpected command: ${String(command)}`);
+    });
+    jest.spyOn(fs, 'access').mockResolvedValue(undefined);
+    jest.spyOn(fs, 'readFile').mockImplementation(async (filePath) => {
+      if (filePath === '/proc/self/mountinfo') {
+        return '25 1 0:24 / / rw,relatime - ext4 /dev/root rw\n' +
+          '26 25 0:25 / /snapshot rw,nosuid,nodev,noexec - tmpfs tmpfs rw\n';
+      }
+      return manifest();
+    });
+    jest.spyOn(fs, 'lstat').mockResolvedValue({
+      isSymbolicLink: () => false,
+      isDirectory: () => false,
+      isFile: () => true,
+      mode: 0o100555,
+      uid: 0,
+      gid: 0,
+      size: 1,
+    } as never);
+
+    await expect(defaults.runVersion('/snapshot/cloud-hypervisor')).rejects.toThrow(
+      /Cloud Hypervisor execution diagnostics:[\s\S]*identity: uid=[\s\S]*mount: \/snapshot type=tmpfs source=tmpfs options=rw,nosuid,nodev,noexec[\s\S]*\/snapshot\/cloud-hypervisor: stat=file,mode=0555,uid=0,gid=0,size=1; acl=/,
+    );
+  });
+
+  it('reports a missing external binary without describing it as a permission failure', async () => {
+    const defaults = cloudHypervisorPreflightTestHelpers.defaultDependencies;
+    mockedExeca.mockRejectedValueOnce(
+      Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+    );
+
+    const error = await defaults.runVersion('/snapshot/cloud-hypervisor').catch((caught) => caught);
+    expect(error).toMatchObject({ code: 'ENOENT' });
+    expect((error as Error).message).toMatch(
+      /Required external binary "\/snapshot\/cloud-hypervisor" is unavailable.*code=ENOENT/,
+    );
+    expect((error as Error).message).not.toMatch(/permission|executable|exec-capable/i);
   });
 
   it('runs host policy and Docker probes through the default helper', async () => {
@@ -137,6 +589,37 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
     const statSpy = jest.spyOn(fs, 'stat').mockResolvedValue({ gid: 978 } as never);
     await expect(defaults.resolveKvmGid()).resolves.toBe(978);
     expect(statSpy).toHaveBeenCalledWith('/dev/kvm');
+  });
+
+  it('verifies the manifest with the offline bundle and exact release workflow identity', async () => {
+    mockedExeca.mockResolvedValue({
+      exitCode: 0,
+      stdout: 'Loaded digest sha256:abc',
+      stderr: '',
+    } as never);
+    await expect(
+      cloudHypervisorPreflightTestHelpers.defaultDependencies.verifyManifestAttestation(
+        '/usr/bin/gh',
+        '/opt/manifest.json',
+        '/opt/manifest.sigstore.jsonl',
+      ),
+    ).resolves.toBeUndefined();
+    expect(mockedExeca).toHaveBeenCalledWith(
+      '/usr/bin/gh',
+      [
+        'attestation',
+        'verify',
+        '/opt/manifest.json',
+        '--repo',
+        'github/gh-aw-firewall',
+        '--bundle',
+        '/opt/manifest.sigstore.jsonl',
+        '--signer-workflow',
+        'github/gh-aw-firewall/.github/workflows/release.yml',
+        '--deny-self-hosted-runners',
+      ],
+      expect.objectContaining({ reject: false, timeout: 30_000 }),
+    );
   });
 
   it('reports host policy and Docker probe failures', async () => {
@@ -172,25 +655,25 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
     expect(() => parseCloudHypervisorVersion('unknown')).toThrow(/Could not parse/);
   });
 
-  it('parses and pins virtiofsd v1.10.0 output', () => {
+  it('parses and pins virtiofsd v1.13.3 output', () => {
+    expect(VIRTIOFSD_RELEASE_VERSION).toBe('1.13.3');
+    expect(parseVirtiofsdVersion('virtiofsd 1.13.3')).toBe('1.13.3');
     expect(parseVirtiofsdVersion('virtiofsd backend 1.10.0')).toBe('1.10.0');
     expect(() => parseVirtiofsdVersion('virtiofsd unknown')).toThrow(/Could not parse/);
   });
 
-  it('pins Cloud Hypervisor v53.0 and verifies configured digests', async () => {
+  it('verifies the attested manifest before its five artifact digests', async () => {
     const deps = dependencies();
     const result = await runCloudHypervisorPreflight(config({
-      sha256: {
-        cloudHypervisor: digest,
-        virtiofsd: digest,
-        kernel: digest,
-        rootfs: digest,
-        supervisor: digest,
-      },
     }), deps);
 
     expect(result.version).toBe('53.0');
-    expect(result.virtiofsdBinary).toBe('/opt/virtiofsd');
+    expect(result.cloudHypervisorBinary).toBe('/snapshot/cloud-hypervisor');
+    expect(result.virtiofsdBinary).toBe('/snapshot/virtiofsd');
+    expect(result.kernelPath).toBe('/snapshot/vmlinux.bin');
+    expect(result.rootfsPath).toBe('/snapshot/rootfs.ext4');
+    expect(result.supervisorPath).toBe('/snapshot/awf-supervisor');
+    expect(result.artifactSnapshotDirectory).toContain('run-test');
     expect(result.cgroupVersion).toBe(2);
     expect(result.kvmGid).toBe(978);
     expect(deps.resolveKvmGid).toHaveBeenCalledTimes(1);
@@ -199,12 +682,30 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
       constants.R_OK | constants.W_OK,
     );
     expect(deps.sha256).toHaveBeenCalledTimes(5);
-    expect(deps.assertToolAvailable).toHaveBeenCalledTimes(11);
-    expect(deps.assertDockerInfrastructure).toHaveBeenCalledWith('/usr/bin/docker');
+    expect(deps.assertToolAvailable).toHaveBeenCalledTimes(20);
+    expect(deps.assertDockerInfrastructure).toHaveBeenCalledWith('/usr/bin/docker', expect.anything());
+    expect(deps.verifyManifestAttestation).toHaveBeenCalledWith(
+      '/usr/bin/gh',
+      '/snapshot/manifest.json',
+      '/snapshot/manifest.sigstore.jsonl',
+    );
+    const sparseCopy = (deps.createArtifactSnapshot as jest.Mock).mock.calls[0][1];
+    await sparseCopy('/source/rootfs.ext4', '/snapshot/rootfs.ext4');
+    expect(deps.copySparseFile).toHaveBeenCalledWith(
+      '/usr/bin/rsync',
+      '/source/rootfs.ext4',
+      '/snapshot/rootfs.ext4',
+    );
     expect(result.tools).toEqual({
+      getfacl: '/usr/bin/getfacl',
+      getent: '/usr/bin/getent',
+      groupdel: '/usr/bin/groupdel',
+      id: '/usr/bin/id',
       ip: '/usr/bin/ip',
+      docker: '/usr/bin/docker',
       nft: '/usr/bin/nft',
       sysctl: '/usr/bin/sysctl',
+      flock: '/usr/bin/flock',
       mke2fs: '/usr/bin/mke2fs',
       debugfs: '/usr/bin/debugfs',
       e2fsck: '/usr/bin/e2fsck',
@@ -212,17 +713,78 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
       mount: '/usr/bin/mount',
       umount: '/usr/bin/umount',
       setpriv: '/usr/bin/setpriv',
+      setfacl: '/usr/bin/setfacl',
+      useradd: '/usr/bin/useradd',
+      userdel: '/usr/bin/userdel',
     });
   });
 
-  it('rejects inaccessible KVM without checking artifacts', async () => {
-    const access = jest.fn().mockRejectedValue(new Error('EACCES'));
-    const lstat = jest.fn();
+  it('validates artifacts before rejecting inaccessible KVM', async () => {
+    const access = jest.fn(async (filePath: string) => {
+      if (filePath === '/dev/kvm') throw new Error('EACCES');
+    });
+    const lstat = jest.fn().mockResolvedValue({
+      isFile: () => true,
+      isSymbolicLink: () => false,
+      mode: 0o100755,
+      size: 1,
+      uid: 0,
+    });
+    const sha256 = jest.fn().mockResolvedValue(digest);
     await expect(runCloudHypervisorPreflight(
       config(),
-      dependencies({ access, lstat }),
+      dependencies({ access, lstat, sha256 }),
     )).rejects.toThrow(/readable and writable \/dev\/kvm.*EACCES/);
-    expect(lstat).not.toHaveBeenCalled();
+    expect(lstat).toHaveBeenCalled();
+    expect(sha256).toHaveBeenCalledWith('/snapshot/cloud-hypervisor');
+  });
+
+  it('retries a transient version-probe failure after digests already verified', async () => {
+    const runVersion = jest.fn()
+      .mockRejectedValueOnce(new Error('"cloud-hypervisor --version" exited with code undefined'))
+      .mockResolvedValueOnce('cloud-hypervisor v53.0')
+      .mockResolvedValueOnce('virtiofsd 1.13.3');
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ runVersion }),
+    )).resolves.toBeDefined();
+    expect(runVersion).toHaveBeenCalledTimes(3);
+  });
+
+  it('fails closed after exhausting version-probe retries', async () => {
+    const runVersion = jest.fn().mockRejectedValue(
+      new Error('"cloud-hypervisor --version" exited with code undefined'),
+    );
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ runVersion }),
+    )).rejects.toThrow(/exited with code undefined/);
+    expect(runVersion).toHaveBeenCalledTimes(3);
+  });
+
+  it('does not retry deterministic version-probe failures like EACCES/ENOENT', async () => {
+    const runVersion = jest.fn().mockRejectedValue(
+      new Error(
+        'Unable to execute "/snapshot/cloud-hypervisor --version"; verify the trusted Cloud ' +
+        'Hypervisor artifact exists, is executable, and is complete: code=EACCES; spawn EACCES',
+      ),
+    );
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ runVersion }),
+    )).rejects.toThrow(/code=EACCES/);
+    expect(runVersion).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not retry a structured error.code marking a deterministic failure', async () => {
+    const runVersion = jest.fn().mockRejectedValue(
+      Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }),
+    );
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ runVersion }),
+    )).rejects.toThrow(/spawn ENOENT/);
+    expect(runVersion).toHaveBeenCalledTimes(1);
   });
 
   it('rejects mismatched versions, unsafe permissions, and digest mismatches', async () => {
@@ -238,20 +800,140 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
           isFile: () => true,
           isSymbolicLink: () => false,
           mode: 0o100777,
+          size: 1,
           uid: 1000,
         }),
       }),
     )).rejects.toThrow(/must not be group- or world-writable/);
 
     await expect(runCloudHypervisorPreflight(
-      config({ sha256: { kernel: digest } }),
+      config(),
       dependencies({ sha256: jest.fn().mockResolvedValue('b'.repeat(64)) }),
     )).rejects.toThrow(/SHA-256 mismatch/);
 
+    process.env.AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS = '1';
     await expect(runCloudHypervisorPreflight(
-      config({ sha256: { kernel: 'bad' } }),
+      config({
+        developmentAllowUnattestedArtifacts: true,
+        sha256: {
+          cloudHypervisor: digest,
+          virtiofsd: digest,
+          kernel: 'bad',
+          rootfs: digest,
+          supervisor: digest,
+        },
+      }),
       dependencies(),
     )).rejects.toThrow(/must contain exactly 64 hexadecimal/);
+  });
+
+  it('fails closed when attestation verification fails before reading the manifest', async () => {
+    const readFile = jest.fn();
+    const removeArtifactSnapshot = jest.fn().mockResolvedValue(undefined);
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({
+        readFile,
+        removeArtifactSnapshot,
+        verifyManifestAttestation: jest.fn().mockRejectedValue(new Error('bad signature')),
+      }),
+    )).rejects.toThrow(/bad signature/);
+    expect(readFile).not.toHaveBeenCalled();
+    expect(removeArtifactSnapshot).toHaveBeenCalledWith(
+      `${CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT}/run-test`,
+    );
+  });
+
+  describe('primary rootfs inventory', () => {
+    function inventoryDependencies(
+      overrides: Partial<CloudHypervisorPreflightDependencies> = {},
+      rootfsDigest = digest,
+    ): Partial<CloudHypervisorPreflightDependencies> {
+      const input = JSON.parse(manifest());
+      input.artifacts.rootfs.sbom = { file: 'rootfs.sbom.spdx.json', sha256: digest };
+      const inventory = JSON.stringify({
+        spdxVersion: 'SPDX-2.3',
+        packages: [{
+          SPDXID: 'SPDXRef-Rootfs',
+          checksums: [{ algorithm: 'SHA256', checksumValue: rootfsDigest }],
+        }],
+        files: [{ fileName: '/bin/bash' }],
+      });
+      return dependencies({
+        readFile: jest.fn(async file => file.endsWith('.spdx.json') ? inventory : JSON.stringify(input)),
+        ...overrides,
+      });
+    }
+
+    it('stages and verifies the inventory from the immutable snapshot on every use', async () => {
+      const deps = inventoryDependencies();
+      await runCloudHypervisorPreflight(config(), deps);
+      await runCloudHypervisorPreflight(config(), deps);
+      expect(deps.createArtifactSnapshot).toHaveBeenCalledWith(
+        expect.objectContaining({ rootfsSbomPath: '/opt/rootfs.sbom.spdx.json' }), expect.any(Function),
+      );
+      expect((deps.sha256 as jest.Mock).mock.calls.filter(([file]) =>
+        file === '/snapshot/rootfs.sbom.spdx.json')).toHaveLength(2);
+      expect(deps.readFile).toHaveBeenCalledWith('/snapshot/rootfs.sbom.spdx.json');
+    });
+
+    it.each(['initial use', 'cache reuse'])('rejects a missing inventory on %s', async phase => {
+      const deps = inventoryDependencies();
+      if (phase === 'cache reuse') await runCloudHypervisorPreflight(config(), deps);
+      (deps.access as jest.Mock).mockImplementation(async file => {
+        if (file === '/opt/rootfs.sbom.spdx.json') throw new Error('missing inventory');
+      });
+      await expect(runCloudHypervisorPreflight(config(), deps)).rejects.toThrow('missing inventory');
+    });
+
+    it.each(['initial use', 'cache reuse'])('rejects a tampered inventory on %s', async phase => {
+      const deps = inventoryDependencies();
+      if (phase === 'cache reuse') await runCloudHypervisorPreflight(config(), deps);
+      (deps.sha256 as jest.Mock).mockImplementation(async file =>
+        file.endsWith('.spdx.json') ? 'f'.repeat(64) : digest);
+      await expect(runCloudHypervisorPreflight(config(), deps)).rejects.toThrow(/SBOM.*SHA-256 mismatch/);
+      expect(deps.removeArtifactSnapshot).toHaveBeenCalled();
+    });
+
+    it('rejects an inventory that does not bind the final rootfs digest', async () => {
+      await expect(runCloudHypervisorPreflight(config(), inventoryDependencies({}, 'f'.repeat(64))))
+        .rejects.toThrow(/SBOM does not bind its final filesystem digest/);
+    });
+
+    it('rejects a declared inventory missing before snapshot creation', async () => {
+      const deps = inventoryDependencies();
+      const lstat = deps.lstat!;
+      deps.lstat = async file => {
+        if (file.endsWith('.spdx.json')) throw Object.assign(new Error('missing'), { code: 'ENOENT' });
+        return lstat(file);
+      };
+      await expect(runCloudHypervisorPreflight(config(), deps)).rejects.toThrow(/SBOM snapshot is missing/);
+      expect(deps.verifyManifestAttestation).toHaveBeenCalled();
+      expect(deps.removeArtifactSnapshot).toHaveBeenCalled();
+    });
+  });
+
+  it('requires conspicuous dual opt-in for development-only legacy digests', async () => {
+    const legacy = config({
+      artifactManifestPath: undefined,
+      artifactManifestBundlePath: undefined,
+      artifactReleaseTag: undefined,
+      developmentAllowUnattestedArtifacts: true,
+      sha256: {
+        cloudHypervisor: digest,
+        virtiofsd: digest,
+        kernel: digest,
+        rootfs: digest,
+        supervisor: digest,
+      },
+    });
+    await expect(runCloudHypervisorPreflight(legacy, dependencies()))
+      .rejects.toThrow(/AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1/);
+
+    process.env.AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS = '1';
+    const deps = dependencies();
+    await expect(runCloudHypervisorPreflight(legacy, deps)).resolves.toBeDefined();
+    expect(deps.verifyManifestAttestation).not.toHaveBeenCalled();
   });
 
   it('rejects a missing or mismatched sibling virtiofsd', async () => {
@@ -264,6 +946,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
             isFile: () => true,
             isSymbolicLink: () => false,
             mode: 0o100755,
+            size: 1,
             uid: 0,
           };
         }),
@@ -274,10 +957,10 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
       config(),
       dependencies({
         runVersion: jest.fn(async (filePath: string) => (
-          filePath.endsWith('/virtiofsd') ? 'virtiofsd backend 1.9.0' : 'cloud-hypervisor v53.0'
+          filePath.endsWith('/virtiofsd') ? 'virtiofsd backend 1.10.0' : 'cloud-hypervisor v53.0'
         )),
       }),
-    )).rejects.toThrow(/virtiofsd is pinned to v1\.10\.0/);
+    )).rejects.toThrow(/virtiofsd is pinned to v1\.13\.3; found v1\.10\.0/);
   });
 
   it('verifies Cloud Hypervisor digest before invoking the binary', async () => {
@@ -287,11 +970,34 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
       dependencies({
         runVersion,
         sha256: jest.fn(async (filePath: string) => (
-          filePath === '/opt/cloud-hypervisor' ? 'b'.repeat(64) : digest
+          filePath === '/snapshot/cloud-hypervisor' ? 'b'.repeat(64) : digest
         )),
       }),
     )).rejects.toThrow(/Cloud Hypervisor binary SHA-256 mismatch/);
     expect(runVersion).not.toHaveBeenCalled();
+  });
+
+  it('rejects empty staged artifacts before invoking the binary', async () => {
+    const runVersion = jest.fn().mockResolvedValue('cloud-hypervisor v53.0');
+    const sha256 = jest.fn().mockResolvedValue(digest);
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({
+        runVersion,
+        sha256,
+        lstat: jest.fn(async (filePath: string) => ({
+          isFile: () => true,
+          isSymbolicLink: () => false,
+          mode: 0o100755,
+          size: filePath === '/snapshot/cloud-hypervisor' ? 0 : 1,
+          uid: 0,
+        })),
+      }),
+    )).rejects.toThrow(
+      /Cloud Hypervisor binary trusted artifact is empty or incomplete before execution/,
+    );
+    expect(runVersion).not.toHaveBeenCalled();
+    expect(sha256).not.toHaveBeenCalledWith('/snapshot/cloud-hypervisor');
   });
 
   it('rejects missing artifacts, unsupported hosts, and unavailable tools', async () => {
@@ -318,6 +1024,45 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
     )).rejects.toThrow(/requires host tool "ip": missing/);
   });
 
+  it('validates artifact trust before classifying an unsupported host for fallback', async () => {
+    const removeArtifactSnapshot = jest.fn().mockResolvedValue(undefined);
+    const sha256 = jest.fn(async (filePath: string) => (
+      filePath === '/snapshot/cloud-hypervisor' ? 'b'.repeat(64) : digest
+    ));
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ platform: 'darwin', sha256, removeArtifactSnapshot }),
+    )).rejects.toThrow(/Cloud Hypervisor binary SHA-256 mismatch/);
+    expect(sha256).toHaveBeenCalledWith('/snapshot/cloud-hypervisor');
+    expect(removeArtifactSnapshot).toHaveBeenCalledWith(
+      `${CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT}/run-test`,
+    );
+  });
+
+  it('classifies only host policy failures as unsupported-host errors', async () => {
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ assertHostPolicy: jest.fn().mockRejectedValue(new Error('missing seccomp')) }),
+    )).rejects.toThrow(/host policy is unsupported: missing seccomp/);
+
+    const unsupported = new CloudHypervisorUnsupportedHostError('cgroup policy unsupported');
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ assertHostPolicy: jest.fn().mockRejectedValue(unsupported) }),
+    )).rejects.toBe(unsupported);
+  });
+
+  it('keeps missing Docker infrastructure fatal after artifact validation', async () => {
+    const assertToolAvailable = jest.fn(async (tool: string) => {
+      if (tool === 'docker') throw new Error('not installed');
+      return `/usr/bin/${tool}`;
+    });
+    await expect(runCloudHypervisorPreflight(
+      config(),
+      dependencies({ assertToolAvailable }),
+    )).rejects.toThrow(/requires host tool "docker": not installed/);
+  });
+
   it('rejects untrusted artifact files and inaccessible paths', async () => {
     await expect(runCloudHypervisorPreflight(
       config({ cloudHypervisorBinary: 'relative/cloud-hypervisor' }),
@@ -332,12 +1077,14 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
                 isFile: () => false,
                 isSymbolicLink: () => true,
                 mode: 0o120777,
+                size: 1,
                 uid: 0,
               }
             : {
                 isFile: () => false,
                 isSymbolicLink: () => false,
                 mode: 0o040755,
+                size: 1,
                 uid: 0,
               }
         )),
@@ -350,6 +1097,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
           isFile: () => true,
           isSymbolicLink: () => false,
           mode: 0o100755,
+          size: 1,
           uid: 4000,
         }),
       }),
@@ -370,6 +1118,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
       isFile: () => true,
       isSymbolicLink: () => false,
       mode: 0o100755,
+      size: 1,
       uid: 2001,
     });
     await expect(runCloudHypervisorPreflight(
@@ -385,6 +1134,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
           isFile: () => false,
           isSymbolicLink: () => false,
           mode: 0o040777,
+          size: 1,
           uid: 0,
         };
       }
@@ -392,6 +1142,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
         isFile: () => true,
         isSymbolicLink: () => false,
         mode: 0o100755,
+        size: 1,
         uid: 0,
       };
     });
@@ -406,6 +1157,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
           isFile: () => false,
           isSymbolicLink: () => true,
           mode: 0o040755,
+          size: 1,
           uid: 0,
         };
       }
@@ -413,6 +1165,7 @@ describe('Cloud Hypervisor preflight (foundation only)', () => {
         isFile: () => true,
         isSymbolicLink: () => false,
         mode: 0o100755,
+        size: 1,
         uid: 0,
       };
     });

@@ -1,7 +1,29 @@
 'use strict';
 
+const zlib = require('zlib');
 const { COPILOT_PLACEHOLDER_TOKEN } = require('./providers/copilot-byok');
 const { stripBearerPrefix } = require('./providers/copilot-auth');
+const { extractProviderErrorFields } = require('./provider-error-fields');
+const { classifyCopilotAuthError } = require('./copilot-auth-diagnostics');
+
+const DEFAULT_MAX_ERROR_RESPONSE_CAPTURE_BYTES = 64 * 1024;
+const REDACTED = '[REDACTED]';
+const OMITTED_RESPONSE_HEADERS = new Set([
+  'authorization',
+  'proxy-authorization',
+  'cookie',
+  'set-cookie',
+  'api-key',
+  'x-api-key',
+  'x-goog-api-key',
+]);
+const SENSITIVE_FIELD_NAME = '(?:api[_-]?key|authorization|proxy-authorization|cookie|set-cookie|(?:access|refresh|id|identity|session)[_-]?token|token|(?:client[_-]?)?secret|password|credential|private[_-]?key)';
+const REQUEST_ID_HEADER_PATTERNS = [
+  /request-id$/i,
+  /requestid$/i,
+  /correlation-id$/i,
+  /trace-id$/i,
+];
 
 // Paths that represent actual LLM inference calls (should count against maxRuns).
 // Non-inference endpoints (e.g., GET /models) are excluded.
@@ -55,7 +77,7 @@ function buildCopilotAuthErrorMessage(statusCode, env = process.env) {
 
 function createLogRequestCompletion({ metrics, logRequest, sanitizeForLog, applyMaxRunsInvocation }) {
   return function logRequestCompletion(statusCode, responseBytes, initiatorSent, billingInfo, {
-    startTime, provider, req, requestBytes, targetHost, requestId,
+    startTime, provider, req, requestBytes, targetHost, requestId, wireApiCompatibility, copilotAuthDiagnostic,
   }) {
     const duration = Date.now() - startTime;
     const sc = metrics.statusClass(statusCode);
@@ -72,9 +94,205 @@ function createLogRequestCompletion({ metrics, logRequest, sanitizeForLog, apply
       duration_ms: duration, request_bytes: requestBytes,
       response_bytes: responseBytes, upstream_host: targetHost,
     };
+    if (wireApiCompatibility) {
+      logFields.requested_endpoint = wireApiCompatibility.requestedEndpoint;
+      logFields.upstream_endpoint = wireApiCompatibility.upstreamEndpoint;
+    }
     if (initiatorSent) logFields.x_initiator = initiatorSent;
     if (billingInfo) logFields.billing = billingInfo;
     logRequest('info', 'request_complete', logFields);
+    if (provider === 'copilot' && copilotAuthDiagnostic && statusCode >= 200 && statusCode < 300) {
+      logRequest('info', 'copilot_auth_diagnostic', {
+        ...copilotAuthDiagnostic, status: statusCode,
+        error_class: 'none', body_capture: 'not_required', challenge: 'not_required',
+      });
+    }
+  };
+}
+
+function coerceHeaderValue(value) {
+  if (Array.isArray(value)) return value.map((v) => String(v)).join(', ');
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return '';
+  return String(value);
+}
+
+function sanitizeResponseHeaders(headers, sanitizeForLog) {
+  const sanitized = {};
+  const source = headers && typeof headers === 'object' ? headers : {};
+  for (const [name, value] of Object.entries(source)) {
+    const lower = name.toLowerCase();
+    if (OMITTED_RESPONSE_HEADERS.has(lower)) continue;
+    const safeValue = sanitizeForLog(coerceHeaderValue(value), 1024);
+    sanitized[lower] = safeValue;
+  }
+  return sanitized;
+}
+
+function extractUpstreamRequestIds(sanitizedHeaders) {
+  const ids = {};
+  for (const [name, value] of Object.entries(sanitizedHeaders)) {
+    if (!value) continue;
+    if (REQUEST_ID_HEADER_PATTERNS.some((pattern) => pattern.test(name))) {
+      ids[name] = value;
+    }
+  }
+  return ids;
+}
+
+function redactSecretsInText(value) {
+  if (typeof value !== 'string' || value.length === 0) return value || '';
+  return value
+    .replace(/\b(Bearer\s+)[^\s",]+/gi, `$1${REDACTED}`)
+    .replace(new RegExp(`("${SENSITIVE_FIELD_NAME}"\\s*:\\s*")[^"]*"`, 'gi'), `$1${REDACTED}"`)
+    .replace(new RegExp(`(${SENSITIVE_FIELD_NAME}\\s*[=:]\\s*)[^\\s,;]+`, 'gi'), `$1${REDACTED}`);
+}
+
+function resolveMaxErrorBodyBytes() {
+  const raw = Number.parseInt(process.env.AWF_MAX_ERROR_RESPONSE_CAPTURE_BYTES, 10);
+  if (Number.isFinite(raw) && raw > 0) return raw;
+  return DEFAULT_MAX_ERROR_RESPONSE_CAPTURE_BYTES;
+}
+
+function captureResponseBody({
+  responseBody,
+  responseBodyBytes,
+  responseBodyTruncated = false,
+  contentEncoding = '',
+}) {
+  const maxBodyBytes = resolveMaxErrorBodyBytes();
+  const rawBytes = Number.isFinite(responseBodyBytes) ? responseBodyBytes : (Buffer.isBuffer(responseBody) ? responseBody.length : 0);
+  const sourceBody = Buffer.isBuffer(responseBody) ? responseBody : Buffer.alloc(0);
+  const captureBytes = Math.min(sourceBody.length, maxBodyBytes);
+  const capturedBody = sourceBody.subarray(0, captureBytes);
+  const truncated = responseBodyTruncated || sourceBody.length > maxBodyBytes || rawBytes > maxBodyBytes;
+  const contentEncodingValue = String(contentEncoding || '').toLowerCase();
+  const compressed = !!contentEncodingValue && contentEncodingValue !== 'identity';
+  let bodyValue = capturedBody.toString('utf8');
+  let bodyOmitted = false;
+  if (compressed) {
+    try {
+      const options = { maxOutputLength: maxBodyBytes };
+      if (contentEncodingValue === 'gzip') bodyValue = zlib.gunzipSync(capturedBody, options).toString('utf8');
+      else if (contentEncodingValue === 'deflate') bodyValue = zlib.inflateSync(capturedBody, options).toString('utf8');
+      else if (contentEncodingValue === 'br') bodyValue = zlib.brotliDecompressSync(capturedBody, options).toString('utf8');
+      else bodyOmitted = true;
+    } catch {
+      bodyOmitted = true;
+    }
+  }
+  return { maxBodyBytes, rawBytes, captureBytes, truncated, compressed, bodyValue, bodyOmitted };
+}
+
+function formatResponseBodyLogFields(capture, sanitizeForLog) {
+  const { maxBodyBytes, rawBytes, captureBytes, truncated, compressed, bodyValue, bodyOmitted } = capture;
+  const redactedBody = redactSecretsInText(sanitizeForLog(bodyValue, maxBodyBytes * 4));
+  return {
+    response_body_content_encoding: bodyOmitted ? 'omitted' : 'utf8',
+    response_body: bodyOmitted
+      ? '[OMITTED: compressed response could not be safely inspected]'
+      : truncated
+      ? `${redactedBody}\n[TRUNCATED ${Math.max(rawBytes - captureBytes, 0)} BYTES]`
+      : redactedBody,
+    response_body_bytes: rawBytes,
+    response_body_captured_bytes: captureBytes,
+    response_body_truncated: truncated,
+    response_compressed: compressed,
+  };
+}
+
+function buildResponseBodyLogFields({ sanitizeForLog, ...body }) {
+  return formatResponseBodyLogFields(captureResponseBody(body), sanitizeForLog);
+}
+
+/**
+ * Parse the provider's error identifiers from a fully captured, decoded
+ * response body. Content-Type is ignored because Copilot sends JSON error
+ * envelopes as text/plain. Truncated or omitted captures yield nothing.
+ */
+function extractCapturedErrorFields(capture) {
+  if (capture.truncated || capture.bodyOmitted) return {};
+  try {
+    return extractProviderErrorFields(JSON.parse(capture.bodyValue));
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Flatten a request tool-surface summary into log fields.  Only names and
+ * counts are emitted, so no prompt or schema content can leak.
+ */
+function buildRequestToolLogFields(requestTools, sanitizeForLog) {
+  if (!requestTools || typeof requestTools !== 'object') return {};
+  const names = Array.isArray(requestTools.tool_names) ? requestTools.tool_names : [];
+  return {
+    request_tool_count: requestTools.tool_count,
+    request_tool_names: names.map((name) => sanitizeForLog(String(name), 200)),
+    request_unnamed_tool_count: requestTools.unnamed_tool_count,
+  };
+}
+
+function createLogUpstreamErrorResponse({
+  logRequest,
+  sanitizeForLog,
+  auditTrack = null,
+}) {
+  return function logUpstreamErrorResponse(statusCode, {
+    requestId, provider, targetHost, req,
+    responseHeaders, responseBody, responseBodyBytes,
+    responseBodyTruncated = false,
+    requestModel = null, requestTools = null, transformed = false,
+    // Set when AWF replaced the provider's response: the provider's original
+    // { responseBody, contentEncoding }, or null when there is none. Error
+    // identifiers come only from it, never from AWF's replacement body.
+    providerErrorBody,
+    copilotAuthDiagnostic,
+  }) {
+    if (statusCode >= 200 && statusCode < 300) return;
+    const safeHeaders = sanitizeResponseHeaders(responseHeaders, sanitizeForLog);
+    const upstreamRequestIds = extractUpstreamRequestIds(safeHeaders);
+    const contentType = safeHeaders['content-type'] || '';
+    const isStreaming = contentType.includes('text/event-stream');
+    const bodyCapture = captureResponseBody({
+      responseBody,
+      responseBodyBytes,
+      responseBodyTruncated,
+      contentEncoding: safeHeaders['content-encoding'],
+    });
+    const bodyFields = formatResponseBodyLogFields(bodyCapture, sanitizeForLog);
+    if (provider === 'copilot' && copilotAuthDiagnostic && [400, 401, 403].includes(statusCode)) {
+      const originalCapture = providerErrorBody === undefined ? bodyCapture
+        : providerErrorBody ? captureResponseBody(providerErrorBody)
+        : { bodyOmitted: true };
+      logRequest('warn', 'copilot_auth_diagnostic', {
+        ...copilotAuthDiagnostic,
+        status: statusCode,
+        ...classifyCopilotAuthError(originalCapture, responseHeaders),
+      });
+    }
+    const fields = {
+      request_id: requestId,
+      provider,
+      model: typeof requestModel === 'string' && requestModel.length > 0 ? sanitizeForLog(requestModel, 200) : undefined,
+      method: req.method,
+      endpoint: sanitizeForLog(req.url),
+      status: statusCode,
+      upstream_host: targetHost,
+      upstream_request_ids: upstreamRequestIds,
+      response_content_type: contentType,
+      response_headers: safeHeaders,
+      response_streaming: isStreaming,
+      response_transformed: !!transformed,
+      ...buildRequestToolLogFields(requestTools, sanitizeForLog),
+      ...bodyFields,
+      ...extractCapturedErrorFields(providerErrorBody === undefined ? bodyCapture
+        : providerErrorBody ? captureResponseBody(providerErrorBody) : { bodyOmitted: true }),
+    };
+    logRequest('warn', 'upstream_error_response', fields);
+    if (typeof auditTrack === 'function') {
+      auditTrack('UPSTREAM_ERROR_RESPONSE', fields);
+    }
   };
 }
 
@@ -111,7 +329,15 @@ function createLogUpstreamAuthError({
 
 module.exports = {
   createLogRequestCompletion,
+  createLogUpstreamErrorResponse,
   createLogUpstreamAuthError,
   buildCopilotAuthErrorMessage,
   isInferenceRequest,
+  _testing: {
+    sanitizeResponseHeaders,
+    extractUpstreamRequestIds,
+    redactSecretsInText,
+    buildResponseBodyLogFields,
+    buildRequestToolLogFields,
+  },
 };

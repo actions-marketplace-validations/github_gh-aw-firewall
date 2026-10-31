@@ -138,6 +138,21 @@ describe('buildProviderRoutingEnv', () => {
     expect(env.COPILOT_INTEGRATION_ID).toBe('my-integration');
   });
 
+  it.each(['GITHUB_REPOSITORY', 'GITHUB_WORKFLOW_REF'])('forwards nonempty %s for routing evidence', (key) => {
+    const saved = process.env[key];
+    try {
+      process.env[key] = '  owner/repo  ';
+      expect(buildProviderRoutingEnv({ ...baseConfig, workDir: '/tmp/awf-test' })[key]).toBe('owner/repo');
+      process.env[key] = '   ';
+      expect(buildProviderRoutingEnv({ ...baseConfig, workDir: '/tmp/awf-test' })[key]).toBeUndefined();
+      delete process.env[key];
+      expect(buildProviderRoutingEnv({ ...baseConfig, workDir: '/tmp/awf-test' })[key]).toBeUndefined();
+    } finally {
+      if (saved !== undefined) process.env[key] = saved;
+      else delete process.env[key];
+    }
+  });
+
   it('omits COPILOT_INTEGRATION_ID when whitespace-only', () => {
     const env = buildProviderRoutingEnv({
       ...baseConfig,
@@ -145,6 +160,15 @@ describe('buildProviderRoutingEnv', () => {
       additionalEnv: { COPILOT_INTEGRATION_ID: '   ' },
     });
     expect(env.COPILOT_INTEGRATION_ID).toBeUndefined();
+  });
+
+  it('forwards GITHUB_COPILOT_INTEGRATION_ID trimmed when set in additionalEnv', () => {
+    const env = buildProviderRoutingEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      additionalEnv: { GITHUB_COPILOT_INTEGRATION_ID: '  github-integration  ' },
+    });
+    expect(env.GITHUB_COPILOT_INTEGRATION_ID).toBe('github-integration');
   });
 
   it('forwards the default api-proxy shutdown timeout', () => {
@@ -232,6 +256,12 @@ describe('resolveApiProxyShutdownTimeoutMs', () => {
 });
 
 describe('buildProxyRoutingEnv', () => {
+  it('forwards catalogue controls without changing the Squid route', () => {
+    const modelCatalogue = { enabled: true, offline: true, refreshSeconds: 300 };
+    const env = buildApiProxyBaseEnv({ ...baseConfig, workDir: '/tmp/awf-test', modelCatalogue }, networkConfig);
+    expect(JSON.parse(env.AWF_MODEL_CATALOGUE)).toEqual(modelCatalogue);
+    expect(env.HTTPS_PROXY).toBe('http://172.30.0.10:3128');
+  });
   it('sets HTTP_PROXY and HTTPS_PROXY to point to Squid', () => {
     const env = buildProxyRoutingEnv(networkConfig);
     expect(env.HTTP_PROXY).toBe('http://172.30.0.10:3128');
@@ -350,14 +380,20 @@ describe('buildRateLimitEnv', () => {
     expect(env.AWF_RATE_LIMIT_RPM).toBeUndefined();
   });
 
-  it('sets AWF_MAX_EFFECTIVE_TOKENS when configured', () => {
-    const env = buildRateLimitEnv({ ...baseConfig, workDir: '/tmp/awf-test', maxEffectiveTokens: 5000 });
-    expect(env.AWF_MAX_EFFECTIVE_TOKENS).toBe('5000');
-  });
-
   it('sets AWF_MAX_AI_CREDITS when configured', () => {
     const env = buildRateLimitEnv({ ...baseConfig, workDir: '/tmp/awf-test', maxAiCredits: 1.25 });
     expect(env.AWF_MAX_AI_CREDITS).toBe('1.25');
+  });
+
+  it('sets model multiplier environment variables when configured', () => {
+    const env = buildRateLimitEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      modelMultipliers: { 'gpt-4o': 2 },
+      defaultModelMultiplier: 1.5,
+    });
+    expect(env.AWF_MODEL_MULTIPLIERS).toBe('{"gpt-4o":2}');
+    expect(env.AWF_DEFAULT_MODEL_MULTIPLIER).toBe('1.5');
   });
 
   it('sets AWF_API_PROXY_PROVIDERS when provider pricing overlays are configured', () => {
@@ -370,6 +406,35 @@ describe('buildRateLimitEnv', () => {
     };
     const env = buildRateLimitEnv({ ...baseConfig, workDir: '/tmp/awf-test', apiProxyProviders: providers });
     expect(JSON.parse(env.AWF_API_PROXY_PROVIDERS)).toEqual(providers);
+  });
+
+  it('passes a versioned model pricing catalog to the API proxy', () => {
+    const modelPricingCatalog = {
+      schemaVersion: 1 as const,
+      unit: 'USD_PER_1M_TOKENS' as const,
+      catalogId: 'github/gh-aw/model-pricing',
+      version: 'sha256:catalog-v1',
+      providers: {
+        copilot: {
+          models: {
+            'gpt-6.1-sol': {
+              input: 10,
+              cachedInput: 1,
+              cacheWrite: null,
+              output: 50,
+              reasoning: 50,
+            },
+          },
+        },
+      },
+    };
+    const env = buildRateLimitEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      modelPricingCatalog,
+    });
+
+    expect(JSON.parse(env.AWF_MODEL_PRICING_CATALOG)).toEqual(modelPricingCatalog);
   });
 
   it('sets AWF_MAX_RUNS when configured', () => {
@@ -390,6 +455,7 @@ describe('buildRateLimitEnv', () => {
   it('sets AWF_AGENT_TIMEOUT_MINUTES when configured', () => {
     const env = buildRateLimitEnv({ ...baseConfig, workDir: '/tmp/awf-test', agentTimeout: 30 });
     expect(env.AWF_AGENT_TIMEOUT_MINUTES).toBe('30');
+    expect(env.AWF_AGENT_RUNTIME_START_FILE).toBe('/var/log/api-proxy/agent-runtime/started-at-ms');
   });
 
   it('sets AWF_MAX_MODEL_MULTIPLIER when maxModelMultiplierCap is configured', () => {
@@ -413,14 +479,96 @@ describe('buildModelPolicyEnv', () => {
     expect(env.AWF_MODEL_FALLBACK).toBe('{"enabled":false,"strategy":"middle_power"}');
   });
 
+  it('sets AWF_FALLBACK_MODELS when fallbackModels is configured', () => {
+    const env = buildModelPolicyEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      fallbackModels: ['gpt-5.4', 'claude-sonnet-4.6'],
+    });
+    expect(env.AWF_FALLBACK_MODELS).toBe('["gpt-5.4","claude-sonnet-4.6"]');
+  });
+
+  it('omits AWF_FALLBACK_MODELS when fallbackModels is empty or unset', () => {
+    expect(buildModelPolicyEnv({ ...baseConfig, workDir: '/tmp/awf-test', fallbackModels: [] }))
+      .not.toHaveProperty('AWF_FALLBACK_MODELS');
+    expect(buildModelPolicyEnv({ ...baseConfig, workDir: '/tmp/awf-test' }))
+      .not.toHaveProperty('AWF_FALLBACK_MODELS');
+  });
+
+it('buildModelPolicyEnv no longer sets AWF_ROUTING_CONFIG when modelRouting is configured', () => {
+    const env = buildModelPolicyEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      modelRouting: {
+        objective: { goal: 'cost', mode: 'balanced' },
+        task: { conversationFile: '/tmp/gh-aw/routing-conversation.json' },
+      },
+    });
+    expect(env.AWF_ROUTING_CONFIG).toBeUndefined();
+  });
+
   it('sets AWF_ALLOWED_MODELS when allowedModels is non-empty', () => {
     const env = buildModelPolicyEnv({ ...baseConfig, workDir: '/tmp/awf-test', allowedModels: ['gpt-4o', 'claude-3-5-sonnet'] });
     expect(env.AWF_ALLOWED_MODELS).toBe('["gpt-4o","claude-3-5-sonnet"]');
   });
 
-  it('omits AWF_ALLOWED_MODELS when allowedModels is empty', () => {
+  describe('buildModelRoutingEnv', () => {
+    const { buildModelRoutingEnv } = testHelpers;
+
+    it('rewrites AWF_ROUTING_CONFIG to the staged container input path', () => {
+      const env = buildModelRoutingEnv({
+        ...baseConfig,
+        workDir: '/tmp/awf-test',
+        experimentalModelRouting: true,
+        modelRouting: {
+          candidateModels: ['gpt-5.6-luna'],
+          objective: { goal: 'cost', mode: 'balanced' },
+          task: { conversationFile: '/host/conversation.json' },
+        },
+        modelRoutingBootstrap: {
+          root: '/tmp/awf-test-routing',
+          inputDir: '/tmp/awf-test-routing/input',
+          outputDir: '/tmp/awf-test-routing/output',
+          inputFile: '/tmp/awf-test-routing/input/conversation.json',
+          containerInputFile: '/run/awf-routing/input/conversation.json',
+          containerOutputDir: '/run/awf-routing/output',
+        },
+      });
+      expect(env.AWF_ROUTING_CONFIG).toBe(
+        '{"candidateModels":["gpt-5.6-luna"],"objective":{"goal":"cost","mode":"balanced"},"task":{"conversationFile":"/run/awf-routing/input/conversation.json"}}'
+      );
+    });
+
+    it('requires host staging before routing env generation', () => {
+      expect(() => buildModelRoutingEnv({
+        ...baseConfig,
+        workDir: '/tmp/awf-test',
+        experimentalModelRouting: true,
+        modelRouting: {
+          objective: { goal: 'cost', mode: 'balanced' },
+          task: { conversationFile: '/host/conversation.json' },
+        },
+      })).toThrow('Model routing was configured but the routing conversation was not staged');
+    });
+
+    it('omits routing environment without both the opt-in and a request', () => {
+      const config = {
+        ...baseConfig,
+        workDir: '/tmp/awf-test',
+        modelRouting: {
+          objective: { goal: 'cost' as const, mode: 'balanced' as const },
+          task: { conversationFile: '/host/conversation.json' },
+        },
+      };
+      expect(buildModelRoutingEnv(config)).toEqual({});
+      expect(buildModelRoutingEnv({ ...config, experimentalModelRouting: false })).toEqual({});
+      expect(buildModelRoutingEnv({ ...baseConfig, workDir: '/tmp/awf-test', experimentalModelRouting: true })).toEqual({});
+    });
+  });
+
+  it('forwards an empty allowedModels list so the proxy rejects the invalid policy', () => {
     const env = buildModelPolicyEnv({ ...baseConfig, workDir: '/tmp/awf-test', allowedModels: [] });
-    expect(env.AWF_ALLOWED_MODELS).toBeUndefined();
+    expect(env.AWF_ALLOWED_MODELS).toBe('[]');
   });
 
   it('sets AWF_DISALLOWED_MODELS when disallowedModels is non-empty', () => {
@@ -515,6 +663,53 @@ describe('buildOidcEnv', () => {
   it('sets custom Anthropic auth header when anthropicApiAuthHeader is configured', () => {
     const env = buildOidcEnv({ ...baseConfig, workDir: '/tmp/awf-test', anthropicApiAuthHeader: 'X-Custom-Anthropic-Auth' });
     expect(env.AWF_ANTHROPIC_AUTH_HEADER).toBe('X-Custom-Anthropic-Auth');
+  });
+
+  it('forwards GCP WIF auth values supplied via additionalEnv to the sidecar', () => {
+    const env = buildOidcEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      additionalEnv: {
+        AWF_AUTH_TYPE: 'github-oidc',
+        AWF_AUTH_PROVIDER: 'gcp',
+        AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER: 'projects/123/locations/global/workloadIdentityPools/pool/providers/github',
+        AWF_AUTH_GCP_SERVICE_ACCOUNT: 'vertex-sa@example.iam.gserviceaccount.com',
+        AWF_AUTH_GCP_PROJECT: 'vertex-project',
+        AWF_AUTH_GCP_LOCATION: 'us-central1',
+      },
+    });
+    expect(env.AWF_AUTH_TYPE).toBe('github-oidc');
+    expect(env.AWF_AUTH_PROVIDER).toBe('gcp');
+    expect(env.AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER).toBe('projects/123/locations/global/workloadIdentityPools/pool/providers/github');
+    expect(env.AWF_AUTH_GCP_SERVICE_ACCOUNT).toBe('vertex-sa@example.iam.gserviceaccount.com');
+    expect(env.AWF_AUTH_GCP_PROJECT).toBe('vertex-project');
+    expect(env.AWF_AUTH_GCP_LOCATION).toBe('us-central1');
+  });
+
+  it('forwards compiler-provided GCP project and location from the host environment', () => {
+    const originalEnv = process.env;
+    process.env = {
+      ...originalEnv,
+      AWF_AUTH_GCP_PROJECT: 'vertex-project',
+      AWF_AUTH_GCP_LOCATION: 'global',
+    };
+    try {
+      const env = buildOidcEnv({ ...baseConfig, workDir: '/tmp/awf-test' });
+      expect(env.AWF_AUTH_GCP_PROJECT).toBe('vertex-project');
+      expect(env.AWF_AUTH_GCP_LOCATION).toBe('global');
+    } finally {
+      process.env = originalEnv;
+    }
+  });
+
+  it('prefers explicit auth config fields over additionalEnv values', () => {
+    const env = buildOidcEnv({
+      ...baseConfig,
+      workDir: '/tmp/awf-test',
+      authProvider: 'gcp',
+      additionalEnv: { AWF_AUTH_PROVIDER: 'azure' },
+    });
+    expect(env.AWF_AUTH_PROVIDER).toBe('gcp');
   });
 
   it('sets AWF_AUTH_ANTHROPIC_TOKEN_URL when anthropicTokenUrl is configured', () => {

@@ -1,5 +1,10 @@
 import { promises as fs } from 'fs';
 import * as path from 'path';
+import {
+  CLOUD_HYPERVISOR_DEFAULT_MOUNT_POLICY,
+  CLOUD_HYPERVISOR_MOUNT_POLICIES,
+  type CloudHypervisorMountPolicy,
+} from '../types/runtime-options';
 
 export type CloudHypervisorExportMode = 'ro' | 'rw';
 
@@ -31,6 +36,9 @@ const WORKSPACE_EXPORT_TAG = 'workspace';
 /** Tag of the mandatory workspace export. */
 export const CLOUD_HYPERVISOR_WORKSPACE_EXPORT_TAG = WORKSPACE_EXPORT_TAG;
 
+/** Tag of the optional `/tmp/gh-aw` export shared with the host firewall/MCP tooling. */
+export const CLOUD_HYPERVISOR_TMP_GH_AW_EXPORT_TAG = 'tmp-gh-aw';
+
 export interface CloudHypervisorExportValidationOptions {
   /**
    * Permits the workspace export to be *published* read-only.
@@ -44,24 +52,39 @@ export interface CloudHypervisorExportValidationOptions {
    * presence of a workspace host mount plan, never enable it unconditionally.
    */
   readonly allowReadOnlyWorkspace?: boolean;
+  /** Set false for workload profiles that do not expose a primary workspace. */
+  readonly requireWorkspace?: boolean;
+  /** Internal role-specific export ceiling; primary-agent keeps the four-export limit. */
+  readonly maxExports?: number;
 }
 
 export async function resolveCloudHypervisorExports(
   environment: CloudHypervisorExportEnvironment = process.env,
   cwd = process.cwd(),
+  mountPolicy: CloudHypervisorMountPolicy = CLOUD_HYPERVISOR_DEFAULT_MOUNT_POLICY,
+  sharedTmpGhAwSource = '/tmp/gh-aw',
 ): Promise<CloudHypervisorDirectoryExport[]> {
+  if (!CLOUD_HYPERVISOR_MOUNT_POLICIES.includes(mountPolicy)) {
+    throw new Error(`Unsupported Cloud Hypervisor mount policy: ${String(mountPolicy)}`);
+  }
   const workspace = environment.GITHUB_WORKSPACE || cwd;
   const candidates: Array<CloudHypervisorDirectoryExport & { required: boolean }> = [
     { tag: 'workspace', source: workspace, target: '/workspace', mode: 'rw', required: true },
   ];
-  const toolCache = environment.RUNNER_TOOL_CACHE || environment.AGENT_TOOLSDIRECTORY;
-  if (toolCache) {
+  if (mountPolicy === 'workspace-and-tool-cache') {
+    const toolCache = environment.RUNNER_TOOL_CACHE || environment.AGENT_TOOLSDIRECTORY;
+    if (!toolCache) {
+      throw new Error(
+        'Cloud Hypervisor mount policy "workspace-and-tool-cache" requires ' +
+        'RUNNER_TOOL_CACHE or AGENT_TOOLSDIRECTORY',
+      );
+    }
     candidates.push({
       tag: 'runner-tool-cache',
       source: toolCache,
       target: toolCache,
       mode: 'ro',
-      required: false,
+      required: true,
     });
   }
   if (environment.RUNNER_TEMP) {
@@ -74,8 +97,13 @@ export async function resolveCloudHypervisorExports(
     });
   }
   candidates.push({
+    // Local literal, not the CLOUD_HYPERVISOR_TMP_GH_AW_EXPORT_TAG constant:
+    // this function declares a local `exports` binding later, which shadows
+    // the CommonJS module object, so referencing an exported const here would
+    // compile to `exports.<name>` and throw a TDZ error (see the comment on
+    // WORKSPACE_EXPORT_TAG above for the same reason `'workspace'` is inlined).
     tag: 'tmp-gh-aw',
-    source: '/tmp/gh-aw',
+    source: sharedTmpGhAwSource,
     target: '/tmp/gh-aw',
     mode: 'rw',
     required: false,
@@ -92,7 +120,9 @@ export async function resolveCloudHypervisorExports(
     } catch (error) {
       if (!candidate.required && (error as NodeJS.ErrnoException).code === 'ENOENT') continue;
       throw new Error(
-        `${candidate.required ? 'Cloud Hypervisor workspace' : `Cloud Hypervisor export "${candidate.tag}"`} ` +
+        `${candidate.tag === WORKSPACE_EXPORT_TAG
+          ? 'Cloud Hypervisor workspace'
+          : `Cloud Hypervisor export "${candidate.tag}"`} ` +
         `must be an existing real directory: ${candidate.source}: ${
           error instanceof Error ? error.message : String(error)
         }`,
@@ -113,15 +143,34 @@ export async function resolveCloudHypervisorExports(
     seenExports.set(key, exports.length);
     exports.push(resolvedExport);
   }
-  return validateCloudHypervisorExports(exports);
+  const validated = validateCloudHypervisorExports(exports);
+  const runnerToolCache = validated.find((entry) => entry.tag === 'runner-tool-cache');
+  if (runnerToolCache) {
+    const writableAlias = validated.find((entry) => (
+      entry.mode === 'rw' &&
+      (
+        entry.source === runnerToolCache.source ||
+        containsPath(entry.source, runnerToolCache.source) ||
+        containsPath(runnerToolCache.source, entry.source)
+      )
+    ));
+    if (writableAlias) {
+      throw new Error(
+        `Cloud Hypervisor runner tool cache source overlaps writable export "${writableAlias.tag}": ` +
+        `${runnerToolCache.source}`,
+      );
+    }
+  }
+  return validated;
 }
 
 export function validateCloudHypervisorExports(
   exports: readonly CloudHypervisorDirectoryExport[],
   options: CloudHypervisorExportValidationOptions = {},
 ): CloudHypervisorDirectoryExport[] {
-  if (exports.length === 0 || exports.length > MAX_EXPORTS) {
-    throw new Error(`Cloud Hypervisor requires 1-${MAX_EXPORTS} directory exports`);
+  const maxExports = options.maxExports ?? MAX_EXPORTS;
+  if (!Number.isInteger(maxExports) || maxExports < 1 || exports.length === 0 || exports.length > maxExports) {
+    throw new Error(`Cloud Hypervisor requires 1-${maxExports} directory exports`);
   }
   const tags = new Set<string>();
   const targets = new Set<string>();
@@ -156,7 +205,7 @@ export function validateCloudHypervisorExports(
     }
     return { ...entry };
   });
-  if (!workspace) {
+  if (!workspace && options.requireWorkspace !== false) {
     throw new Error(
       options.allowReadOnlyWorkspace === true
         ? 'Cloud Hypervisor requires tag "workspace" at /workspace'

@@ -1,11 +1,53 @@
-import { createHash } from 'crypto';
-import { createReadStream, constants, promises as fs } from 'fs';
+import { constants, promises as fs } from 'fs';
 import * as path from 'path';
 import execa from 'execa';
 import {
   CLOUD_HYPERVISOR_RELEASE_VERSION,
+  type CloudHypervisorArtifactDigests,
   type CloudHypervisorOptions,
 } from '../types/runtime-options';
+import {
+  CLOUD_HYPERVISOR_ARTIFACT_REPOSITORY,
+  CLOUD_HYPERVISOR_ARTIFACT_SIGNER_WORKFLOW,
+  artifactDigestsFromManifest,
+  assertArtifactBasenames,
+  parseCloudHypervisorArtifactManifest,
+} from './artifact-manifest';
+import { CloudHypervisorUnsupportedHostError } from './errors';
+import { logger } from '../logger';
+import {
+  buildExecutionFailureDiagnostics,
+  describeAcl,
+  describeMountForPath,
+  describePathComponent,
+  findMountForPath,
+  pathComponents,
+  resolveDiagnosticGetfaclPath,
+} from './preflight-diagnostics';
+import {
+  createArtifactSnapshot,
+  createCommonArtifactSnapshot,
+  copySparseFileWithRsync,
+  type CloudHypervisorArtifactSnapshot,
+  type CloudHypervisorArtifactSnapshotSources,
+  type CloudHypervisorCommonArtifactSnapshot,
+  type CloudHypervisorCommonArtifactSnapshotSources,
+} from './artifact-snapshot';
+import {
+  assertDigest,
+  assertTrustedAncestorChain,
+  assertTrustedHostTool,
+  assertTrustedRegularFile,
+  calculateSha256,
+  type CloudHypervisorArtifactTrustDependencies,
+  hasCompleteArtifactDigests,
+  parsePositiveUid,
+  resolveTrustedOperatorUid,
+  resolveTrustedHostTool,
+} from './artifact-trust';
+import {
+  HostPreflightReporter, hostPreflightReason, markHostPreflightError, type HostPreflightProgress,
+} from './host-preflight-progress';
 
 /**
  * Fail-closed host and artifact validation for the Cloud Hypervisor v53.0
@@ -15,38 +57,54 @@ import {
  * tools) so both VMM backends share the same fail-closed posture.
  *
  * Cloud Hypervisor has no jailer-equivalent process. AWF instead requires
- * the pinned v1.10.0 virtiofsd sibling used for directory exports, while
+ * the pinned v1.13.3 virtiofsd sibling used for directory exports, while
  * `src/cloud-hypervisor/launcher.ts` builds an equivalent
  * network-namespace-join + privilege-drop + Landlock/seccomp launch using
  * the `setpriv` tool resolved here, and `src/cloud-hypervisor/manager.ts`
  * stages artifacts into a private, non-world-readable run directory.
  */
 
-export interface CloudHypervisorPreflightDependencies {
+export interface CloudHypervisorPreflightDependencies extends CloudHypervisorArtifactTrustDependencies {
+  hostPreflightReporter?: HostPreflightReporter;
+  onHostPreflight?: (progress: HostPreflightProgress) => void;
   platform: NodeJS.Platform;
   arch: string;
-  uid: number;
-  access(filePath: string, mode: number): Promise<void>;
-  lstat(filePath: string): Promise<{
-    isFile(): boolean;
-    isSymbolicLink(): boolean;
-    mode: number;
-    uid: number;
-  }>;
   runVersion(binaryPath: string): Promise<string>;
-  sha256(filePath: string): Promise<string>;
+  readFile(filePath: string): Promise<string>;
+  createArtifactSnapshot(
+    sources: CloudHypervisorArtifactSnapshotSources,
+    copySparseFile: (source: string, destination: string) => Promise<void>,
+  ): Promise<CloudHypervisorArtifactSnapshot>;
+  createCommonArtifactSnapshot(
+    sources: CloudHypervisorCommonArtifactSnapshotSources,
+    copySparseFile: (source: string, destination: string) => Promise<void>,
+  ): Promise<CloudHypervisorCommonArtifactSnapshot>;
+  copySparseFile(rsyncBinaryPath: string, source: string, destination: string): Promise<void>;
+  removeArtifactSnapshot(directory: string): Promise<void>;
+  verifyManifestAttestation(
+    ghBinaryPath: string,
+    manifestPath: string,
+    bundlePath: string,
+  ): Promise<void>;
   assertToolAvailable(tool: string): Promise<string>;
-  assertHostPolicy(): Promise<2>;
-  assertDockerInfrastructure(dockerBinaryPath: string): Promise<void>;
+  assertHostPolicy(report?: HostPreflightReporter): Promise<2>;
+  assertDockerInfrastructure(dockerBinaryPath: string, report?: HostPreflightReporter): Promise<void>;
   /** Resolves the group ID that owns `/dev/kvm`, so the launcher can retain
    * exactly that supplementary group instead of the full operator group set. */
   resolveKvmGid(): Promise<number>;
 }
 
 export type CloudHypervisorHostToolPaths = Readonly<{
+  getfacl: string;
+  getent: string;
+  groupdel: string;
+  id: string;
   ip: string;
+  docker: string;
   nft: string;
   sysctl: string;
+  /** util-linux `flock`, used to serialize durable microVM network reservations. */
+  flock: string;
   mke2fs: string;
   debugfs: string;
   e2fsck: string;
@@ -60,10 +118,39 @@ export type CloudHypervisorHostToolPaths = Readonly<{
    * this for Cloud Hypervisor). See `src/cloud-hypervisor/launcher.ts`.
    */
   setpriv: string;
+  setfacl: string;
+  useradd: string;
+  userdel: string;
 }>;
+
 const CLOUD_HYPERVISOR_HOST_TOOLS: (keyof CloudHypervisorHostToolPaths)[] = [
-  'ip', 'nft', 'sysctl', 'mke2fs', 'debugfs', 'e2fsck', 'rsync', 'mount', 'umount', 'setpriv',
+  'getent', 'getfacl', 'groupdel', 'id', 'ip', 'nft', 'sysctl', 'flock', 'mke2fs', 'debugfs', 'e2fsck',
+  'rsync', 'mount', 'umount', 'setfacl', 'setpriv', 'useradd', 'userdel',
 ];
+
+async function versionProbeExecutionError(
+  binaryPath: string,
+  details: string,
+  code?: string,
+): Promise<Error> {
+  let message: string;
+  if (code === 'ENOENT') {
+    message =
+      `Required external binary "${binaryPath}" is unavailable: the binary or its interpreter ` +
+      `was not found${details ? ` (${details})` : ''}`;
+  } else if (code === 'EACCES') {
+    message =
+      `Permission denied executing "${binaryPath} --version"; verify path traversal permissions ` +
+      `and that the artifact is on an exec-capable mount${details ? `: ${details}` : ''}`;
+    message += await buildExecutionFailureDiagnostics(binaryPath);
+  } else {
+    message =
+      `Unable to execute required external binary "${binaryPath} --version"; verify the trusted ` +
+      `artifact exists, is executable, and is complete${details ? `: ${details}` : ''}`;
+    message += await buildExecutionFailureDiagnostics(binaryPath);
+  }
+  return Object.assign(new Error(message), code ? { code } : {});
+}
 
 const defaultDependencies: CloudHypervisorPreflightDependencies = {
   platform: process.platform,
@@ -72,51 +159,109 @@ const defaultDependencies: CloudHypervisorPreflightDependencies = {
   access: fs.access,
   lstat: fs.lstat,
   runVersion: async (binaryPath) => {
-    const result = await execa(binaryPath, ['--version'], {
-      reject: false,
-      timeout: 5_000,
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    if (result.exitCode !== 0) {
-      throw new Error(
-        `"${binaryPath} --version" exited with code ${result.exitCode}: ${result.stderr.trim()}`,
+    let result;
+    try {
+      result = await execa(binaryPath, ['--version'], {
+        reject: false,
+        timeout: 5_000,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      const code = error && typeof error === 'object' &&
+        typeof (error as { code?: unknown }).code === 'string'
+        ? (error as { code: string }).code
+        : undefined;
+      const details = [
+        code ? `code=${code}` : '',
+        error instanceof Error ? error.message : String(error),
+      ].filter(Boolean).join('; ');
+      throw await versionProbeExecutionError(
+        binaryPath,
+        details,
+        code,
       );
+    }
+    if (result.exitCode == null && !result.signal) {
+      const executionError = result as typeof result & {
+        code?: unknown;
+        shortMessage?: unknown;
+      };
+      const codeValue = typeof executionError.code === 'string' ? executionError.code : undefined;
+      const code = codeValue ? `code=${codeValue}` : '';
+      const shortMessage = typeof executionError.shortMessage === 'string'
+        ? executionError.shortMessage
+        : '';
+      const details = [code, shortMessage, result.stderr.trim()].filter(Boolean).join('; ');
+      throw await versionProbeExecutionError(binaryPath, details, codeValue);
+    }
+    if (result.exitCode !== 0) {
+      const stderr = result.stderr.trim();
+      const signalCode = result.signal ?? null;
+      const exitCode = result.exitCode ?? null;
+      const termination = signalCode
+        ? `terminated by signal ${signalCode}`
+        : `exited with code ${exitCode}`;
+      throw markHostPreflightError(new Error(
+        `"${binaryPath} --version" ${termination} ` +
+        `(exitCode=${exitCode}, signalCode=${signalCode})${stderr ? `: ${stderr}` : ''}`,
+      ), 'command-failed');
     }
     return `${result.stdout}\n${result.stderr}`.trim();
   },
   sha256: calculateSha256,
-  assertToolAvailable: async (tool) => {
-    const searchPath = process.env.PATH ?? '';
-    for (const directory of searchPath.split(path.delimiter)) {
-      if (!directory) continue;
-      try {
-        const candidate = path.join(directory, tool);
-        await assertTrustedHostTool(tool, candidate);
-        return candidate;
-      } catch {
-        // Continue searching the bounded host PATH.
-      }
-    }
-    throw new Error(`required trusted host tool "${tool}" was not found on PATH`);
+  readFile: async (filePath) => fs.readFile(filePath, 'utf8'),
+  createArtifactSnapshot: createArtifactSnapshot,
+  createCommonArtifactSnapshot,
+  copySparseFile: copySparseFileWithRsync,
+  removeArtifactSnapshot: async (directory) => {
+    await fs.rm(directory, { recursive: true, force: true });
   },
-  assertHostPolicy: async () => {
-    if (process.getuid?.() !== 0) {
-      throw new Error(
-        'Cloud Hypervisor network setup requires root; invoke awf through sudo from a non-root account',
-      );
+  verifyManifestAttestation: async (ghBinaryPath, manifestPath, bundlePath) => {
+    const result = await execa(ghBinaryPath, [
+      'attestation',
+      'verify',
+      manifestPath,
+      '--repo',
+      CLOUD_HYPERVISOR_ARTIFACT_REPOSITORY,
+      '--bundle',
+      bundlePath,
+      '--signer-workflow',
+      CLOUD_HYPERVISOR_ARTIFACT_SIGNER_WORKFLOW,
+      '--deny-self-hosted-runners',
+    ], {
+      reject: false,
+      timeout: 30_000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (result.exitCode !== 0) {
+      throw markHostPreflightError(new Error(
+        `GitHub artifact attestation verification failed with code ${result.exitCode}: ${result.stderr.trim()
+        }`,
+      ), 'command-failed');
     }
+  },
+  assertToolAvailable: (tool) => resolveTrustedHostTool(tool, process.env),
+  assertHostPolicy: async (report = new HostPreflightReporter('bounded-runtime')) => {
+    await report.check('root', () => {
+      if (process.getuid?.() !== 0) {
+        throw markHostPreflightError(new CloudHypervisorUnsupportedHostError(
+          'Cloud Hypervisor network setup requires root; invoke awf through sudo from a non-root account',
+        ), 'requirement-not-met');
+      }
+    });
     try {
-      await fs.access('/proc/sys/net/ipv4/ip_forward', constants.R_OK);
-      await fs.access('/proc/sys/net/ipv6/conf/all/disable_ipv6', constants.R_OK);
-      await fs.access('/proc/sys/kernel/seccomp/actions_avail', constants.R_OK);
+      await report.check('ipv4-control', () => fs.access('/proc/sys/net/ipv4/ip_forward', constants.R_OK));
+      await report.check('ipv6-control', () => fs.access('/proc/sys/net/ipv6/conf/all/disable_ipv6', constants.R_OK));
+      await report.check('seccomp-control', () => fs.access('/proc/sys/kernel/seccomp/actions_avail', constants.R_OK));
     } catch (error) {
-      throw new Error(
+      throw markHostPreflightError(new CloudHypervisorUnsupportedHostError(
         'host kernel policy does not expose required network namespace and seccomp controls: ' +
         `${error instanceof Error ? error.message : String(error)}`,
-      );
+        error,
+      ), hostPreflightReason(error));
     }
     try {
-      await fs.access('/sys/fs/cgroup/cgroup.controllers', constants.R_OK);
+      await report.check('cgroup-v2', () => fs.access('/sys/fs/cgroup/cgroup.controllers', constants.R_OK));
       return 2;
     } catch (error) {
       // Cloud Hypervisor's launcher manages an explicit memory/CPU/PID
@@ -128,25 +273,28 @@ const defaultDependencies: CloudHypervisorPreflightDependencies = {
       // manage, so it is rejected explicitly rather than silently
       // constructing a broken cgroup. GitHub-hosted Ubuntu runners (the
       // only supported host) always run cgroup v2.
-      throw new Error(
+      throw markHostPreflightError(new CloudHypervisorUnsupportedHostError(
         'Cloud Hypervisor requires the cgroup v2 unified hierarchy ' +
         '(/sys/fs/cgroup/cgroup.controllers); cgroup v1-only hosts are not supported: ' +
         `${error instanceof Error ? error.message : String(error)}`,
-      );
+        error,
+      ), hostPreflightReason(error));
     }
   },
-  assertDockerInfrastructure: async (dockerBinaryPath) => {
+  assertDockerInfrastructure: async (dockerBinaryPath, report = new HostPreflightReporter('bounded-runtime')) => {
     for (const args of [['info'], ['compose', 'version']] as const) {
-      const result = await execa(dockerBinaryPath, [...args], {
-        reject: false,
-        timeout: 10_000,
-        stdio: ['ignore', 'pipe', 'pipe'],
+      await report.check(args[0] === 'info' ? 'docker-info' : 'docker-compose', async () => {
+        const result = await execa(dockerBinaryPath, [...args], {
+          reject: false,
+          timeout: 10_000,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        if (result.exitCode !== 0) {
+          throw markHostPreflightError(new Error(
+            `${dockerBinaryPath} ${args.join(' ')} failed with code ${result.exitCode}: ${result.stderr.trim()}`,
+          ), 'command-failed');
+        }
       });
-      if (result.exitCode !== 0) {
-        throw new Error(
-          `${dockerBinaryPath} ${args.join(' ')} failed with code ${result.exitCode}: ${result.stderr.trim()}`,
-        );
-      }
     }
   },
   resolveKvmGid: async () => {
@@ -155,8 +303,35 @@ const defaultDependencies: CloudHypervisorPreflightDependencies = {
   },
 };
 
+export {
+  buildExecutionFailureDiagnostics,
+  describeAcl,
+  describeMountForPath,
+  describePathComponent,
+  findMountForPath,
+  pathComponents,
+  resolveDiagnosticGetfaclPath,
+  copySparseFileWithRsync,
+  createArtifactSnapshot,
+  assertDigest,
+  assertTrustedAncestorChain,
+  assertTrustedHostTool,
+  assertTrustedRegularFile,
+  calculateSha256,
+  hasCompleteArtifactDigests,
+  parsePositiveUid,
+  resolveTrustedOperatorUid,
+};
+export type {
+  CloudHypervisorArtifactSnapshot,
+  CloudHypervisorArtifactSnapshotSources,
+};
+
 /** @internal Exposed only for focused host-probe tests. */
-export const cloudHypervisorPreflightTestHelpers = { defaultDependencies };
+export const cloudHypervisorPreflightTestHelpers = {
+  defaultDependencies,
+  createArtifactSnapshot,
+};
 
 export interface CloudHypervisorPreflightResult {
   version: string;
@@ -165,13 +340,95 @@ export interface CloudHypervisorPreflightResult {
   kernelPath: string;
   rootfsPath: string;
   supervisorPath: string;
+  artifactSnapshotDirectory: string;
+  artifactDigests: Required<CloudHypervisorArtifactDigests>;
   tools: CloudHypervisorHostToolPaths;
   cgroupVersion: 2;
   /** Group ID that owns `/dev/kvm`, retained as the launcher's sole supplementary group. */
   kvmGid: number;
 }
 
+export type CloudHypervisorCommonPreflightResult =
+  Omit<CloudHypervisorPreflightResult, 'rootfsPath' | 'artifactDigests'> & {
+    artifactDigests: Omit<Required<CloudHypervisorArtifactDigests>, 'rootfs'>;
+  };
+
 export const CLOUD_HYPERVISOR_MAX_BOOT_ATTEMPTS = 3;
+
+/**
+ * Number of attempts for the post-digest-verification `--version` probe.
+ * The staged artifact's content is already digest-verified before this runs,
+ * so a probe failure here reflects a transient host/exec hiccup (e.g. a
+ * momentary I/O error copying/executing the just-staged binary) rather than
+ * a corrupt or wrong artifact. Retrying a couple of times avoids failing an
+ * entire run over a fleeting condition. See gh-aw-firewall#8767.
+ */
+const CLOUD_HYPERVISOR_VERSION_PROBE_ATTEMPTS = 3;
+const CLOUD_HYPERVISOR_VERSION_PROBE_RETRY_DELAY_MS = 250;
+
+/**
+ * Error codes indicating a deterministic, non-transient version-probe
+ * failure: the binary is missing, not a regular file, or not executable.
+ * These will not resolve on retry, so they are allowed to fail closed
+ * immediately instead of paying the retry delay. The default `runVersion`
+ * attaches a structured `code` property when the underlying spawn failure
+ * carries one (see its `Object.assign(new Error(...), { code })` above);
+ * the `code=XXX` message fragment is used as a fallback for callers that
+ * inject a custom `runVersion` throwing a plain `Error`.
+ */
+const CLOUD_HYPERVISOR_VERSION_PROBE_PERMANENT_ERROR_CODES = new Set([
+  'ENOENT', 'EACCES', 'EISDIR', 'ENOTDIR', 'ENOEXEC',
+]);
+const CLOUD_HYPERVISOR_VERSION_PROBE_PERMANENT_ERROR_CODE_PATTERN = /\bcode=(ENOENT|EACCES|EISDIR|ENOTDIR|ENOEXEC)\b/;
+
+function isPermanentVersionProbeError(error: unknown): boolean {
+  const code = error && typeof error === 'object' ? (error as { code?: unknown }).code : undefined;
+  if (typeof code === 'string' && CLOUD_HYPERVISOR_VERSION_PROBE_PERMANENT_ERROR_CODES.has(code)) {
+    return true;
+  }
+  const message = error instanceof Error ? error.message : String(error);
+  return CLOUD_HYPERVISOR_VERSION_PROBE_PERMANENT_ERROR_CODE_PATTERN.test(message);
+}
+
+async function sleep(ms: number): Promise<void> {
+  await new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Runs `dependencies.runVersion` with a small bounded retry for transient
+ * execution failures. The binary's digest has already been verified to
+ * match the trusted manifest by the time this is called, so any rejection
+ * here is an execution-environment problem, not an artifact integrity
+ * problem, and is generally safe to retry. Deterministic failures (missing
+ * file, permission denied, etc.) are not retried since they would not
+ * resolve on their own.
+ */
+async function runVersionWithRetry(
+  dependencies: Pick<CloudHypervisorPreflightDependencies, 'runVersion'>,
+  binaryPath: string,
+  attempts: number = CLOUD_HYPERVISOR_VERSION_PROBE_ATTEMPTS,
+  retryDelayMs: number = CLOUD_HYPERVISOR_VERSION_PROBE_RETRY_DELAY_MS,
+): Promise<string> {
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= attempts; attempt += 1) {
+    try {
+      return await dependencies.runVersion(binaryPath);
+    } catch (error) {
+      lastError = error;
+      if (attempt < attempts && !isPermanentVersionProbeError(error)) {
+        logger.warn(
+          `Cloud Hypervisor version probe failed for "${binaryPath}" ` +
+          `(attempt ${attempt}/${attempts}); retrying: ` +
+          `${error instanceof Error ? error.message : String(error)}`,
+        );
+        await sleep(retryDelayMs);
+        continue;
+      }
+      break;
+    }
+  }
+  throw lastError;
+}
 
 type CloudHypervisorReadinessStage =
   | 'guest-network-readiness'
@@ -208,32 +465,6 @@ export class CloudHypervisorRetryableReadinessError extends Error {
   }
 }
 
-async function assertTrustedHostTool(label: string, filePath: string): Promise<void> {
-  if (!path.isAbsolute(filePath)) {
-    throw new Error(`host tool "${label}" path must be absolute: ${filePath}`);
-  }
-  const { root } = path.parse(filePath);
-  const segments = filePath.slice(root.length).split('/').filter(Boolean);
-  let ancestor = root;
-  for (const segment of segments.slice(0, -1)) {
-    ancestor = path.join(ancestor, segment);
-    const stat = await fs.lstat(ancestor);
-    if (stat.isSymbolicLink() || (stat.mode & 0o022) !== 0 || stat.uid !== 0) {
-      throw new Error(`host tool "${label}" has an untrusted parent directory: ${ancestor}`);
-    }
-  }
-  const stat = await fs.lstat(filePath);
-  if (
-    stat.isSymbolicLink() ||
-    !stat.isFile() ||
-    (stat.mode & 0o022) !== 0 ||
-    stat.uid !== 0
-  ) {
-    throw new Error(`host tool "${label}" must be a root-owned non-writable regular file: ${filePath}`);
-  }
-  await fs.access(filePath, constants.X_OK);
-}
-
 /**
  * Parses a `cloud-hypervisor --version` output like `cloud-hypervisor v53.0`
  * (also accepts the plain `v53.0`/`53.0` forms some builds emit).
@@ -241,124 +472,19 @@ async function assertTrustedHostTool(label: string, filePath: string): Promise<v
 export function parseCloudHypervisorVersion(output: string): string {
   const match = output.match(/\bv?(\d+\.\d+(?:\.\d+)?)\b/);
   if (!match) {
-    throw new Error(`Could not parse Cloud Hypervisor version from: ${JSON.stringify(output)}`);
+    throw markHostPreflightError(new Error(`Could not parse Cloud Hypervisor version from: ${JSON.stringify(output)}`), 'version-format');
   }
   return match[1];
 }
 
-export const VIRTIOFSD_RELEASE_VERSION = '1.10.0';
+export const VIRTIOFSD_RELEASE_VERSION = '1.13.3';
 
 export function parseVirtiofsdVersion(output: string): string {
   const match = output.match(/(?:^|\s)v?(\d+\.\d+\.\d+)(?:\s|$)/);
   if (!match) {
-    throw new Error(`Could not parse virtiofsd version from: ${JSON.stringify(output)}`);
+    throw markHostPreflightError(new Error(`Could not parse virtiofsd version from: ${JSON.stringify(output)}`), 'version-format');
   }
   return match[1];
-}
-
-export async function calculateSha256(filePath: string): Promise<string> {
-  const hash = createHash('sha256');
-  const stream = createReadStream(filePath);
-  for await (const chunk of stream) {
-    hash.update(chunk as Buffer);
-  }
-  return hash.digest('hex');
-}
-
-async function assertTrustedRegularFile(
-  label: string,
-  filePath: string,
-  accessMode: number,
-  dependencies: CloudHypervisorPreflightDependencies,
-): Promise<void> {
-  if (!path.isAbsolute(filePath)) {
-    throw new Error(`${label} path must be absolute: ${filePath}`);
-  }
-  await assertTrustedAncestorChain(label, filePath, dependencies);
-  let stat;
-  try {
-    stat = await dependencies.lstat(filePath);
-  } catch (error) {
-    throw new Error(
-      `${label} is unavailable: ${filePath}: ${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  if (stat.isSymbolicLink() || !stat.isFile()) {
-    throw new Error(`${label} must be a regular file and not a symbolic link: ${filePath}`);
-  }
-  if ((stat.mode & 0o022) !== 0) {
-    throw new Error(`${label} must not be group- or world-writable: ${filePath}`);
-  }
-  if (stat.uid !== 0 && stat.uid !== dependencies.uid) {
-    throw new Error(
-      `${label} must be owned by root or uid ${dependencies.uid}; found uid ${stat.uid}: ${filePath}`,
-    );
-  }
-  try {
-    await dependencies.access(filePath, accessMode);
-  } catch (error) {
-    throw new Error(
-      `${label} does not have the required host access: ${filePath}: ` +
-      `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-}
-
-function parsePositiveUid(value: string | undefined): number | undefined {
-  if (!value || !/^[1-9]\d*$/.test(value)) return undefined;
-  return Number(value);
-}
-
-function resolveTrustedOperatorUid(): number {
-  return parsePositiveUid(process.env.SUDO_UID) ?? (process.getuid?.() ?? -1);
-}
-
-async function assertTrustedAncestorChain(
-  label: string,
-  filePath: string,
-  dependencies: CloudHypervisorPreflightDependencies,
-): Promise<void> {
-  const { root } = path.parse(filePath);
-  const segments = filePath.slice(root.length).split('/').filter((segment) => segment.length > 0);
-  let ancestor = root;
-  for (const segment of segments.slice(0, -1)) {
-    ancestor = path.join(ancestor, segment);
-    const stat = await dependencies.lstat(ancestor);
-    if (stat.isSymbolicLink()) {
-      throw new Error(
-        `${label} parent directory must not be a symbolic link: ${ancestor}`,
-      );
-    }
-    if ((stat.mode & 0o022) !== 0) {
-      throw new Error(
-        `${label} parent directory must not be group- or world-writable: ${ancestor}`,
-      );
-    }
-    if (stat.uid !== 0 && stat.uid !== dependencies.uid) {
-      throw new Error(
-        `${label} parent directory must be owned by root or uid ${dependencies.uid}; ` +
-        `found uid ${stat.uid}: ${ancestor}`,
-      );
-    }
-  }
-}
-
-async function assertDigest(
-  label: string,
-  filePath: string,
-  expected: string | undefined,
-  dependencies: CloudHypervisorPreflightDependencies,
-): Promise<void> {
-  if (!expected) return;
-  if (!/^[a-fA-F0-9]{64}$/.test(expected)) {
-    throw new Error(`${label} SHA-256 must contain exactly 64 hexadecimal characters`);
-  }
-  const actual = await dependencies.sha256(filePath);
-  if (actual.toLowerCase() !== expected.toLowerCase()) {
-    throw new Error(
-      `${label} SHA-256 mismatch: expected ${expected.toLowerCase()}, got ${actual.toLowerCase()}`,
-    );
-  }
 }
 
 /**
@@ -372,146 +498,385 @@ export async function runCloudHypervisorPreflight(
   config: CloudHypervisorOptions,
   overrides: Partial<CloudHypervisorPreflightDependencies> = {},
 ): Promise<CloudHypervisorPreflightResult> {
+  const result = await runPreflight(config, overrides, false);
+  if (!('rootfsPath' in result)) throw new Error('Primary Cloud Hypervisor rootfs is missing');
+  return result;
+}
+
+export async function runCloudHypervisorCommonPreflight(
+  config: CloudHypervisorOptions,
+  overrides: Partial<CloudHypervisorPreflightDependencies> = {},
+): Promise<CloudHypervisorCommonPreflightResult> {
+  return runPreflight(config, overrides, true);
+}
+
+function hasPrimaryRootfs(
+  snapshot: CloudHypervisorCommonArtifactSnapshot,
+): snapshot is CloudHypervisorArtifactSnapshot {
+  return 'rootfsPath' in snapshot && typeof snapshot.rootfsPath === 'string';
+}
+
+function runPreflight(
+  config: CloudHypervisorOptions,
+  overrides: Partial<CloudHypervisorPreflightDependencies>,
+  commonOnly: true,
+): Promise<CloudHypervisorCommonPreflightResult>;
+function runPreflight(
+  config: CloudHypervisorOptions,
+  overrides: Partial<CloudHypervisorPreflightDependencies>,
+  commonOnly: false,
+): Promise<CloudHypervisorPreflightResult>;
+async function runPreflight(
+  config: CloudHypervisorOptions,
+  overrides: Partial<CloudHypervisorPreflightDependencies>,
+  commonOnly: boolean,
+): Promise<CloudHypervisorCommonPreflightResult | CloudHypervisorPreflightResult> {
+  const report = overrides.hostPreflightReporter ?? new HostPreflightReporter(
+    'bounded-runtime', overrides.onHostPreflight, undefined,
+    { phase: 'preflight', profile: commonOnly ? 'common' : 'primary' },
+  );
   const dependencies = {
     ...defaultDependencies,
     ...overrides,
-    uid: overrides.uid ?? resolveTrustedOperatorUid(),
+    uid: await report.check('operator-identity', () => overrides.uid ?? resolveTrustedOperatorUid()),
   };
-  if (dependencies.platform !== 'linux') {
-    throw new Error(`Cloud Hypervisor requires Linux with KVM; found ${dependencies.platform}`);
-  }
-  if (dependencies.arch !== 'x64') {
-    throw new Error(
-      `Cloud Hypervisor is supported only on x86_64 GitHub-hosted runners; found Node architecture ${dependencies.arch}`,
-    );
-  }
-  if (!config.kernelPath || !config.rootfsPath || !config.supervisorPath) {
-    throw new Error(
-      'Cloud Hypervisor requires guest kernel, rootfs, and supervisor artifact paths',
-    );
-  }
+  const developmentBypass = config.developmentAllowUnattestedArtifacts === true;
+  await report.check('artifact-configuration', () => {
+    if (commonOnly && developmentBypass) {
+      throw new Error('Enclave common artifacts require an attested primary manifest');
+    }
+    if (!config.kernelPath || (!commonOnly && !config.rootfsPath) || !config.supervisorPath) {
+      throw new Error(
+        'Cloud Hypervisor requires guest kernel, rootfs, and supervisor artifact paths',
+      );
+    }
+    if (
+      developmentBypass &&
+      process.env.AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS !== '1'
+    ) {
+      throw new Error(
+        'Cloud Hypervisor development artifact bypass requires ' +
+        'AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1',
+      );
+    }
+    if (
+      !developmentBypass &&
+      (!config.artifactManifestPath ||
+        !config.artifactManifestBundlePath ||
+        !config.artifactReleaseTag)
+    ) {
+      throw new Error(
+        'Cloud Hypervisor requires an artifact manifest, attestation bundle, and expected release tag',
+      );
+    }
+  });
 
-  try {
-    await dependencies.access('/dev/kvm', constants.R_OK | constants.W_OK);
-  } catch (error) {
-    throw new Error(
-      'Cloud Hypervisor requires readable and writable /dev/kvm: ' +
-      `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  const kvmGid = await dependencies.resolveKvmGid();
-  const cgroupVersion = await dependencies.assertHostPolicy();
-  let dockerBinaryPath: string;
-  try {
-    dockerBinaryPath = await dependencies.assertToolAvailable('docker');
-  } catch (error) {
-    throw new Error(
-      'Cloud Hypervisor requires host tool "docker": ' +
-      `${error instanceof Error ? error.message : String(error)}`,
-    );
-  }
-  await dependencies.assertDockerInfrastructure(dockerBinaryPath);
-  await assertTrustedRegularFile(
+  await report.check('cloud-hypervisor-trust', () => assertTrustedRegularFile(
     'Cloud Hypervisor binary',
     config.cloudHypervisorBinary,
     constants.R_OK | constants.X_OK,
     dependencies,
-  );
+  ));
   const virtiofsdBinary = path.join(path.dirname(config.cloudHypervisorBinary), 'virtiofsd');
-  await assertTrustedRegularFile(
+  await report.check('virtiofsd-trust', () => assertTrustedRegularFile(
     'virtiofsd binary',
     virtiofsdBinary,
     constants.R_OK | constants.X_OK,
     dependencies,
-  );
+  ));
 
   const tools = {} as Record<keyof CloudHypervisorHostToolPaths, string>;
   for (const tool of CLOUD_HYPERVISOR_HOST_TOOLS) {
     try {
-      tools[tool] = await dependencies.assertToolAvailable(tool);
+      tools[tool] = await report.check(`tool-${tool}`, () => dependencies.assertToolAvailable(tool));
+    } catch (error) {
+      throw markHostPreflightError(new Error(
+        `Cloud Hypervisor requires host tool "${tool}": ` +
+        `${error instanceof Error ? error.message : String(error)}`,
+      ), hostPreflightReason(error));
+    }
+  }
+  await report.check('kernel-trust', () => assertTrustedRegularFile(
+    'Cloud Hypervisor guest kernel',
+    config.kernelPath!,
+    constants.R_OK,
+    dependencies,
+  ));
+  if (!commonOnly) {
+    await report.check('rootfs-trust', () => assertTrustedRegularFile(
+      'Cloud Hypervisor rootfs', config.rootfsPath!, constants.R_OK, dependencies,
+    ));
+  } else {
+    report.notRequired('rootfs-trust');
+  }
+  await report.check('supervisor-trust', () => assertTrustedRegularFile(
+    'Cloud Hypervisor guest supervisor',
+    config.supervisorPath!,
+    constants.R_OK,
+    dependencies,
+  ));
+  let rootfsSbomPath: string | undefined;
+  if (!developmentBypass) {
+    await report.check('manifest-trust', () => assertTrustedRegularFile(
+      'Cloud Hypervisor artifact manifest',
+      config.artifactManifestPath!,
+      constants.R_OK,
+      dependencies,
+    ));
+    await report.check('bundle-trust', () => assertTrustedRegularFile(
+      'Cloud Hypervisor artifact attestation bundle',
+      config.artifactManifestBundlePath!,
+      constants.R_OK,
+      dependencies,
+    ));
+    if (!commonOnly) {
+      const candidate = path.join(path.dirname(config.rootfsPath!), 'rootfs.sbom.spdx.json');
+      rootfsSbomPath = await report.check('sbom-trust', async () => {
+      try {
+        await dependencies.lstat(candidate);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+        throw error;
+      }
+      await assertTrustedRegularFile('Cloud Hypervisor rootfs SBOM', candidate, constants.R_OK, dependencies);
+      return candidate;
+      });
+    }
+  }
+  if (!rootfsSbomPath) report.notRequired('sbom-trust');
+
+  const commonSources = {
+      cloudHypervisorBinary: config.cloudHypervisorBinary,
+      virtiofsdBinary,
+      kernelPath: config.kernelPath!,
+      supervisorPath: config.supervisorPath!,
+      ...(!developmentBypass
+        ? {
+          manifestPath: config.artifactManifestPath!,
+          bundlePath: config.artifactManifestBundlePath!,
+        }
+        : {}),
+  };
+  const copy = (source: string, destination: string) =>
+    dependencies.copySparseFile(tools.rsync, source, destination);
+  const snapshot = await report.check('artifact-snapshot', () => commonOnly
+    ? dependencies.createCommonArtifactSnapshot(commonSources, copy)
+    : dependencies.createArtifactSnapshot({
+      ...commonSources, rootfsPath: config.rootfsPath!,
+      ...(rootfsSbomPath ? { rootfsSbomPath } : {}),
+    }, copy));
+  try {
+    if (!commonOnly && !hasPrimaryRootfs(snapshot)) {
+      throw new Error('Primary Cloud Hypervisor rootfs snapshot is missing');
+    }
+    let artifactDigests: Required<CloudHypervisorArtifactDigests>;
+    if (developmentBypass) {
+      if (!hasCompleteArtifactDigests(config.sha256)) {
+        throw new Error(
+          'Cloud Hypervisor development artifact bypass requires SHA-256 digests for all five artifacts',
+        );
+      }
+      artifactDigests = config.sha256;
+    } else {
+      if (!snapshot.manifestPath || !snapshot.bundlePath) {
+        throw new Error('Cloud Hypervisor attested artifact snapshot is missing its manifest or bundle');
+      }
+      const manifestPath = snapshot.manifestPath;
+      const bundlePath = snapshot.bundlePath;
+      const ghBinaryPath = await report.check('tool-gh', () => dependencies.assertToolAvailable('gh'));
+      await report.check('manifest-attestation', () => dependencies.verifyManifestAttestation(
+        ghBinaryPath,
+        manifestPath,
+        bundlePath,
+      ));
+      const manifest = await report.check('manifest-contents', async () => {
+        const parsed = parseCloudHypervisorArtifactManifest(
+          await dependencies.readFile(manifestPath),
+          config.artifactReleaseTag!,
+        );
+        const basenames = {
+          cloudHypervisor: config.cloudHypervisorBinary,
+          virtiofsd: virtiofsdBinary,
+          kernel: config.kernelPath!,
+          supervisor: config.supervisorPath!,
+        };
+        if (commonOnly) {
+          for (const name of ['cloudHypervisor', 'virtiofsd', 'kernel', 'supervisor'] as const) {
+            if (path.basename(basenames[name]) !== parsed.artifacts[name].file) {
+              throw new Error(`Cloud Hypervisor ${name} artifact basename mismatch`);
+            }
+          }
+        } else {
+          assertArtifactBasenames(parsed, { ...basenames, rootfs: config.rootfsPath! });
+        }
+        return parsed;
+      });
+      artifactDigests = artifactDigestsFromManifest(manifest);
+      if (!commonOnly && manifest.artifacts.rootfs.sbom) {
+        if (!hasPrimaryRootfs(snapshot) || !snapshot.rootfsSbomPath) {
+          throw new Error('Cloud Hypervisor rootfs SBOM snapshot is missing');
+        }
+        const sbomPath = snapshot.rootfsSbomPath;
+        await report.check('sbom-digest', () => assertDigest(
+          'Cloud Hypervisor rootfs SBOM', sbomPath,
+          manifest.artifacts.rootfs.sbom!.sha256, dependencies,
+        ));
+        await report.check('sbom-contents', async () => {
+          const document: unknown = JSON.parse(await dependencies.readFile(sbomPath));
+          const sbom = document as {
+            spdxVersion?: unknown;
+            packages?: Array<{ SPDXID?: string; checksums?: Array<{ algorithm?: string; checksumValue?: string }> }>;
+            files?: unknown[];
+          } | null;
+          if (sbom?.spdxVersion !== 'SPDX-2.3'
+            || !Array.isArray(sbom.files) || sbom.files.length === 0
+            || !Array.isArray(sbom.packages)
+            || sbom.packages.filter(pkg => pkg?.SPDXID === 'SPDXRef-Rootfs'
+              && Array.isArray(pkg.checksums) && pkg.checksums.some(check => check?.algorithm === 'SHA256'
+                && check.checksumValue === artifactDigests.rootfs)).length !== 1) {
+            throw new Error('Cloud Hypervisor rootfs SBOM does not bind its final filesystem digest');
+          }
+        });
+      } else {
+        report.notRequired('sbom-digest');
+        report.notRequired('sbom-contents');
+      }
+    }
+    if (developmentBypass) {
+      report.notRequired('sbom-digest');
+      report.notRequired('sbom-contents');
+    }
+    await report.check('cloud-hypervisor-digest', () => assertDigest(
+      'Cloud Hypervisor binary',
+      snapshot.cloudHypervisorBinary,
+      artifactDigests.cloudHypervisor,
+      dependencies,
+    ));
+    await report.check('virtiofsd-digest', () => assertDigest(
+      'virtiofsd binary',
+      snapshot.virtiofsdBinary,
+      artifactDigests.virtiofsd,
+      dependencies,
+    ));
+
+    const version = await report.check('cloud-hypervisor-version', async () => {
+      const parsed = parseCloudHypervisorVersion(
+        await runVersionWithRetry(dependencies, snapshot.cloudHypervisorBinary),
+      );
+      if (parsed !== CLOUD_HYPERVISOR_RELEASE_VERSION) {
+        throw markHostPreflightError(new Error(
+          `Cloud Hypervisor is pinned to v${CLOUD_HYPERVISOR_RELEASE_VERSION}; found v${parsed}`,
+        ), 'version-mismatch');
+      }
+      return parsed;
+    });
+    await report.check('virtiofsd-version', async () => {
+      const virtiofsdVersion = parseVirtiofsdVersion(
+        await runVersionWithRetry(dependencies, snapshot.virtiofsdBinary),
+      );
+      if (virtiofsdVersion !== VIRTIOFSD_RELEASE_VERSION) {
+        throw markHostPreflightError(new Error(
+          `virtiofsd is pinned to v${VIRTIOFSD_RELEASE_VERSION}; found v${virtiofsdVersion}`,
+        ), 'version-mismatch');
+      }
+    });
+
+    await report.check('kernel-digest', () => assertDigest(
+      'Cloud Hypervisor guest kernel',
+      snapshot.kernelPath,
+      artifactDigests.kernel,
+      dependencies,
+    ));
+    if (!commonOnly) {
+      if (!hasPrimaryRootfs(snapshot)) throw new Error('Primary Cloud Hypervisor rootfs snapshot is missing');
+      const rootfsPath = snapshot.rootfsPath;
+      await report.check('rootfs-digest', () => assertDigest(
+        'Cloud Hypervisor rootfs', rootfsPath, artifactDigests.rootfs, dependencies,
+      ));
+    } else {
+      report.notRequired('rootfs-digest');
+    }
+    await report.check('supervisor-digest', () => assertDigest(
+      'Cloud Hypervisor guest supervisor',
+      snapshot.supervisorPath,
+      artifactDigests.supervisor,
+      dependencies,
+    ));
+
+    // Artifact trust must be established before any host-capability error can
+    // trigger the supported fallback to Docker.
+    await report.check('platform', () => {
+      if (dependencies.platform !== 'linux') {
+        throw markHostPreflightError(new CloudHypervisorUnsupportedHostError(
+          `Cloud Hypervisor requires Linux with KVM; found ${dependencies.platform}`,
+        ), 'requirement-not-met');
+      }
+    });
+    await report.check('architecture', () => {
+      if (dependencies.arch !== 'x64') {
+        throw markHostPreflightError(new CloudHypervisorUnsupportedHostError(
+          `Cloud Hypervisor is supported only on x86_64 GitHub-hosted runners; found Node architecture ${dependencies.arch}`,
+        ), 'requirement-not-met');
+      }
+    });
+    try {
+      await report.check('kvm-access', () => dependencies.access('/dev/kvm', constants.R_OK | constants.W_OK));
+    } catch (error) {
+      throw new CloudHypervisorUnsupportedHostError(
+        'Cloud Hypervisor requires readable and writable /dev/kvm: ' +
+        `${error instanceof Error ? error.message : String(error)}`,
+        error,
+      );
+    }
+    const kvmGid = await report.check('kvm-group', () => dependencies.resolveKvmGid());
+    let cgroupVersion: 2;
+    try {
+      cgroupVersion = await report.check('host-policy', () => dependencies.assertHostPolicy(report));
+    } catch (error) {
+      throw error instanceof CloudHypervisorUnsupportedHostError
+        ? error
+        : new CloudHypervisorUnsupportedHostError(
+          `Cloud Hypervisor host policy is unsupported: ${error instanceof Error ? error.message : String(error)}`,
+          error,
+        );
+    }
+    let dockerBinaryPath: string;
+    try {
+      dockerBinaryPath = await report.check('tool-docker', () => dependencies.assertToolAvailable('docker'));
     } catch (error) {
       throw new Error(
-        `Cloud Hypervisor requires host tool "${tool}": ` +
+        'Cloud Hypervisor requires host tool "docker": ' +
         `${error instanceof Error ? error.message : String(error)}`,
       );
     }
-  }
-  await assertTrustedRegularFile(
-    'Cloud Hypervisor guest kernel',
-    config.kernelPath,
-    constants.R_OK,
-    dependencies,
-  );
-  await assertTrustedRegularFile(
-    'Cloud Hypervisor rootfs',
-    config.rootfsPath,
-    constants.R_OK,
-    dependencies,
-  );
-  await assertTrustedRegularFile(
-    'Cloud Hypervisor guest supervisor',
-    config.supervisorPath,
-    constants.R_OK,
-    dependencies,
-  );
-  await assertDigest(
-    'Cloud Hypervisor binary',
-    config.cloudHypervisorBinary,
-    config.sha256?.cloudHypervisor,
-    dependencies,
-  );
-  await assertDigest(
-    'virtiofsd binary',
-    virtiofsdBinary,
-    config.sha256?.virtiofsd,
-    dependencies,
-  );
+    tools.docker = dockerBinaryPath;
+    await report.check('docker-infrastructure', () => dependencies.assertDockerInfrastructure(dockerBinaryPath, report));
 
-  const version = parseCloudHypervisorVersion(
-    await dependencies.runVersion(config.cloudHypervisorBinary),
-  );
-  if (version !== CLOUD_HYPERVISOR_RELEASE_VERSION) {
-    throw new Error(
-      `Cloud Hypervisor is pinned to v${CLOUD_HYPERVISOR_RELEASE_VERSION}; found v${version}`,
-    );
+    const commonResult: CloudHypervisorCommonPreflightResult = {
+      version,
+      cloudHypervisorBinary: snapshot.cloudHypervisorBinary,
+      virtiofsdBinary: snapshot.virtiofsdBinary,
+      kernelPath: snapshot.kernelPath,
+      supervisorPath: snapshot.supervisorPath,
+      artifactSnapshotDirectory: snapshot.directory,
+      artifactDigests: {
+        cloudHypervisor: artifactDigests.cloudHypervisor,
+        virtiofsd: artifactDigests.virtiofsd,
+        kernel: artifactDigests.kernel,
+        supervisor: artifactDigests.supervisor,
+      },
+      tools,
+      cgroupVersion,
+      kvmGid,
+    };
+    if (commonOnly) return commonResult;
+    if (!hasPrimaryRootfs(snapshot)) throw new Error('Primary Cloud Hypervisor rootfs snapshot is missing');
+    return {
+      ...commonResult, rootfsPath: snapshot.rootfsPath,
+      artifactDigests: { ...commonResult.artifactDigests, rootfs: artifactDigests.rootfs },
+    };
+  } catch (error) {
+    await dependencies.removeArtifactSnapshot(snapshot.directory);
+    throw error;
   }
-  const virtiofsdVersion = parseVirtiofsdVersion(
-    await dependencies.runVersion(virtiofsdBinary),
-  );
-  if (virtiofsdVersion !== VIRTIOFSD_RELEASE_VERSION) {
-    throw new Error(
-      `virtiofsd is pinned to v${VIRTIOFSD_RELEASE_VERSION}; found v${virtiofsdVersion}`,
-    );
-  }
-
-  await assertDigest(
-    'Cloud Hypervisor guest kernel',
-    config.kernelPath,
-    config.sha256?.kernel,
-    dependencies,
-  );
-  await assertDigest(
-    'Cloud Hypervisor rootfs',
-    config.rootfsPath,
-    config.sha256?.rootfs,
-    dependencies,
-  );
-  await assertDigest(
-    'Cloud Hypervisor guest supervisor',
-    config.supervisorPath,
-    config.sha256?.supervisor,
-    dependencies,
-  );
-
-  return {
-    version,
-    cloudHypervisorBinary: config.cloudHypervisorBinary,
-    virtiofsdBinary,
-    kernelPath: config.kernelPath,
-    rootfsPath: config.rootfsPath,
-    supervisorPath: config.supervisorPath,
-    tools,
-    cgroupVersion,
-    kvmGid,
-  };
 }

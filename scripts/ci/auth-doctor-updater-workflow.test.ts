@@ -6,6 +6,18 @@ const sourcePath = path.join(workflowsDir, 'auth-doctor-updater.md');
 const lockPath = path.join(workflowsDir, 'auth-doctor-updater.lock.yml');
 
 describe('auth doctor updater workflow config', () => {
+  it('pins the Copilot CLI to a release reviewed by the pinned setup action', () => {
+    const source = fs.readFileSync(sourcePath, 'utf-8');
+    const lock = fs.readFileSync(lockPath, 'utf-8');
+    const metadataLine = lock.split('\n').find(line => line.startsWith('# gh-aw-metadata: '));
+
+    expect(source).toContain('engine:\n  id: copilot\n  version: "1.0.98"');
+    expect(metadataLine).toBeDefined();
+    const metadata = JSON.parse(metadataLine!.slice('# gh-aw-metadata: '.length));
+    expect(metadata.engine_versions.copilot).toBe('1.0.98');
+    expect(lock).toContain('run: bash "${RUNNER_TEMP}/gh-aw/actions/install_copilot_cli.sh" 1.0.98');
+  });
+
   it('uses updater cadence with a bounded documentation PR contract', () => {
     const source = fs.readFileSync(sourcePath, 'utf-8');
 
@@ -13,6 +25,7 @@ describe('auth doctor updater workflow config', () => {
     expect(source).toContain('schedule: daily');
     expect(source).toContain('workflow_dispatch:');
     expect(source).toContain('Compute scan window');
+    expect(source).toContain('mkdir -p /tmp/gh-aw/agent /tmp/gh-aw/cache-memory /tmp/gh-aw/sandbox/agent/logs');
     expect(source).toContain('query: \'is:pr is:open in:title "[docs] auth:"\'');
     expect(source).toContain('title-prefix: "[docs] auth: "');
     expect(source).toContain('labels: [documentation, ai-generated]');
@@ -20,6 +33,8 @@ describe('auth doctor updater workflow config', () => {
     expect(source).toContain('allowed-files:');
     expect(source).toContain('docs/auth-matrix.md');
     expect(source).toContain('never run `git commit`, `git push`, or `gh pr create`');
+    expect(source).toContain('sandbox:\n  agent:\n    id: awf\nnetwork:');
+    expect(source).not.toContain('runtime: cloud-hypervisor');
     expect(source).not.toContain('create-issue:');
   });
 
@@ -50,6 +65,14 @@ describe('auth doctor updater workflow config', () => {
     expect(source).not.toContain('${{ env.');
   });
 
+  it('checks official provider docs with the enabled bash tool', () => {
+    const source = fs.readFileSync(sourcePath, 'utf-8');
+
+    expect(source).toContain('Use the enabled `bash` tool with read-only `curl` requests');
+    expect(source).toContain('curl --fail --location --silent --show-error --max-time 30');
+    expect(source).not.toContain('Use `web-fetch`');
+  });
+
   it('compiles the schedule, scan window, permissions, and safe outputs', () => {
     const lock = fs.readFileSync(lockPath, 'utf-8');
 
@@ -61,6 +84,8 @@ describe('auth doctor updater workflow config', () => {
     expect(lock).toContain('Compute scan window');
     expect(lock).toContain('create_pull_request');
     expect(lock).toContain('docs/auth-matrix.md');
+    expect(lock).toContain('GH_AW_INFO_AGENT_RUNTIME: ""');
+    expect(lock).not.toContain('--container-runtime cloud-hypervisor');
     expect(lock).toMatch(/memory-none-nopolicy-\$\{\{ env\.GH_AW_WORKFLOW_ID_SANITIZED \}\}-/);
     expect(lock).toMatch(/github\/gh-aw(?:-actions\/|\/actions\/)setup@[a-f0-9]{40}/);
   });

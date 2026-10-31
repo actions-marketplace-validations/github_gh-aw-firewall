@@ -6,10 +6,12 @@ const root = path.join(__dirname, '..', '..', 'containers');
 const {
   dispatchJsonRpc,
   parseJsonRpcBody,
+  MCP_PROTOCOL_VERSION,
   TOOL_NAME,
 } = require(path.join(root, 'enclave', 'mcp-server', 'mcp-protocol.js'));
 const {
   createMcpServer,
+  createBoundedToolAdmissionAudit,
   createSingleToolAdmission,
   safeCapabilityEquals,
 } = require(path.join(root, 'enclave', 'mcp-server', 'server.js'));
@@ -22,6 +24,7 @@ const {
   createEnclaveInformationBudgetLedger,
 } = require(path.join(root, 'bounded-execution', 'sensitivity-ledger.js'));
 /* eslint-enable @typescript-eslint/no-require-imports */
+import { createRpcTestHarness } from './mcp-server.test-utils';
 
 const capability = '0123456789abcdef0123456789abcdef';
 const validArguments = {
@@ -30,23 +33,43 @@ const validArguments = {
   script: 'import json\nopen("out", "w").write(json.dumps(True))',
 };
 
-function rpc(method: string, params?: unknown, id = 1) {
-  return { jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) };
-}
-
-function fakeBroker(response: string, requests: unknown[] = []) {
-  return {
-    handle(request: unknown, respond: (value: string) => void) {
-      requests.push(request);
-      respond(response);
-      return Promise.resolve();
-    },
-  };
-}
+const { rpc, fakeBroker, canonicalErrorBroker } = createRpcTestHarness(CANONICAL_ERROR_RESPONSE_JSON);
 
 describe('AWF enclave MCP protocol', () => {
+  it('bounds repeated per-run tool-admission audit events', () => {
+    const lifecycle = jest.fn();
+    const audit = createBoundedToolAdmissionAudit({ lifecycle }, 2);
+    for (let index = 0; index < 5; index++) {
+      audit.lifecycle('tool-admission', { status: 'rejected', reason: 'tool-call-cap' });
+    }
+    audit.lifecycle('other-event', { status: 'retained' });
+
+    expect(lifecycle.mock.calls).toEqual([
+      ['tool-admission', { status: 'rejected', reason: 'tool-call-cap' }],
+      ['tool-admission', { status: 'rejected', reason: 'tool-call-cap' }],
+      ['tool-admission', { phase: 'diagnostics', status: 'limit-reached' }],
+      ['other-event', { status: 'retained' }],
+    ]);
+  });
+
+  it.each(['busy', 'tool-call-cap'])('records protected %s rejection without changing the public response', async reason => {
+    const lifecycle = jest.fn();
+    const handler = canonicalErrorBroker();
+    const response = await dispatchJsonRpc(rpc('tools/call', { name: TOOL_NAME, arguments: validArguments }), {
+      handlers: { [TOOL_NAME]: handler },
+      diagnosticAudit: { lifecycle },
+      ...(reason === 'busy' ? { tryAcquireToolCall: () => undefined }
+        : { toolCallBudget: { tryConsume: () => false } }),
+    });
+    expect(response.result.structuredContent).toEqual({ status: 'error' });
+    expect(lifecycle).toHaveBeenCalledWith('tool-admission', {
+      status: 'rejected', reason, executorKind: 'script',
+    });
+    expect(JSON.stringify(lifecycle.mock.calls)).not.toContain(validArguments.script);
+  });
+
   it('implements initialization and the initialized notification', async () => {
-    const deps = { handlers: { [TOOL_NAME]: fakeBroker(CANONICAL_ERROR_RESPONSE_JSON) }, maxScriptBytes: 65536 };
+    const deps = { handlers: { [TOOL_NAME]: canonicalErrorBroker() }, maxScriptBytes: 65536 };
     const initialized = await dispatchJsonRpc(rpc('initialize', {}), deps);
     expect(initialized).toMatchObject({
       jsonrpc: '2.0',
@@ -62,9 +85,33 @@ describe('AWF enclave MCP protocol', () => {
     }, deps)).toBeUndefined();
   });
 
+  it('echoes a supported protocol version requested by the client', async () => {
+    const deps = { handlers: { [TOOL_NAME]: canonicalErrorBroker() }, maxScriptBytes: 65536 };
+    for (const requested of ['2025-11-25', '2025-06-18']) {
+      const response = await dispatchJsonRpc(
+        rpc('initialize', { protocolVersion: requested, clientInfo: { name: 'copilot', version: '1.0.83' } }),
+        deps,
+      );
+      expect(response.result.protocolVersion).toBe(requested);
+    }
+  });
+
+  it('falls back to the newest supported protocol version for an unknown request', async () => {
+    const deps = { handlers: { [TOOL_NAME]: canonicalErrorBroker() }, maxScriptBytes: 65536 };
+    const response = await dispatchJsonRpc(rpc('initialize', { protocolVersion: '1999-01-01' }), deps);
+    expect(response.result.protocolVersion).toBe(MCP_PROTOCOL_VERSION);
+    expect(MCP_PROTOCOL_VERSION).toBe('2025-11-25');
+  });
+
+  it('does not advertise revisions that require unsupported batch handling', async () => {
+    const deps = { handlers: { [TOOL_NAME]: canonicalErrorBroker() }, maxScriptBytes: 65536 };
+    const response = await dispatchJsonRpc(rpc('initialize', { protocolVersion: '2025-03-26' }), deps);
+    expect(response.result.protocolVersion).toBe(MCP_PROTOCOL_VERSION);
+  });
+
   it('publishes one static tool without trusted configuration or repository data', async () => {
     const response = await dispatchJsonRpc(rpc('tools/list', {}), {
-      handlers: { [TOOL_NAME]: fakeBroker(CANONICAL_ERROR_RESPONSE_JSON) },
+      handlers: { [TOOL_NAME]: canonicalErrorBroker() },
       maxScriptBytes: 65536,
       repositories: ['should-never-appear'],
       runtime: 'gvisor',
@@ -84,7 +131,7 @@ describe('AWF enclave MCP protocol', () => {
 
   it('accepts the null tools/list params emitted by the mcpg Go SDK', async () => {
     const response = await dispatchJsonRpc(rpc('tools/list', null), {
-      handlers: { [TOOL_NAME]: fakeBroker(CANONICAL_ERROR_RESPONSE_JSON) },
+      handlers: { [TOOL_NAME]: canonicalErrorBroker() },
       maxScriptBytes: 65536,
     });
     expect(response.result.tools).toHaveLength(1);
@@ -93,7 +140,7 @@ describe('AWF enclave MCP protocol', () => {
 
   it('rejects non-empty tools/list params', async () => {
     const response = await dispatchJsonRpc(rpc('tools/list', { unexpected: true }), {
-      handlers: { [TOOL_NAME]: fakeBroker(CANONICAL_ERROR_RESPONSE_JSON) },
+      handlers: { [TOOL_NAME]: canonicalErrorBroker() },
       maxScriptBytes: 65536,
     });
     expect(response).toMatchObject({ error: { code: -32602 } });
@@ -116,6 +163,23 @@ describe('AWF enclave MCP protocol', () => {
       },
     });
     expect(JSON.stringify(response)).not.toContain('isError');
+  });
+
+  it('passes the exact request AbortSignal as the handler third argument', async () => {
+    const cancellation = new AbortController();
+    const handle = jest.fn((_request: unknown, respond: (json: string) => void, _options: { signal: AbortSignal }) => {
+      respond('{"status":"ok","result":true}');
+    });
+    await dispatchJsonRpc(rpc('tools/call', {
+      name: TOOL_NAME,
+      arguments: validArguments,
+    }), {
+      handlers: { [TOOL_NAME]: { handle } },
+      maxScriptBytes: 65536,
+      signal: cancellation.signal,
+    });
+    expect(handle).toHaveBeenCalledWith(validArguments, expect.any(Function), { signal: cancellation.signal });
+    expect(handle.mock.calls[0][2].signal).toBe(cancellation.signal);
   });
 
   it.each([
@@ -155,7 +219,7 @@ describe('AWF enclave MCP protocol', () => {
   });
 
   it('uses JSON-RPC errors only for malformed protocol requests', async () => {
-    const deps = { handlers: { [TOOL_NAME]: fakeBroker(CANONICAL_ERROR_RESPONSE_JSON) }, maxScriptBytes: 65536 };
+    const deps = { handlers: { [TOOL_NAME]: canonicalErrorBroker() }, maxScriptBytes: 65536 };
     await expect(dispatchJsonRpc(rpc('unknown'), deps)).resolves.toMatchObject({
       error: { code: -32601 },
     });
@@ -218,7 +282,7 @@ describe('AWF enclave MCP HTTP framing', () => {
 
   beforeEach(async () => {
     server = createMcpServer({
-      handlers: { [TOOL_NAME]: fakeBroker(CANONICAL_ERROR_RESPONSE_JSON) },
+      handlers: { [TOOL_NAME]: canonicalErrorBroker() },
       capability,
       maxScriptBytes: 65536,
     });
@@ -313,7 +377,7 @@ describe('unified enclave ledger and timing', () => {
       responseJitterSource: () => 0,
       clock,
       runner: {
-        runScriptContainer: async () => {
+        runInvocation: async () => {
           now += 5;
           return { exitCode: 0, timedOut: false };
         },
@@ -332,6 +396,52 @@ describe('unified enclave ledger and timing', () => {
     expect(ledger.tryDebit).toHaveBeenCalledWith('octo/private', 6, 'script');
     expect(sleeps).toEqual([25]);
     expect(now).toBe(100);
+  });
+
+  it('allows free-form string fields only for trusted repositories', async () => {
+    const schema = {
+      type: 'object',
+      fields: {
+        disposition: { type: 'enum', values: ['dispatch', 'ignore'] },
+        rationale: { type: 'string' },
+      },
+    };
+    const request = { ...validArguments, schema };
+    const run = jest.fn(async () => ({ exitCode: 0, timedOut: false }));
+    const workspace = {
+      createInvocationWorkspace: () => ({ outPath: 'unused' }),
+      readQueryOutput: () => '{"disposition":"dispatch","rationale":"Free-form trusted rationale."}',
+      destroyInvocationWorkspace: () => undefined,
+    };
+    const createBroker = (sensitivity: 'trusted' | 'public') => createExecutorHandler({
+      config: {
+        maxInvocations: 1,
+        timeoutSeconds: 30,
+        primaryBackend: 'docker',
+        executorBackend: 'docker',
+        maxOutputBytes: 8192,
+      },
+      seedMap: new Map([['octo/private', { seedId: 'a'.repeat(16), sensitivity }]]),
+      runId: 'a'.repeat(16),
+      audit: { failure: jest.fn(), invocation: jest.fn() },
+      telemetry: { emit: jest.fn() },
+      executorKind: 'script',
+      clock: { nowMs: () => 0, sleep: async () => undefined },
+      runner: { runInvocation: run },
+      workspace,
+    });
+
+    let trustedResult = '';
+    await createBroker('trusted').handle(request, (value: string) => { trustedResult = value; });
+    expect(trustedResult).toBe(
+      '{"status":"ok","result":{"disposition":"dispatch","rationale":"Free-form trusted rationale."}}',
+    );
+    expect(run).toHaveBeenCalledTimes(1);
+
+    let publicResult = '';
+    await createBroker('public').handle(request, (value: string) => { publicResult = value; });
+    expect(publicResult).toBe(CANONICAL_ERROR_RESPONSE_JSON);
+    expect(run).toHaveBeenCalledTimes(1);
   });
 
   it('buckets repository and budget rejection classes to the same public boundary', async () => {
@@ -428,7 +538,7 @@ describe('unified enclave ledger and timing', () => {
         },
       },
       runner: {
-        runScriptContainer: async () => {
+        runInvocation: async () => {
           now += 50;
           return { exitCode: 0, timedOut: false };
         },

@@ -16,7 +16,9 @@ import type {
   EnclaveAgentExecutorConfig,
   EnclaveScriptExecutorConfig,
 } from '../types/enclave-options';
+import { isEnclaveAgentGithubToolsEnabled } from '../types/enclave-options';
 import { assertPrivateRootIsolated } from './mount-policy';
+import { ENCLAVE_DEBUG_ARTIFACT_ROOT } from './public-debug';
 import {
   assertAgentRuntimeAvailable,
   assertPrimaryRuntimeAvailable,
@@ -28,11 +30,40 @@ import {
   ENCLAVE_MCP_CAPABILITY_ENV,
   resolveEnclaveGatewayContract,
 } from './gateway';
-import { resolveEnclaveGithubGatewayContract } from './github-gateway';
+import {
+  ENCLAVE_GITHUB_MCP_AGENT_ID_ENV,
+  resolveEnclaveGithubGatewayContract,
+} from './github-gateway';
+import {
+  resolveEnclaveDynamicDelegationHandoff,
+  stageEnclaveDynamicDelegationHandoff,
+  takeEnclaveDynamicDelegationHandoff,
+} from './dynamic-delegation-handoff';
+import {
+  assertCloudHypervisorEnclavePrerequisites,
+  isCloudHypervisorEnclaveSelected,
+  startCloudHypervisorEnclaveLifecycle,
+  stopCloudHypervisorEnclaveLifecycle,
+  type TrustedCloudHypervisorEnclaveStorageProvider,
+} from './cloud-hypervisor-lifecycle';
+import { ProductionTrustedCloudHypervisorEnclaveStorageProvider } from '../cloud-hypervisor/trusted-enclave-storage';
+import {
+  assertDockerEnclaveLifecycleReady,
+  assertDockerEnclaveHostPrerequisites,
+  isDockerEnclaveSelected,
+  startDockerEnclaveLifecycle,
+  stopDockerEnclaveLifecycle,
+} from './docker-lifecycle';
+import { HOST_EXECUTOR_STORAGE_ROOT } from './host-executor-journal';
+import * as path from 'path';
+import { updateEnclaveStartupProgress } from './startup-progress';
+import { HostPreflightReporter } from '../cloud-hypervisor/host-preflight-progress';
+import {
+  getStaticGithubExecutorCapability,
+  takeStaticGithubExecutorCapability,
+} from './static-github-handoff';
 
 export const ENCLAVE_RUN_LABEL = 'awf.enclave.run';
-export const ENCLAVE_GITHUB_CAPABILITY_KEY_ENV = 'MCP_GATEWAY_ENCLAVE_CAPABILITY_KEY';
-
 export function isEnclaveScriptEnabled(config: WrapperConfig): boolean {
   return config.enclaves?.enabled === true && config.enclaves.executors.script.enabled === true;
 }
@@ -45,10 +76,27 @@ export function isEnclavesEnabled(config: WrapperConfig): boolean {
   return config.enclaves?.enabled === true;
 }
 
+/** Whether this run's agent entry declares a dynamic repository policy. */
+export function isEnclaveDynamicPolicyDeclared(config: WrapperConfig): boolean {
+  return isEnclaveAgentEnabled(config) && config.enclaves?.executors.agent.dynamic !== undefined;
+}
+
+/**
+ * Whether this run stages immutable seeds at all.
+ *
+ * A dynamic-only entry reads live GitHub through a per-invocation delegated
+ * identity, so it needs no staging credential, no clone, no seed catalog, and
+ * no `/awf/seed` mount. Mixed runs (a static entry beside a separate dynamic
+ * entry) still stage the static catalog.
+ */
+export function isEnclaveSeedStagingRequired(config: WrapperConfig): boolean {
+  return isEnclavesEnabled(config) && (config.enclaves?.privateRepos.length ?? 0) > 0;
+}
+
 export function isEnclaveGithubEnabled(config: WrapperConfig): boolean {
   return (
     isEnclaveAgentEnabled(config)
-    && config.enclaves?.executors.agent.github?.cli === 'issues-read-v1'
+    && isEnclaveAgentGithubToolsEnabled(config.enclaves?.executors.agent)
   );
 }
 
@@ -57,11 +105,19 @@ function ensureDirectory(target: string, mode: number): void {
   fs.chmodSync(target, mode);
 }
 
+interface NeverLaunchedStaging {
+  runId?: string;
+}
+
+const neverLaunchedStaging = new Map<string, NeverLaunchedStaging>();
+
 function prepareDirectories(
   paths: EnclavePaths,
   chown: typeof fs.chownSync = fs.chownSync,
+  onPrivateRootCreated: () => void = () => undefined,
 ): void {
   fs.mkdirSync(paths.root, { mode: 0o700 });
+  onPrivateRootCreated();
   fs.mkdirSync(paths.ingressRoot, { mode: 0o700 });
   ensureDirectory(paths.seedsDir, 0o700);
   ensureDirectory(paths.workDir, 0o700);
@@ -70,14 +126,12 @@ function prepareDirectories(
   ensureDirectory(paths.apiProxyLogsDir, 0o700);
   // The image's fixed non-root user must create the audit stream through this
   // bind mount. The parent private root remains 0700 on the host.
-  ensureDirectory(paths.githubCliProxyLogsDir, 0o733);
   ensureDirectory(paths.runDir, 0o770);
   if (process.getuid?.() === 0) {
     const hostUid = parseInt(getSafeHostUid(), 10);
     const hostGid = parseInt(getSafeHostGid(), 10);
     chown(paths.runDir, hostUid, hostGid);
     chown(paths.apiProxyLogsDir, hostUid, hostGid);
-    chown(paths.githubCliProxyLogsDir, hostUid, hostGid);
   }
 }
 
@@ -101,6 +155,10 @@ export interface PrepareEnclavesDeps {
   assertScriptRuntimeAvailable?: (config: EnclaveScriptExecutorConfig) => Promise<void>;
   assertAgentRuntimeAvailable?: (config: EnclaveAgentExecutorConfig) => Promise<void>;
   assertPrimaryAvailable?: typeof assertPrimaryRuntimeAvailable;
+  assertCloudHypervisorPrimaryPreflight?: (config: WrapperConfig) => Promise<void>;
+  assertDockerHostPrerequisites?: typeof assertDockerEnclaveHostPrerequisites;
+  /** Trusted host integration only. No CLI/config/env switch can supply this provider. */
+  cloudHypervisorStorageProvider?: TrustedCloudHypervisorEnclaveStorageProvider;
 }
 
 export async function prepareEnclaves(
@@ -108,9 +166,24 @@ export async function prepareEnclaves(
   deps: PrepareEnclavesDeps = {},
 ): Promise<void> {
   if (!isEnclavesEnabled(config)) return;
+  updateEnclaveStartupProgress(config, { stage: 'configuration' });
   const enclaves = config.enclaves!;
   const env = deps.env ?? process.env;
-  const errors = validateEnclavesConfig(config);
+  takeStaticGithubExecutorCapability(config, env);
+  const staticGithubCapability = getStaticGithubExecutorCapability(config);
+  const storageProvider = deps.cloudHypervisorStorageProvider ??
+    new ProductionTrustedCloudHypervisorEnclaveStorageProvider();
+  // Take custody of the compiler's AWF-only delegation handoff before anything
+  // else can inherit this environment, on every run — including static-only
+  // runs, where the values must simply be discarded.
+  const delegationHandoff = resolveEnclaveDynamicDelegationHandoff(
+    takeEnclaveDynamicDelegationHandoff(env),
+  );
+  const dynamicDeclared = isEnclaveDynamicPolicyDeclared(config);
+  const errors = validateEnclavesConfig(config, {
+    delegationHandoff,
+    requireDelegationHandoff: dynamicDeclared,
+  });
   try {
     const gateway = resolveEnclaveGatewayContract(config, env);
     if (!config.networkIsolation) {
@@ -140,16 +213,19 @@ export async function prepareEnclaves(
     );
   }
   const token = resolveStagingToken(env);
-  if (!token) {
+  const seedStagingRequired = isEnclaveSeedStagingRequired(config);
+  if (seedStagingRequired && !token) {
     errors.push('enclaves require a staging credential in GH_TOKEN or GITHUB_TOKEN on the AWF host');
   }
-  const githubCapabilityKey = env[ENCLAVE_GITHUB_CAPABILITY_KEY_ENV] ?? '';
+  const githubAgentId = staticGithubCapability?.agentId ?? env[ENCLAVE_GITHUB_MCP_AGENT_ID_ENV] ?? '';
   if (isEnclaveGithubEnabled(config)) {
-    if (!/^[0-9a-f]{64}$/.test(githubCapabilityKey)) {
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(githubAgentId)) {
       errors.push(
-        `${ENCLAVE_GITHUB_CAPABILITY_KEY_ENV} must contain the compiler-issued 256-bit lowercase hex root`,
+        `${ENCLAVE_GITHUB_MCP_AGENT_ID_ENV} must contain the compiler-issued enclave gateway identity`,
       );
     }
+  }
+  if (isEnclaveGithubEnabled(config) || dynamicDeclared) {
     try {
       resolveEnclaveGithubGatewayContract(config, env);
     } catch (error) {
@@ -161,64 +237,177 @@ export async function prepareEnclaves(
   if (errors.length > 0) {
     throw new Error(`Enclave configuration is invalid:\n  - ${errors.join('\n  - ')}`);
   }
-  if (!token) {
+  if (seedStagingRequired && !token) {
     throw new Error('Enclave staging credential disappeared during preflight');
   }
 
-  await (deps.assertPrimaryAvailable ?? assertPrimaryRuntimeAvailable)(config.containerRuntime);
-  if (enclaves.executors.script.enabled) {
-    const assertScriptRuntime = deps.assertScriptRuntimeAvailable ?? assertScriptRuntimeAvailable;
-    await assertScriptRuntime(enclaves.executors.script);
+  const cloudHypervisorSelected = isCloudHypervisorEnclaveSelected(config);
+  const dockerSelected = isDockerEnclaveSelected(config);
+  const hostExecutorSelected = cloudHypervisorSelected || dockerSelected;
+  if (dockerSelected) {
+    (deps.assertDockerHostPrerequisites ?? assertDockerEnclaveHostPrerequisites)(config, env);
   }
-  if (enclaves.executors.agent.enabled) {
+  updateEnclaveStartupProgress(config, { stage: 'host-preflight' });
+  if (hostExecutorSelected) {
+    const hostPaths = resolveEnclavePaths(config.workDir);
+    const report = cloudHypervisorSelected
+      ? new HostPreflightReporter('host-isolation', (hostPreflight) =>
+        updateEnclaveStartupProgress(config, { hostPreflight }))
+      : undefined;
+    for (const [root, label, check] of [
+      [hostPaths.hostExecutorJournalDir, 'recovery journal', 'journal-isolation'],
+      [path.join(path.dirname(hostPaths.hostExecutorJournalDir), 'host-invocations'), 'invocation mount points', 'invocation-isolation'],
+      [HOST_EXECUTOR_STORAGE_ROOT, 'allocation domains', 'allocation-isolation'],
+      [ENCLAVE_DEBUG_ARTIFACT_ROOT, 'debug artifacts', 'debug-artifact-isolation'],
+    ] as const) {
+      if (!cloudHypervisorSelected && (check === 'allocation-isolation' || check === 'debug-artifact-isolation')) {
+       continue;
+      }
+      const assertIsolated = () => assertPrivateRootIsolated(config, {
+       root, ingressRoot: hostPaths.ingressRoot,
+      }, env, process.cwd(), `${cloudHypervisorSelected ? 'Cloud Hypervisor' : 'Docker'} enclave ${label}`);
+      if (report) await report.check(check, assertIsolated);
+      else assertIsolated();
+    }
+  }
+  await assertCloudHypervisorEnclavePrerequisites(config, storageProvider);
+  updateEnclaveStartupProgress(config, { stage: 'runtime-preflight' });
+  const runtimeChecks = new HostPreflightReporter('enclave-runtime', (hostPreflight) =>
+    updateEnclaveStartupProgress(config, { hostPreflight }));
+  if (!enclaves.executors.script.enabled) runtimeChecks.notRequired('script-runtime');
+  if (!enclaves.executors.agent.enabled) runtimeChecks.notRequired('agent-runtime');
+  if (!hostExecutorSelected) runtimeChecks.notRequired('host-service');
+  if (config.containerRuntime === 'cloud-hypervisor') {
+    await runtimeChecks.check('primary-runtime', () => {
+      if (!deps.assertCloudHypervisorPrimaryPreflight) {
+        throw new Error('Cloud Hypervisor primary runtime preflight evidence is unavailable');
+      }
+      return deps.assertCloudHypervisorPrimaryPreflight(config);
+    });
+  } else {
+    await runtimeChecks.check('primary-runtime', () =>
+      (deps.assertPrimaryAvailable ?? assertPrimaryRuntimeAvailable)(config.containerRuntime));
+  }
+  if (enclaves.executors.script.enabled && !cloudHypervisorSelected) {
+    const assertScriptRuntime = deps.assertScriptRuntimeAvailable ?? assertScriptRuntimeAvailable;
+    await runtimeChecks.check('script-runtime', () => assertScriptRuntime(enclaves.executors.script));
+  }
+  if (enclaves.executors.agent.enabled && !cloudHypervisorSelected) {
     const assertAgentRuntime = deps.assertAgentRuntimeAvailable ?? assertAgentRuntimeAvailable;
-    await assertAgentRuntime(enclaves.executors.agent);
+    await runtimeChecks.check('agent-runtime', () => assertAgentRuntime(enclaves.executors.agent));
   }
 
   const paths = resolveEnclavePaths(config.workDir);
-  assertPrivateRootIsolated(config, paths, env, process.cwd(), 'enclave');
-  try {
-    const workDirStat = fs.lstatSync(config.workDir);
-    if (workDirStat.isSymbolicLink()) {
-      throw new Error(`Refusing to stage into a symlink work directory: ${config.workDir}`);
+  updateEnclaveStartupProgress(config, { stage: 'seed-staging' });
+  const storageChecks = new HostPreflightReporter('enclave-storage', (hostPreflight) =>
+    updateEnclaveStartupProgress(config, { hostPreflight }));
+  if (!seedStagingRequired) storageChecks.notRequired('seed-catalog');
+  if (!isEnclaveGithubEnabled(config)) storageChecks.notRequired('github-identity');
+  if (!(dynamicDeclared && delegationHandoff.handoff)) storageChecks.notRequired('delegation-custody');
+  await storageChecks.check('private-root-isolation', () =>
+    assertPrivateRootIsolated(config, paths, env, process.cwd(), 'enclave'));
+  await storageChecks.check('work-directory', () => {
+    try {
+      const workDirStat = fs.lstatSync(config.workDir);
+      if (workDirStat.isSymbolicLink()) {
+        throw new Error(`Refusing to stage into a symlink work directory: ${config.workDir}`);
+      }
+    } catch (error: unknown) {
+      if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== 'ENOENT') {
+        throw error;
+      }
     }
-  } catch (error: unknown) {
-    if (!(error instanceof Error) || (error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      throw error;
-    }
-  }
-  prepareDirectories(paths);
+  });
+  await storageChecks.check('directory-layout', () => prepareDirectories(
+    paths, undefined, () => {
+      if (dockerSelected) neverLaunchedStaging.set(paths.root, {});
+    },
+  ));
 
   const runId = generateEnclaveRunId();
-  const staging = await stageEnclaveSeeds({
-    repos: enclaves.privateRepos,
-    paths,
-    runId,
-    token,
-    gitRunner: deps.gitRunner,
-    label: 'Enclaves',
-  });
-  const seedMap: PrivateRepositorySeedMap = {
-    version: PRIVATE_REPOSITORY_SEED_MAP_VERSION,
-    runId: staging.runId,
-    seeds: staging.seeds.map((seed) => ({
-      repo: seed.repoKey,
-      seedId: seed.seedId,
-      sensitivity: seed.sensitivity,
-    })),
-  };
-  writeExclusive(paths.seedMapPath, serializePrivateRepositorySeedMap(seedMap), 0o600);
-  writeExclusive(paths.capabilityPath, `${env[ENCLAVE_MCP_CAPABILITY_ENV]}\n`, 0o600);
-  if (isEnclaveGithubEnabled(config)) {
-    writeExclusive(paths.githubCapabilityKeyPath, `${githubCapabilityKey}\n`, 0o600);
-    const githubRunIdentity = resolveEnclaveGithubGatewayContract(config, env).identity;
-    writeExclusive(paths.githubRunIdentityPath, `${githubRunIdentity}\n`, 0o600);
-    if (env === process.env) delete process.env[ENCLAVE_GITHUB_CAPABILITY_KEY_ENV];
+  await storageChecks.check('run-identity', () => writeExclusive(paths.runIdPath, `${runId}\n`, 0o600));
+  const staging = neverLaunchedStaging.get(paths.root);
+  if (staging) staging.runId = runId;
+  if (seedStagingRequired) {
+    await storageChecks.check('seed-catalog', async () => {
+      const staging = await stageEnclaveSeeds({
+        repos: enclaves.privateRepos,
+        paths,
+        runId,
+        token: token!,
+        gitRunner: deps.gitRunner,
+        label: 'Enclaves',
+      });
+      const seedMap: PrivateRepositorySeedMap = {
+        version: PRIVATE_REPOSITORY_SEED_MAP_VERSION,
+        runId: staging.runId,
+        seeds: staging.seeds.map((seed) => ({
+          repo: seed.repoKey,
+          seedId: seed.seedId,
+          sensitivity: seed.sensitivity,
+        })),
+      };
+      writeExclusive(paths.seedMapPath, serializePrivateRepositorySeedMap(seedMap), 0o600);
+      logger.info(`Enclaves: staged ${staging.seeds.length} immutable seed(s); staging credential discarded.`);
+    });
+  } else {
+    // Dynamic-only: no clone, no seed catalog, not even an empty one. The
+    // broker mounts neither /awf/seed nor a seed map, and never sees a job
+    // token.
+    logger.info('Enclaves: dynamic-only entry; no repository seed is cloned, staged, or mounted.');
   }
-  logger.info(`Enclaves: staged ${staging.seeds.length} immutable seed(s); staging credential discarded.`);
+  await storageChecks.check('capability-staging', () =>
+    writeExclusive(paths.capabilityPath, `${env[ENCLAVE_MCP_CAPABILITY_ENV]}\n`, 0o600));
+  if (isEnclaveGithubEnabled(config)) {
+    await storageChecks.check('github-identity', () => {
+      if (!staticGithubCapability) {
+        writeExclusive(paths.githubAgentIdPath, `${githubAgentId}\n`, 0o600);
+        if (env === process.env) delete process.env[ENCLAVE_GITHUB_MCP_AGENT_ID_ENV];
+      }
+    });
+  }
+  if (dynamicDeclared && delegationHandoff.handoff) {
+    const handoff = delegationHandoff.handoff;
+    await storageChecks.check('delegation-custody', () => {
+      // AWF-private custody: exclusive 0600 files inside the 0700 private root,
+      // never bind-mounted into the broker, the executor, the model sidecar, the
+      // general MCP route, or the delegated data plane.
+      stageEnclaveDynamicDelegationHandoff(paths, handoff);
+      ensureDirectory(paths.delegationChannelDir, 0o700);
+      logger.info(
+        'Enclaves: took private custody of the mcpg delegation-control handoff for dynamic '
+        + 'repository admission.',
+      );
+    });
+  }
+  if (dockerSelected) {
+    updateEnclaveStartupProgress(config, { stage: 'host-service' });
+    await runtimeChecks.check('host-service', async () => {
+      await startDockerEnclaveLifecycle(config, env, () => neverLaunchedStaging.delete(paths.root));
+      await assertDockerEnclaveLifecycleReady(config);
+    });
+  }
+  if (cloudHypervisorSelected) {
+    updateEnclaveStartupProgress(config, { stage: 'host-service' });
+    await runtimeChecks.check('host-service', () => startCloudHypervisorEnclaveLifecycle(config, storageProvider, env));
+    if (enclaves.executors.script.enabled) {
+      await runtimeChecks.check('script-runtime', () =>
+        assertScriptRuntimeAvailable(enclaves.executors.script, undefined, undefined, config));
+    }
+    if (enclaves.executors.agent.enabled) {
+      await runtimeChecks.check('agent-runtime', () =>
+        assertAgentRuntimeAvailable(enclaves.executors.agent, undefined, undefined, config));
+    }
+  }
 }
 
 function readRunId(paths: EnclavePaths): string | undefined {
+  try {
+    const raw = fs.readFileSync(paths.runIdPath, 'ascii').trim();
+    if (/^[0-9a-f]{16,64}$/.test(raw)) return raw;
+  } catch {
+    // Fall through to the seed map, which older runs wrote instead.
+  }
   try {
     const parsed = JSON.parse(fs.readFileSync(paths.seedMapPath, 'utf8')) as PrivateRepositorySeedMap;
     return typeof parsed.runId === 'string' && parsed.runId.length > 0 ? parsed.runId : undefined;
@@ -284,7 +473,7 @@ function removePrivateState(
       if (!repaired) {
         throw new Error(
           `Enclaves: failed to repair private state permissions; ` +
-            `manual cleanup is required for ${paths.root} and ${paths.ingressRoot}`,
+          `manual cleanup is required for ${paths.root} and ${paths.ingressRoot}`,
         );
       }
       remove(paths.root);
@@ -298,8 +487,26 @@ function removePrivateState(
 export async function teardownEnclaves(config: WrapperConfig): Promise<void> {
   if (!isEnclavesEnabled(config)) return;
   const paths = resolveEnclavePaths(config.workDir);
+  const staging = neverLaunchedStaging.get(paths.root);
+  await stopDockerEnclaveLifecycle(config, () => {
+    const current = neverLaunchedStaging.get(paths.root);
+    if (!current) return false;
+    const runId = readRunId(paths);
+    return !current.runId || current.runId === runId;
+  });
+  await stopCloudHypervisorEnclaveLifecycle(config);
+  if (staging && neverLaunchedStaging.get(paths.root) === staging) {
+    const stagedRunId = readRunId(paths);
+    if (staging.runId && stagedRunId !== staging.runId) {
+      throw new Error('Never-launched enclave staging identity changed; private state is preserved');
+    }
+    releaseSeedPermissions(paths.seedsDir);
+    removePrivateState(config, paths);
+    neverLaunchedStaging.delete(paths.root);
+    return;
+  }
   const runId = readRunId(paths);
-  if (runId) {
+  if (runId && !isDockerEnclaveSelected(config)) {
     await removeOrphanEnclaveContainers(runId);
   }
   if (config.keepContainers) {
@@ -320,4 +527,5 @@ export const enclaveManagerTestHelpers = {
   readRunId,
   removePrivateState,
   removeOrphanEnclaveContainers,
+  neverLaunchedStaging,
 };

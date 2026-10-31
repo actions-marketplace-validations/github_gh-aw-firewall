@@ -60,23 +60,30 @@ export interface SslConfig {
 }
 
 /**
- * Normalizes an API target value to a bare hostname.
- * API target values should be bare hostnames (e.g., "api.openai.com"), but
- * may arrive with a scheme or path when set via GitHub Actions expressions
- * that are resolved at runtime (see github/gh-aw#25137).
- * Discards any scheme, path, query, fragment, credentials, or port —
- * path prefixes must use the separate *_API_BASE_PATH settings.
+ * Normalizes an API target to its authority, preserving non-default ports
+ * and an explicit `http://` scheme.
+ *
+ * Bare authorities and explicit `https://` URLs normalize to an authority
+ * (HTTPS remains the implicit default). Preserving an explicit `http://`
+ * lets the api-proxy sidecar dial the target in cleartext instead of assuming
+ * HTTPS (see github/gh-aw-firewall#7862) — this
+ * mirrors the runner-side allowlist (resolveApiTargetsToAllowedDomains), which
+ * already treats `http://` targets as a supported, explicitly opted-in
+ * configuration. The mirrored normalizeApiTarget() in the api-proxy sidecar
+ * (containers/api-proxy/proxy-utils.js) re-validates and re-normalizes this
+ * value defensively.
  */
-export function stripScheme(value: string): string {
+export function normalizeApiTargetScheme(value: string): string {
   const trimmed = value.trim();
   if (!trimmed) return trimmed;
 
-  const candidate = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed)
-    ? trimmed
-    : `https://${trimmed}`;
+  const hasScheme = /^[a-zA-Z][a-zA-Z\d+\-.]*:\/\//.test(trimmed);
+  const candidate = hasScheme ? trimmed : `https://${trimmed}`;
 
   try {
-    return new URL(candidate).hostname || trimmed;
+    const parsed = new URL(candidate);
+    if (!parsed.hostname || !['http:', 'https:'].includes(parsed.protocol)) return trimmed;
+    return parsed.protocol === 'http:' ? `http://${parsed.host}` : parsed.host;
   } catch {
     return trimmed;
   }

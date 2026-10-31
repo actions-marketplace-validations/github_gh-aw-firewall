@@ -4,7 +4,7 @@ import { logger } from '../../logger';
 import { WrapperConfig } from '../../types';
 import { applyHostPathPrefixToVolumes } from '../host-path-prefix';
 import { buildCredentialHidingOverlays, pruneUnmountableCredentialOverlays } from './credential-hiding';
-import { createLocalSourceResolver } from './mount-topology';
+import { createLocalSourceResolver, parseMount } from './mount-topology';
 import { ensureNestedMountpoints } from './nested-mountpoints';
 import { buildDockerSocketMount } from './docker-socket';
 import { buildEtcMounts } from './etc-mounts';
@@ -14,6 +14,8 @@ import { buildSslMounts } from './ssl-mounts';
 import { buildSystemMounts } from './system-mounts';
 import { buildCustomVolumeMounts, buildWorkspaceMounts } from './workspace-mounts';
 import { applyFilesystemWritePolicy, resolveComposeFilesystemAllowWrite } from './filesystem-write-policy';
+import type { LocalSourceResolver } from './mount-topology';
+import type { NestedMountpointOptions } from './nested-mountpoints';
 
 interface AgentVolumesParams {
   config: WrapperConfig;
@@ -25,6 +27,17 @@ interface AgentVolumesParams {
   agentLogsPath: string;
   sessionStatePath: string;
   initSignalDir: string;
+  pathExists?: (candidate: string) => boolean;
+  prepareNestedMountpoints?: (
+    volumes: string[],
+    uid: number,
+    gid: number,
+    localSourceResolver: LocalSourceResolver,
+    options?: NestedMountpointOptions,
+  ) => string[];
+  additionalMounts?: string[];
+  nestedMountpointOptions?: NestedMountpointOptions;
+  filterVolumes?: (volumes: string[]) => string[];
 }
 
 export function buildAgentVolumes(params: AgentVolumesParams): string[] {
@@ -41,6 +54,7 @@ export function buildAgentVolumes(params: AgentVolumesParams): string[] {
   } = params;
 
   const agentVolumes: string[] = [];
+  agentVolumes.push(...(params.additionalMounts ?? []));
   agentVolumes.push(...buildWorkspaceMounts({
     config,
     projectRoot,
@@ -55,8 +69,10 @@ export function buildAgentVolumes(params: AgentVolumesParams): string[] {
 
   const useSysroot = config.runnerTopology === 'arc-dind';
   agentVolumes.push(...buildSystemMounts(workspaceDir, config.chrootBinariesSourcePath, useSysroot));
-  agentVolumes.push(...buildHomeMounts({ config, effectiveHome, agentLogsPath, sessionStatePath }));
-  agentVolumes.push(...buildEtcMounts(config));
+  agentVolumes.push(...buildHomeMounts({
+    config, effectiveHome, agentLogsPath, sessionStatePath, pathExists: params.pathExists,
+  }));
+  agentVolumes.push(...buildEtcMounts(config, params.pathExists));
   // When sysroot-stage is active, the sysroot volume provides /etc/hosts.
   // The generated chroot hosts file lives on the runner's /tmp which the
   // Docker daemon cannot see on split-fs. DNS pre-resolution is skipped;
@@ -77,8 +93,6 @@ export function buildAgentVolumes(params: AgentVolumesParams): string[] {
 
   logger.debug('Using selective mounting for security (credential files hidden)');
 
-  agentVolumes.push(...buildCredentialHidingOverlays(effectiveHome));
-
   const localCustomMounts = buildCustomVolumeMounts(config.volumeMounts, undefined, { quiet: true });
   const localSourceRoots = new Map(
     customMounts.map((spec, index) => [spec, localCustomMounts[index]?.split(':')[0] ?? '']),
@@ -92,27 +106,36 @@ export function buildAgentVolumes(params: AgentVolumesParams): string[] {
     ]),
   );
   const localSourceResolver = createLocalSourceResolver(customSourceRoots, config.dockerHostPathPrefix);
+  const credentialOverlays = buildCredentialHidingOverlays(effectiveHome, agentVolumes, localSourceResolver);
+  const credentialTargets = new Set(credentialOverlays.map((spec) => parseMount(spec)?.target));
+  const maskedVolumes = agentVolumes.filter((spec) => !credentialTargets.has(parseMount(spec)?.target));
+  maskedVolumes.push(...credentialOverlays);
 
-  const policyVolumes = pruneUnmountableCredentialOverlays(applyFilesystemWritePolicy(
-    agentVolumes,
+  const policyVolumes = applyFilesystemWritePolicy(
+    maskedVolumes,
     resolveComposeFilesystemAllowWrite(config),
     alwaysWritableMounts,
     localSourceRoots,
-  ), localSourceResolver);
+  );
+  const volumeFilter = params.filterVolumes;
+  const filterBeforePruning = volumeFilter !== undefined;
+  const topologyVolumes = filterBeforePruning
+    ? volumeFilter(applyHostPathPrefixToVolumes(policyVolumes, config.dockerHostPathPrefix))
+    : policyVolumes;
+  const prunedVolumes = pruneUnmountableCredentialOverlays(topologyVolumes, localSourceResolver);
 
   // A read-only bind cannot host a mountpoint runc still has to create, so any
   // internal mount nested inside one must exist up front. Derived from the final
   // topology, so mounts added later are covered without another targeted fix.
-  ensureNestedMountpoints(
-    policyVolumes,
+  (params.prepareNestedMountpoints ?? ensureNestedMountpoints)(
+    prunedVolumes,
     parseInt(getSafeHostUid(), 10),
     parseInt(getSafeHostGid(), 10),
     localSourceResolver,
+    params.nestedMountpointOptions,
   );
 
-  if (config.dockerHostPathPrefix) {
-    return applyHostPathPrefixToVolumes(policyVolumes, config.dockerHostPathPrefix);
-  }
-
-  return policyVolumes;
+  return filterBeforePruning
+    ? prunedVolumes
+    : applyHostPathPrefixToVolumes(prunedVolumes, config.dockerHostPathPrefix);
 }

@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:26.04@sha256:f144425ff09be612d6d9ad965196e9cdc23dae1f42110a8a11a3e9a8198759f7
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV DOCKER_TLS_CERTDIR=""
@@ -26,5 +26,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     nodejs \
   && apt-get clean \
   && rm -rf /var/lib/apt/lists/*
+
+COPY trust/ /opt/awf/trust/
+RUN sh /opt/awf/trust/install-system-trust.sh \
+    && sh /opt/awf/trust/install-node-trust.sh
 
 CMD ["dockerd", "--host=unix:///var/run/docker.sock"]

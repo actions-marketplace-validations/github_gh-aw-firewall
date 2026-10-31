@@ -147,6 +147,25 @@ describe('log-aggregator', () => {
       expectOnlyValidTunnelStats(stats);
     });
 
+    it('should filter out NONE_* Squid preflight entries', () => {
+      const [first, second] = validTunnelEntries();
+      const entries: ParsedLogEntry[] = [
+        first,
+        createLogEntry({
+          domain: 'allowed.example.com',
+          url: 'allowed.example.com:443',
+          decision: 'NONE_NONE:HIER_NONE',
+          statusCode: 0,
+          isAllowed: false,
+        }),
+        second,
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      expectOnlyValidTunnelStats(stats);
+    });
+
     it('should handle multiple transaction-end-before-headers entries', () => {
       const [first, second] = validTunnelEntries();
       const entries: ParsedLogEntry[] = [
@@ -154,6 +173,32 @@ describe('log-aggregator', () => {
         transactionEndEntry({ clientIp: '::1' }), // healthcheck from localhost
         second,
         transactionEndEntry({ clientIp: '172.30.0.20' }), // shutdown-time connection closure
+      ];
+
+      const stats = aggregateLogs(entries);
+
+      expectOnlyValidTunnelStats(stats);
+    });
+
+    it('should filter out ssl_bump step1 and other NONE decision entries', () => {
+      const [first, second] = validTunnelEntries();
+      const entries: ParsedLogEntry[] = [
+        first,
+        createLogEntry({
+          domain: 'github.com',
+          url: 'github.com:443',
+          decision: 'NONE_NONE:HIER_NONE',
+          statusCode: 0,
+          isAllowed: false,
+        }),
+        second,
+        createLogEntry({
+          domain: 'upstream-blocked.example',
+          url: 'error:transaction-end-before-headers',
+          decision: 'NONE_MISS:HIER_DIRECT',
+          statusCode: 0,
+          isAllowed: false,
+        }),
       ];
 
       const stats = aggregateLogs(entries);
@@ -536,6 +581,30 @@ describe('log-aggregator', () => {
       expect(stats.allowedRequests).toBe(2);
       expect(stats.deniedRequests).toBe(1);
       expect(stats.uniqueDomains).toBe(2);
+    });
+
+    it('should include startup diagnostics when no access.log exists', async () => {
+      const source: LogSource = {
+        type: 'preserved',
+        path: '/tmp/squid-logs-startup',
+      };
+      mockedFs.existsSync.mockImplementation((p) => (
+        p === '/tmp/squid-logs-startup/awf-startup-error.json'
+      ));
+      mockedFs.readFileSync.mockReturnValue(JSON.stringify({
+        timestamp: '2026-09-02T12:45:57.000Z',
+        phase: 'startup',
+        message: 'Refusing to use symlink as bind mountpoint: /usr/local/bin/npm',
+      }));
+
+      const stats = await loadAndAggregate(source);
+
+      expect(stats.totalRequests).toBe(0);
+      expect(stats.startupDiagnostics).toEqual([{
+        timestamp: '2026-09-02T12:45:57.000Z',
+        phase: 'startup',
+        message: 'Refusing to use symlink as bind mountpoint: /usr/local/bin/npm',
+      }]);
     });
   });
 });

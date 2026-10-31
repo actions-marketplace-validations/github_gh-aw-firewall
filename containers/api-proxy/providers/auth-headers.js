@@ -9,6 +9,24 @@
  */
 
 /**
+ * Build an `Authorization` header using the given scheme prefix (e.g. `Bearer`,
+ * `token`), optionally merged with extra headers.
+ *
+ * This is the single place that assembles an `Authorization` header value, so
+ * every adapter that needs a non-default prefix (e.g. Copilot's Enterprise
+ * `token <value>` scheme) composes it from here instead of concatenating the
+ * prefix and token itself.
+ *
+ * @param {string} prefix - The auth scheme prefix (e.g. `Bearer`, `token`)
+ * @param {string} token
+ * @param {Record<string, string>} [extraHeaders]
+ * @returns {Record<string, string>}
+ */
+function tokenAuthHeaders(prefix, token, extraHeaders) {
+  return { ...extraHeaders, 'Authorization': prefix + ' ' + token };
+}
+
+/**
  * Build a `Bearer` Authorization header, optionally merged with extra headers.
  *
  * @param {string} token
@@ -16,7 +34,7 @@
  * @returns {Record<string, string>}
  */
 function bearerAuthHeaders(token, extraHeaders) {
-  return { ...extraHeaders, 'Authorization': 'Bearer ' + token };
+  return tokenAuthHeaders('Bearer', token, extraHeaders);
 }
 
 /**
@@ -33,6 +51,27 @@ function providerKeyHeaders(headerName, token, extraHeaders) {
 }
 
 /**
+ * Build a reusable auth-header builder function that encapsulates the
+ * "custom header name vs. Authorization prefix" branching shared by the
+ * OpenAI and Copilot adapters.
+ *
+ * When `headerName` is set (e.g. Azure OpenAI BYOK's `api-key`, or a caller
+ * override such as `AWF_OPENAI_AUTH_HEADER`), the returned function builds a
+ * `providerKeyHeaders`-style header. Otherwise it falls back to
+ * `tokenAuthHeaders` using `prefix` (defaulting to `Bearer`), so callers such
+ * as Copilot can select the `token` or `Bearer` scheme when creating the
+ * reusable builder.
+ *
+ * @param {{ headerName?: string, prefix?: string }} [options]
+ * @returns {(token: string, extraHeaders?: Record<string, string>) => Record<string, string>}
+ */
+function buildAuthHeaderFn({ headerName, prefix = 'Bearer' } = {}) {
+  return (token, extraHeaders) => (headerName
+    ? providerKeyHeaders(headerName, token, extraHeaders)
+    : tokenAuthHeaders(prefix, token, extraHeaders));
+}
+
+/**
  * Add a `Copilot-Integration-Id` entry to an existing header object.
  *
  * @param {Record<string, string>} headers - Base headers to extend
@@ -43,4 +82,4 @@ function withCopilotIntegration(headers, integrationId) {
   return { ...headers, 'Copilot-Integration-Id': integrationId };
 }
 
-module.exports = { bearerAuthHeaders, providerKeyHeaders, withCopilotIntegration };
+module.exports = { tokenAuthHeaders, bearerAuthHeaders, providerKeyHeaders, withCopilotIntegration, buildAuthHeaderFn };

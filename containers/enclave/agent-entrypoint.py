@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """Run the pinned native Copilot CLI inside a enclave-agent enclave."""
 
+from __future__ import annotations
+
+from contextlib import contextmanager
 import errno
+import hashlib
 import json
 import os
 import re
@@ -16,11 +20,16 @@ SEED_DIR = Path("/awf/seed")
 TASK_PATH = Path("/awf/task.txt")
 SCHEMA_PATH = Path("/awf/schema.json")
 OUT_PATH = Path("/awf/out")
+OUTPUT_DIR = Path("/output")
 SESSION_LOG_PATH = Path("/awf/session.jsonl")
 AGENT_DIR = Path("/agent")
 TEMP_DIR = Path("/tmp")
 SHARED_MEMORY_DIR = Path("/dev/shm")
+STORAGE_PROBE_PATH = TEMP_DIR / ".awf-enclave-storage-probe.jsonl"
 COPILOT_BIN = "/usr/local/bin/copilot"
+GITHUB_AGENT_ID_PATH = Path("/run/awf-enclave-github/agent-id")
+GITHUB_BEARER_PATH = Path("/run/awf-enclave-github/bearer")
+GITHUB_MCP_CONFIG_PATH = AGENT_DIR / "github-mcp.json"
 
 MAX_INPUT_BYTES = 64 * 1024
 MAX_TRANSCRIPT_BYTES = 1024 * 1024
@@ -28,6 +37,19 @@ MAX_ENGINE_STREAM_BYTES = MAX_TRANSCRIPT_BYTES // 4
 MAX_DIAGNOSTIC_BYTES = 256 * 1024
 MAX_DIAGNOSTIC_FILES = 32
 MAX_RESOURCE_ENTRIES = 10_000
+MAX_STORAGE_PROBE_BYTES = 4096
+STORAGE_PROBE_STAGES = {
+    "started", "storage-complete", "cleanup-started", "cleanup-complete",
+    "output-write-started", "output-write-complete", "output-check-failed", "output-verified",
+}
+STORAGE_PROBE_FLAGS = (
+    "enospcObserved", "probeFilesRemoved", "symlink", "targetMatches", "sameFile",
+    "directReadable", "aliasReadable", "directMatchesExpected", "aliasMatchesExpected",
+)
+STORAGE_PROBE_OPERATIONS = {
+    "link-lstat", "link-readlink", "direct-stat", "alias-stat",
+    "direct-open", "direct-read", "direct-close", "alias-open", "alias-read", "alias-close",
+}
 MAX_STARTUP_RETRIES = 2
 STARTUP_CRASH_WINDOW_SECONDS = 30
 EXIT_CONFIGURATION_INVALID = 10
@@ -35,6 +57,24 @@ EXIT_INPUT_INVALID = 11
 EXIT_DEADLINE_EXCEEDED = 20
 EXIT_ENGINE_FAILED = 24
 EXIT_RESULT_WRITE_FAILED = 30
+EXIT_RESULT_READ_FAILED = 32
+EXIT_RESULT_EMPTY = 33
+EXIT_RESULT_TOO_LARGE = 34
+EXIT_RESULT_INVALID_UTF8 = 35
+EXIT_RESULT_WHITESPACE_ONLY = 36
+EXIT_RESULT_RESET_FAILED = 37
+
+# Raw engine stdout/stderr and copilot diagnostics can contain private
+# repository content, tool results, or full model transcripts. That free-form
+# text is never part of the enclave's approved disclosure contract (the
+# schema-validated bounded result written to /awf/out), so it must not cross
+# the enclave boundary into the broker-audited session transcript by default.
+# Only trusted host/broker authorization restores raw text (automatic for
+# verified public-only Cloud Hypervisor enclaves, otherwise an explicit opt-in),
+# and even then it stays subject to redact_diagnostics().
+ALLOW_RAW_SESSION_LOGS = (
+    os.environ.get("AWF_ENCLAVE_AGENT_DEBUG_RAW_SESSION_LOGS") == "true"
+)
 
 
 def truncate_utf8(value: str, max_bytes: int) -> str:
@@ -45,18 +85,83 @@ def truncate_utf8(value: str, max_bytes: int) -> str:
 
 
 def append_event(event: dict) -> None:
+    operation = "session-log-encode"
     try:
         encoded = (json.dumps(event, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
+        operation = "session-log-stat"
         current = SESSION_LOG_PATH.stat().st_size
         if len(encoded) <= MAX_TRANSCRIPT_BYTES and current + len(encoded) <= MAX_TRANSCRIPT_BYTES:
-            with SESSION_LOG_PATH.open("ab") as handle:
+            operation = "session-log-open"
+            handle = SESSION_LOG_PATH.open("ab")
+            write_completed = False
+            try:
+                operation = "session-log-write"
                 handle.write(encoded)
-    except (OSError, TypeError, ValueError):
-        pass
+                write_completed = True
+            finally:
+                try:
+                    handle.close()
+                except OSError as error:
+                    if write_completed:
+                        operation = "session-log-close"
+                        raise
+                    sys.stderr.write(json.dumps(os_error_event(
+                        error, "session-log-close", fatal=False,
+                    )) + "\n")
+    except OSError as error:
+        # Do not recurse into the failed transcript writer.
+        sys.stderr.write(json.dumps(os_error_event(error, operation, fatal=False)) + "\n")
+        if event.get("event") in {"operation-error", "failure"}:
+            fields = {"event", "operation", "category", "errno", "fatal"}
+            sys.stderr.write(json.dumps({
+                key: value for key, value in event.items() if key in fields
+            }) + "\n")
+    except (TypeError, ValueError):
+        sys.stderr.write('{"event":"failure","category":"diagnostic-encoding-failed"}\n')
 
 
-def read_bounded(path: Path) -> str:
-    data = path.read_bytes()
+def file_operation(operation: str, action, *, fatal: bool = True):
+    try:
+        return action()
+    except OSError as error:
+        safe_os_error(error, operation, fatal=fatal)
+        raise
+
+
+def close_file(handle, operation: str, *, fatal: bool = True) -> None:
+    try:
+        handle.close()
+    except OSError as error:
+        safe_os_error(error, operation, fatal=fatal)
+        raise
+
+
+@contextmanager
+def diagnostic_file(path: Path, operation: str, mode: str, *, fatal: bool = True):
+    handle = file_operation(f"{operation}-open", lambda: path.open(mode), fatal=fatal)
+    try:
+        yield handle
+    finally:
+        pending_error = sys.exc_info()[0] is not None
+        try:
+            close_file(handle, f"{operation}-close", fatal=fatal)
+        except OSError:
+            if not pending_error:
+                raise
+
+
+def read_file(path: Path, operation: str, *, limit: int = -1, fatal: bool = True) -> bytes:
+    with diagnostic_file(path, operation, "rb", fatal=fatal) as handle:
+        return file_operation(operation, lambda: handle.read(limit), fatal=fatal)
+
+
+def write_file(path: Path, text: str, operation: str) -> None:
+    with diagnostic_file(path, operation, "wb") as handle:
+        file_operation(operation, lambda: handle.write(text.encode("utf-8")))
+
+
+def read_bounded(path: Path, operation: str) -> str:
+    data = read_file(path, operation, limit=MAX_INPUT_BYTES + 1)
     if not data or len(data) > MAX_INPUT_BYTES:
         raise ValueError("invalid bounded input")
     return data.decode("utf-8")
@@ -75,13 +180,102 @@ def redact_diagnostics(value: str) -> str:
         redacted,
     )
     for name, secret in os.environ.items():
-        if secret and secret != "******" and re.search(r"(?:TOKEN|KEY|SECRET|CREDENTIAL)", name):
+        if (
+            secret
+            and secret != "******"
+            and secret.lower() not in {"true", "false", "0", "1"}
+            and re.search(r"(?:TOKEN|KEY|SECRET|CREDENTIAL)", name)
+        ):
             redacted = redacted.replace(secret, "[REDACTED]")
+    try:
+        agent_id = read_file(GITHUB_AGENT_ID_PATH, "redaction-agent-id-read", fatal=False).decode("ascii").strip() \
+            if os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_ENABLED") == "true" \
+            and os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_AUTH_MODE") != "scoped-bearer" else ""
+        if agent_id:
+            redacted = redacted.replace(agent_id, "[REDACTED]")
+    except (OSError, UnicodeDecodeError):
+        pass
+    try:
+        bearer = read_file(GITHUB_BEARER_PATH, "redaction-bearer-read", fatal=False).decode("ascii").strip() \
+            if is_dynamic_enabled() \
+            or os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_AUTH_MODE") == "scoped-bearer" else ""
+        if bearer:
+            redacted = redacted.replace(bearer, "[REDACTED]")
+    except (OSError, UnicodeDecodeError):
+        pass
     return redacted
+
+
+def summarize_enclave_stream(value: str) -> dict:
+    """Bounds a raw enclave-derived text stream to non-disclosing metadata.
+
+    By default only a byte count and a content hash cross the enclave
+    boundary into the broker-audited session transcript, so an invocation can
+    still be diagnosed and correlated without exposing private repository
+    content, tool results, or model transcripts. `sensitivity` records
+    whether the raw text was withheld ("redacted") or included under trusted
+    host/broker debugging authorization ("raw-debug").
+    """
+    encoded = value.encode("utf-8")
+    summary = {
+        "bytes": len(encoded),
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+        "sensitivity": "raw-debug" if ALLOW_RAW_SESSION_LOGS else "redacted",
+    }
+    if ALLOW_RAW_SESSION_LOGS:
+        summary["raw"] = truncate_utf8(redact_diagnostics(value), MAX_ENGINE_STREAM_BYTES)
+    return summary
 
 
 def append_progress(stage: str, **metadata) -> None:
     append_event({"event": "progress", "stage": stage, **metadata})
+
+
+def append_storage_probe_snapshot() -> None:
+    event = {"event": "storage-probe", "status": "missing", "milestones": []}
+    try:
+        with open(STORAGE_PROBE_PATH, "rb", opener=lambda name, flags: os.open(
+            name, flags | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )) as handle:
+            if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                event["status"] = "unsafe"
+            else:
+                data = handle.read(MAX_STORAGE_PROBE_BYTES + 1)
+                if len(data) > MAX_STORAGE_PROBE_BYTES:
+                    event["status"] = "oversized"
+                else:
+                    lines = data.decode("utf-8").splitlines()
+                    if not lines or len(lines) > 16:
+                        raise ValueError("invalid probe marker")
+                    milestones = []
+                    for line in lines:
+                        value = json.loads(line)
+                        if not isinstance(value, dict) or not isinstance(value.get("stage"), str) \
+                                or value["stage"] not in STORAGE_PROBE_STAGES:
+                            raise ValueError("invalid probe stage")
+                        milestone = {"stage": value["stage"]}
+                        for key in STORAGE_PROBE_FLAGS:
+                            if key in value:
+                                if not isinstance(value[key], bool):
+                                    raise ValueError("invalid probe flag")
+                                milestone[key] = value[key]
+                        if "operation" in value:
+                            if not isinstance(value["operation"], str) \
+                                    or value["operation"] not in STORAGE_PROBE_OPERATIONS:
+                                raise ValueError("invalid probe operation")
+                            milestone["operation"] = value["operation"]
+                        if "errno" in value:
+                            if type(value["errno"]) is not int or not 0 <= value["errno"] <= 4095:
+                                raise ValueError("invalid probe errno")
+                            milestone["errno"] = value["errno"]
+                        milestones.append(milestone)
+                    event.update({"status": "captured", "milestones": milestones})
+    except OSError as error:
+        event["status"] = "missing" if error.errno == errno.ENOENT else \
+            "unsafe" if error.errno in {errno.ELOOP, errno.EISDIR} else "read-failed"
+    except (UnicodeDecodeError, ValueError, RecursionError):
+        event["status"] = "invalid"
+    append_event(event)
 
 
 def directory_usage(path: Path) -> dict:
@@ -90,14 +284,18 @@ def directory_usage(path: Path) -> dict:
     entries = 0
     truncated = False
     try:
-        for root, directories, files in os.walk(path):
+        for root, directories, files in os.walk(path, onerror=lambda error: safe_os_error(
+            error, "resource-directory-walk", fatal=False,
+        )):
             for name in directories + files:
                 entries += 1
                 if entries > MAX_RESOURCE_ENTRIES:
                     truncated = True
                     break
                 try:
-                    entry_stat = (Path(root) / name).lstat()
+                    entry_stat = file_operation(
+                        "resource-entry-lstat", (Path(root) / name).lstat, fatal=False,
+                    )
                     total_bytes += entry_stat.st_size
                     if stat.S_ISREG(entry_stat.st_mode):
                         largest_file_bytes = max(largest_file_bytes, entry_stat.st_size)
@@ -105,8 +303,8 @@ def directory_usage(path: Path) -> dict:
                     continue
             if truncated:
                 break
-    except OSError:
-        pass
+    except OSError as error:
+        safe_os_error(error, "resource-directory-walk", fatal=False)
     return {
         "entries": min(entries, MAX_RESOURCE_ENTRIES),
         "bytes": total_bytes,
@@ -117,7 +315,9 @@ def directory_usage(path: Path) -> dict:
 
 def read_cgroup_value(name: str) -> int | None:
     try:
-        value = (Path("/sys/fs/cgroup") / name).read_text(encoding="ascii").strip()
+        value = read_file(
+            Path("/sys/fs/cgroup") / name, f"resource-{name}-read", fatal=False,
+        ).decode("ascii").strip()
     except (OSError, UnicodeDecodeError):
         return None
     if value == "max":
@@ -133,7 +333,9 @@ def read_cgroup_events() -> dict:
     allowed = {"high", "max", "oom", "oom_kill"}
     events = {}
     try:
-        lines = Path("/sys/fs/cgroup/memory.events").read_text(encoding="ascii").splitlines()
+        lines = read_file(
+            Path("/sys/fs/cgroup/memory.events"), "resource-memory.events-read", fatal=False,
+        ).decode("ascii").splitlines()
     except (OSError, UnicodeDecodeError):
         return events
     for line in lines:
@@ -148,7 +350,7 @@ def read_cgroup_events() -> dict:
     return events
 
 
-def append_resource_snapshot(stage: str) -> None:
+def append_resource_snapshot(stage: str, max_output: int) -> None:
     filesystems = []
     directories = []
     for identifier, path in (
@@ -157,7 +359,9 @@ def append_resource_snapshot(stage: str) -> None:
         ("shared-memory", SHARED_MEMORY_DIR),
     ):
         try:
-            filesystem = os.statvfs(path)
+            filesystem = file_operation(
+                f"resource-{identifier}-statvfs", lambda: os.statvfs(path), fatal=False,
+            )
             filesystems.append({
                 "path": identifier,
                 "capacityBytes": filesystem.f_blocks * filesystem.f_frsize,
@@ -186,9 +390,106 @@ def append_resource_snapshot(stage: str) -> None:
         "directories": directories,
         "memory": memory,
     })
+    paths = []
+    for identifier, path, follow in (
+        ("output-parent", OUT_PATH.parent, True),
+        ("output-directory", OUTPUT_DIR, True),
+        ("output-link", OUT_PATH, False),
+        ("output-file", OUT_PATH, True),
+    ):
+        metadata = {"path": identifier}
+        try:
+            observed = file_operation(
+                f"snapshot-{identifier}-{'stat' if follow else 'lstat'}",
+                path.stat if follow else path.lstat,
+                fatal=False,
+            )
+            mode = observed.st_mode
+            metadata.update({
+                "type": "file" if stat.S_ISREG(mode) else
+                    "directory" if stat.S_ISDIR(mode) else
+                    "symlink" if stat.S_ISLNK(mode) else "other",
+                "uid": observed.st_uid,
+                "gid": observed.st_gid,
+                "mode": stat.S_IMODE(mode),
+                "readable": os.access(path, os.R_OK),
+                "writable": os.access(path, os.W_OK),
+                "executable": os.access(path, os.X_OK),
+            })
+            if identifier == "output-file":
+                metadata["size"] = "empty" if observed.st_size == 0 else \
+                    "within-limit" if observed.st_size <= max_output else "oversized"
+        except OSError:
+            metadata["type"] = "unavailable"
+        paths.append(metadata)
+    append_event({
+        "event": "output-snapshot",
+        "stage": stage,
+        "uid": os.getuid(),
+        "gid": os.getgid(),
+        "paths": paths,
+    })
+    append_output_verification(stage, max_output)
 
 
-def safe_os_error(error: OSError, operation: str) -> None:
+def append_output_verification(stage: str, max_output: int) -> None:
+    event = {"event": "output-verification", "stage": stage}
+    direct_path = OUTPUT_DIR / "out"
+    try:
+        link = file_operation("verify-output-link-lstat", OUT_PATH.lstat, fatal=False)
+        event["symlink"] = stat.S_ISLNK(link.st_mode)
+        if event["symlink"]:
+            target = file_operation(
+                "verify-output-link-readlink", lambda: os.readlink(OUT_PATH), fatal=False,
+            )
+            event["targetMatches"] = target == str(direct_path)
+    except OSError:
+        pass
+
+    def readback(path: Path, label: str):
+        operation = f"verify-output-{label}"
+        handle = None
+        try:
+            handle = file_operation(
+                f"{operation}-open", lambda: open(path, "rb", opener=lambda name, flags:
+                    os.open(name, flags | os.O_NONBLOCK)), fatal=False,
+            )
+            metadata = file_operation(
+                f"{operation}-fstat", lambda: os.fstat(handle.fileno()), fatal=False,
+            )
+            if not stat.S_ISREG(metadata.st_mode):
+                safe_os_error(OSError(errno.EINVAL, "not a regular file"),
+                              f"{operation}-validate", fatal=False)
+                return None
+            data = file_operation(
+                f"{operation}-read", lambda: handle.read(max_output + 1), fatal=False,
+            )
+            return data, metadata
+        except OSError:
+            return None
+        finally:
+            if handle is not None:
+                try:
+                    file_operation(f"{operation}-close", handle.close, fatal=False)
+                except OSError:
+                    pass
+
+    direct = readback(direct_path, "direct")
+    alias = readback(OUT_PATH, "alias")
+    for label, observed in (("direct", direct), ("alias", alias)):
+        event[f"{label}Readable"] = observed is not None
+        event[f"{label}State"] = "unavailable" if observed is None else \
+            "empty" if not observed[0] else \
+            "within-limit" if len(observed[0]) <= max_output else "oversized"
+    if direct is not None and alias is not None:
+        event["sameFile"] = (direct[1].st_dev, direct[1].st_ino) == \
+            (alias[1].st_dev, alias[1].st_ino)
+        if len(direct[0]) <= max_output and len(alias[0]) <= max_output:
+            event["contentsMatch"] = direct[0] == alias[0]
+    append_event(event)
+
+
+def os_error_event(error: OSError, operation: str, *, fatal: bool = True) -> dict:
     error_number = error.errno if isinstance(error.errno, int) else None
     category = {
         errno.ENOENT: "not-found",
@@ -197,6 +498,14 @@ def safe_os_error(error: OSError, operation: str) -> None:
         errno.ENOTDIR: "not-directory",
         errno.EISDIR: "is-directory",
         errno.EROFS: "read-only-filesystem",
+        errno.ENOSPC: "no-space",
+        errno.EDQUOT: "quota-exceeded",
+        errno.EFBIG: "file-too-large",
+        errno.EIO: "io-error",
+        errno.ELOOP: "symlink-loop",
+        errno.EPERM: "operation-not-permitted",
+        errno.EMFILE: "too-many-open-files",
+        errno.ENFILE: "too-many-open-files",
     }.get(error_number, "os-error")
     exception = type(error).__name__
     if exception not in {
@@ -212,6 +521,7 @@ def safe_os_error(error: OSError, operation: str) -> None:
         "operation": operation,
         "exception": exception,
         "category": category,
+        "fatal": fatal,
     }
     if error_number is not None:
         event["errno"] = error_number
@@ -219,7 +529,11 @@ def safe_os_error(error: OSError, operation: str) -> None:
             event["strerror"] = os.strerror(error_number)
         except (ValueError, OverflowError):
             pass
-    append_event(event)
+    return event
+
+
+def safe_os_error(error: OSError, operation: str, *, fatal: bool = True) -> None:
+    append_event(os_error_event(error, operation, fatal=fatal))
 
 
 def preflight_path(
@@ -237,7 +551,7 @@ def preflight_path(
         "type": "missing",
     }
     try:
-        path_stat = path.stat()
+        path_stat = file_operation(f"preflight-{identifier}-stat", path.stat)
     except OSError as error:
         append_event(metadata)
         return error
@@ -269,9 +583,9 @@ def preflight_path(
 
 
 def run_preflight(copilot_logs: Path) -> bool:
+    dynamic = is_dynamic_enabled()
     checks = [
         ("copilot-executable", Path(COPILOT_BIN), "file", True, False),
-        ("seed-directory", SEED_DIR, "directory", True, False),
         ("task-input", TASK_PATH, "file", False, False),
         ("schema-input", SCHEMA_PATH, "file", False, False),
         ("output-file", OUT_PATH, "file", False, True),
@@ -279,7 +593,24 @@ def run_preflight(copilot_logs: Path) -> bool:
         ("agent-directory", AGENT_DIR, "directory", True, True),
         ("copilot-log-directory", copilot_logs, "directory", True, True),
     ]
+    if not dynamic:
+        checks.insert(1, ("seed-directory", SEED_DIR, "directory", True, False))
     valid = True
+    try:
+        forbidden_seed = dynamic and SEED_DIR.exists() and any(file_operation(
+            "preflight-seed-directory-list", lambda: list(SEED_DIR.iterdir()),
+        ))
+    except OSError:
+        return False
+    if forbidden_seed:
+        # A dynamic invocation must never be handed a repository checkout.
+        append_event({
+            "event": "preflight",
+            "path": "seed-directory",
+            "exists": True,
+            "type": "forbidden-seed-mount",
+        })
+        valid = False
     for identifier, path, expected_type, executable, writable in checks:
         error = preflight_path(
             identifier,
@@ -291,6 +622,22 @@ def run_preflight(copilot_logs: Path) -> bool:
         if error is not None:
             safe_os_error(error, f"preflight-{identifier}")
             valid = False
+    if os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_ENABLED") == "true" \
+            and not dynamic \
+            and os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_AUTH_MODE") != "scoped-bearer":
+        error = preflight_path(
+            "github-agent-id",
+            GITHUB_AGENT_ID_PATH,
+            "file",
+        )
+        if error is not None:
+            safe_os_error(error, "preflight-github-agent-id")
+            valid = False
+    if dynamic or os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_AUTH_MODE") == "scoped-bearer":
+        error = preflight_path("github-bearer", GITHUB_BEARER_PATH, "file")
+        if error is not None:
+            safe_os_error(error, "preflight-github-bearer")
+            valid = False
     append_progress("preflight-completed", valid=valid)
     return valid
 
@@ -299,15 +646,21 @@ def read_copilot_diagnostics(log_dir: Path) -> str:
     chunks = []
     remaining = MAX_DIAGNOSTIC_BYTES
     try:
-        candidates = sorted(log_dir.rglob("*"))
+        candidates = file_operation(
+            "copilot-diagnostics-scan", lambda: sorted(log_dir.rglob("*")), fatal=False,
+        )
     except OSError:
         return ""
     for path in candidates[:MAX_DIAGNOSTIC_FILES]:
         try:
-            if not stat.S_ISREG(path.lstat().st_mode):
+            if not stat.S_ISREG(file_operation(
+                "copilot-diagnostics-lstat", path.lstat, fatal=False,
+            ).st_mode):
                 continue
-            with path.open("rb") as handle:
-                data = handle.read(remaining + 1)[:remaining]
+            with diagnostic_file(path, "copilot-diagnostics-read", "rb", fatal=False) as handle:
+                data = file_operation(
+                    "copilot-diagnostics-read", lambda: handle.read(remaining + 1), fatal=False,
+                )[:remaining]
         except OSError:
             continue
         chunks.append(
@@ -332,31 +685,160 @@ def build_prompt(task: str, schema_text: str) -> str:
     else:
         output_contract = (
             "Before finishing, use a shell command to replace /awf/out with exactly one JSON "
-            "value conforming to this finite schema. Do not write a Markdown fence, "
+            "value conforming to this structured response schema. Do not write a Markdown fence, "
             "explanation, surrounding text, or repeated schema to /awf/out. Your "
             f"conversational response is not the result channel:\n{schema_text}\n"
         )
     github_access = ""
     if os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_ENABLED") == "true":
         github_access = (
-            " A narrow credential-isolated gh wrapper is available only for REST issue reads. "
-            "Use `gh api --method GET` with repos/{owner}/{repo}/issues, "
-            "repos/{owner}/{repo}/issues/{number}, or "
-            "repos/{owner}/{repo}/issues/{number}/comments. GraphQL, search, writes, "
-            "and other GitHub paths are unavailable."
+            " A credential-isolated GitHub MCP server exposes only `list_issues` and "
+            "`issue_read`. For `issue_read`, only methods `get` and `get_comments` are "
+            "available. Use those MCP tools for GitHub reads. GitHub CLI, GraphQL, search, "
+            "writes, and all other GitHub access are prohibited. The installed GitHub CLI "
+            "has no credentials or direct GitHub network route."
+        )
+    if is_dynamic_enabled():
+        repository = os.environ.get("AWF_ENCLAVE_AGENT_DYNAMIC_REPO", "")
+        read_mode = os.environ.get("AWF_ENCLAVE_AGENT_DYNAMIC_READ_MODE", "live")
+        freshness = (
+            "Reads are live: they reflect the repository's current state at call time, not a "
+            "reproducible snapshot."
+            if read_mode != "pinned"
+            else "Reads are pinned to the admitted default-branch commit."
+        )
+        return (
+            "You are the native GitHub Copilot CLI running in an AWF enclave-agent enclave.\n"
+            "There is no repository checkout: no source tree is cloned, staged, or mounted. "
+            f"Your only source of repository data is the credential-isolated GitHub MCP server, "
+            f"which is scoped to exactly one repository: {repository}. It exposes only "
+            "`list_issues` and `issue_read`; for `issue_read`, only methods `get` and "
+            f"`get_comments` are available. {freshness}\n"
+            "You must not clone or fetch any repository, open arbitrary URLs, use the GitHub CLI "
+            "or GraphQL, perform any write or mutation, run unscoped or organization-wide search, "
+            "enumerate or discover repositories, or read any repository other than "
+            f"{repository}. Those paths are blocked and every attempt fails closed.\n"
+            "/agent is an invocation-private writable runtime directory and /tmp is bounded "
+            "tmpfs. You have no GitHub credentials, no host filesystem, and no network route "
+            "except AWF's model proxy and the repository-scoped GitHub MCP server.\n\n"
+            "Complete this task:\n"
+            f"{task}\n\n"
+            f"{output_contract}"
         )
     return (
         "You are the native GitHub Copilot CLI running in an AWF enclave-agent enclave.\n"
         "The repository root is your current directory and is mounted read-only at /awf/seed. "
         "/agent is an invocation-private writable runtime directory and /tmp is bounded tmpfs. "
         "You may use your built-in shell, "
-        "bash, file-reading, and search tools. You have no GitHub MCP, no credentials, no host "
-        "filesystem, and no network route except AWF's model and optional GitHub proxies."
+        "bash, file-reading, and search tools. You have no GitHub credentials, no host "
+        "filesystem, and no network route except AWF's model proxy and optional shared GitHub MCP gateway."
         f"{github_access}\n\n"
         "Complete this task:\n"
         f"{task}\n\n"
         f"{output_contract}"
     )
+
+
+def is_dynamic_enabled() -> bool:
+    """Whether this invocation reads live GitHub through a delegated identity."""
+    return os.environ.get("AWF_ENCLAVE_AGENT_DYNAMIC_ENABLED") == "true"
+
+
+def configure_github_mcp() -> None:
+    auth_mode = os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_AUTH_MODE", "")
+    if auth_mode not in {"", "scoped-bearer"}:
+        raise ValueError("unsupported GitHub MCP auth mode")
+    if is_dynamic_enabled():
+        if auth_mode:
+            raise ValueError("static GitHub MCP auth mode cannot be combined with dynamic delegation")
+        configure_dynamic_github_mcp()
+        return
+    if os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_ENABLED") != "true":
+        return
+    if auth_mode == "scoped-bearer":
+        configure_scoped_github_mcp()
+        return
+    if os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_PROFILE") != "issues-read-v1":
+        raise ValueError("unsupported GitHub MCP profile")
+    endpoint = os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_MCP_URL", "")
+    if not re.fullmatch(r"http://[0-9.]+:[0-9]+/mcp/github", endpoint):
+        raise ValueError("invalid GitHub MCP endpoint")
+    agent_id = read_file(GITHUB_AGENT_ID_PATH, "github-agent-id-read").decode("ascii").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_-]{32,128}", agent_id):
+        raise ValueError("invalid GitHub MCP agent identity")
+    config = {
+        "mcpServers": {
+            "github": {
+                "type": "http",
+                "url": endpoint,
+                "headers": {"Authorization": agent_id},
+            }
+        }
+    }
+    write_file(GITHUB_MCP_CONFIG_PATH, json.dumps(config, separators=(",", ":")), "github-mcp-config-write")
+    file_operation("github-mcp-config-chmod", lambda: GITHUB_MCP_CONFIG_PATH.chmod(0o600))
+
+
+def configure_scoped_github_mcp() -> None:
+    endpoint = os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_MCP_URL", "")
+    if endpoint != "http://172.31.0.40:8080/mcp/github":
+        raise ValueError("invalid scoped GitHub MCP endpoint")
+    tools = json.loads(os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_ALLOWED_TOOLS", ""))
+    if not isinstance(tools, list) or not tools \
+            or any(not isinstance(tool, str) or tool not in {"list_issues", "issue_read"} for tool in tools) \
+            or len(tools) != len(set(tools)):
+        raise ValueError("invalid scoped GitHub MCP tools")
+    bearer_bytes = read_file(GITHUB_BEARER_PATH, "github-bearer-read", limit=514)
+    if len(bearer_bytes) > 513:
+        raise ValueError("invalid scoped GitHub MCP bearer")
+    bearer = bearer_bytes.decode("ascii").strip()
+    if not re.fullmatch(r"[\x21-\x7e]{16,512}", bearer):
+        raise ValueError("invalid scoped GitHub MCP bearer")
+    os.environ["AWF_GITHUB_MCP_AUTHORIZATION"] = bearer
+    config = {
+        "mcpServers": {
+            "github": {
+                "type": "http",
+                "url": endpoint,
+                "headers": {"Authorization": "${AWF_GITHUB_MCP_AUTHORIZATION}"},
+                "tools": tools,
+            }
+        }
+    }
+    write_file(GITHUB_MCP_CONFIG_PATH, json.dumps(config, separators=(",", ":")), "github-mcp-config-write")
+    file_operation("github-mcp-config-chmod", lambda: GITHUB_MCP_CONFIG_PATH.chmod(0o600))
+
+
+def configure_dynamic_github_mcp() -> None:
+    """Writes the invocation-private, bearer-only GitHub MCP configuration.
+
+    The executor holds exactly one short-lived, repository-scoped bearer minted
+    for this invocation. It never receives the job token, the delegation-control
+    capability, the identity handle, the compiler envelope, mcpg's state path,
+    its policy generation, or a route to the control listener.
+    """
+    endpoint = os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_MCP_URL", "")
+    if not re.fullmatch(r"http://[0-9.]+:[0-9]+/mcp/github", endpoint):
+        raise ValueError("invalid GitHub MCP endpoint")
+    repository = os.environ.get("AWF_ENCLAVE_AGENT_DYNAMIC_REPO", "")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,38}/[a-z0-9._-]{1,100}", repository):
+        raise ValueError("invalid admitted repository selector")
+    bearer = read_file(GITHUB_BEARER_PATH, "github-bearer-read").decode("ascii").strip()
+    if not re.fullmatch(r"[\x21-\x7e]{16,512}", bearer):
+        raise ValueError("invalid delegated executor bearer")
+    os.environ["AWF_GITHUB_MCP_AUTHORIZATION"] = bearer
+    config = {
+        "mcpServers": {
+            "github": {
+                "type": "http",
+                "url": endpoint,
+                "headers": {"Authorization": "${AWF_GITHUB_MCP_AUTHORIZATION}"},
+                "tools": ["list_issues", "issue_read"],
+            }
+        }
+    }
+    write_file(GITHUB_MCP_CONFIG_PATH, json.dumps(config, separators=(",", ":")), "github-mcp-config-write")
+    file_operation("github-mcp-config-chmod", lambda: GITHUB_MCP_CONFIG_PATH.chmod(0o600))
 
 
 def append_engine_result(completed: subprocess.CompletedProcess) -> tuple[str, str]:
@@ -365,8 +847,8 @@ def append_engine_result(completed: subprocess.CompletedProcess) -> tuple[str, s
     append_event({
         "event": "engine-result",
         "exitCode": completed.returncode,
-        "stdout": truncate_utf8(redact_diagnostics(stdout), MAX_ENGINE_STREAM_BYTES),
-        "stderr": truncate_utf8(redact_diagnostics(stderr), MAX_ENGINE_STREAM_BYTES),
+        "stdout": summarize_enclave_stream(stdout),
+        "stderr": summarize_enclave_stream(stderr),
     })
     return stdout, stderr
 
@@ -377,8 +859,8 @@ def main() -> int:
         return EXIT_CONFIGURATION_INVALID
     append_progress("configuration-accepted", engine="copilot")
     try:
-        task = read_bounded(TASK_PATH)
-        schema_text = read_bounded(SCHEMA_PATH)
+        task = read_bounded(TASK_PATH, "task-input-read")
+        schema_text = read_bounded(SCHEMA_PATH, "schema-input-read")
         json.loads(schema_text)
         max_output = int(os.environ["AWF_ENCLAVE_AGENT_MAX_OUTPUT_BYTES"])
         timeout = int(os.environ["AWF_ENCLAVE_AGENT_DEADLINE_SECONDS"])
@@ -412,6 +894,11 @@ def main() -> int:
             append_event({"event": "failure", "category": "engine-failed"})
             return EXIT_ENGINE_FAILED
     copilot_logs = runtime_paths[-1][1]
+    try:
+        configure_github_mcp()
+    except (OSError, UnicodeDecodeError, ValueError):
+        append_event({"event": "failure", "category": "configuration-invalid"})
+        return EXIT_CONFIGURATION_INVALID
     append_progress(
         "runtime-paths-ready",
         paths=[identifier for identifier, _ in runtime_paths],
@@ -419,21 +906,21 @@ def main() -> int:
     append_event({
         "event": "session",
         "engine": "copilot",
+        "sensitivity": "raw-debug" if ALLOW_RAW_SESSION_LOGS else "redacted",
         "taskBytes": len(task.encode("utf-8")),
         "schemaBytes": len(schema_text.encode("utf-8")),
     })
     if not run_preflight(copilot_logs):
         diagnostics = read_copilot_diagnostics(copilot_logs)
         if diagnostics:
-            append_event({"event": "engine-diagnostics", "log": diagnostics})
+            append_event({"event": "engine-diagnostics", "log": summarize_enclave_stream(diagnostics)})
         append_event({"event": "failure", "category": "engine-failed"})
         return EXIT_ENGINE_FAILED
     try:
-        OUT_PATH.write_text("", encoding="utf-8")
-    except OSError as error:
-        safe_os_error(error, "output-reset")
-        append_event({"event": "failure", "category": "result-write-failed"})
-        return EXIT_RESULT_WRITE_FAILED
+        write_file(OUT_PATH, "", "output-reset")
+    except OSError:
+        append_event({"event": "failure", "category": "result-reset-failed"})
+        return EXIT_RESULT_RESET_FAILED
 
     command = [
         COPILOT_BIN,
@@ -452,14 +939,12 @@ def main() -> int:
         "--log-level", "all",
         "--log-dir", str(copilot_logs),
     ]
-    if max_model_requests is not None:
-        command.extend(["--max-model-requests", max_model_requests])
-    if max_model_tokens is not None:
-        command.extend(["--max-model-tokens", max_model_tokens])
+    if os.environ.get("AWF_ENCLAVE_AGENT_GITHUB_ENABLED") == "true" or is_dynamic_enabled():
+        command.extend(["--additional-mcp-config", f"@{GITHUB_MCP_CONFIG_PATH}"])
     deadline = time.monotonic() + timeout
     completed = None
     stdout = ""
-    append_resource_snapshot("before-engine")
+    append_resource_snapshot("before-engine", max_output)
     for attempt in range(MAX_STARTUP_RETRIES + 1):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -469,7 +954,7 @@ def main() -> int:
         try:
             process = subprocess.Popen(
                 command,
-                cwd=SEED_DIR,
+                cwd=AGENT_DIR if is_dynamic_enabled() else SEED_DIR,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -487,19 +972,17 @@ def main() -> int:
                 append_event({
                     "event": "engine-result",
                     "exitCode": None,
-                    "stdout": truncate_utf8(
-                        redact_diagnostics(process_stdout.decode("utf-8", errors="replace").strip()),
-                        MAX_ENGINE_STREAM_BYTES,
+                    "stdout": summarize_enclave_stream(
+                        process_stdout.decode("utf-8", errors="replace").strip()
                     ),
-                    "stderr": truncate_utf8(
-                        redact_diagnostics(process_stderr.decode("utf-8", errors="replace")),
-                        MAX_ENGINE_STREAM_BYTES,
+                    "stderr": summarize_enclave_stream(
+                        process_stderr.decode("utf-8", errors="replace")
                     ),
                 })
                 diagnostics = read_copilot_diagnostics(copilot_logs)
                 if diagnostics:
-                    append_event({"event": "engine-diagnostics", "log": diagnostics})
-                append_resource_snapshot("after-engine")
+                    append_event({"event": "engine-diagnostics", "log": summarize_enclave_stream(diagnostics)})
+                append_resource_snapshot("after-engine", max_output)
                 append_event({"event": "failure", "category": "deadline-exceeded"})
                 return EXIT_DEADLINE_EXCEEDED
             completed = subprocess.CompletedProcess(
@@ -512,14 +995,15 @@ def main() -> int:
             safe_os_error(error, "engine-launch")
             diagnostics = read_copilot_diagnostics(copilot_logs)
             if diagnostics:
-                append_event({"event": "engine-diagnostics", "log": diagnostics})
-            append_resource_snapshot("after-engine")
+                append_event({"event": "engine-diagnostics", "log": summarize_enclave_stream(diagnostics)})
+            append_resource_snapshot("after-engine", max_output)
             append_event({"event": "failure", "category": "engine-failed"})
             return EXIT_ENGINE_FAILED
 
         stdout, _ = append_engine_result(completed)
         runtime = time.monotonic() - started
-        append_resource_snapshot("after-engine")
+        append_resource_snapshot("after-engine", max_output)
+        append_storage_probe_snapshot()
         append_progress(
             "engine-completed",
             attempt=attempt + 1,
@@ -546,33 +1030,40 @@ def main() -> int:
     if completed.returncode != 0:
         diagnostics = read_copilot_diagnostics(copilot_logs)
         if diagnostics:
-            append_event({"event": "engine-diagnostics", "log": diagnostics})
+            append_event({"event": "engine-diagnostics", "log": summarize_enclave_stream(diagnostics)})
         append_event({"event": "failure", "category": "engine-failed"})
         return EXIT_ENGINE_FAILED
     append_progress("output-normalization-started")
     try:
-        result_bytes = OUT_PATH.read_bytes()
-    except OSError as error:
-        safe_os_error(error, "output-read")
-        append_event({"event": "failure", "category": "result-write-failed"})
-        return EXIT_RESULT_WRITE_FAILED
-    if not result_bytes or len(result_bytes) > max_output:
-        append_event({"event": "failure", "category": "result-write-failed"})
-        return EXIT_RESULT_WRITE_FAILED
+        result_bytes = read_file(OUT_PATH, "output-read", limit=max_output + 1)
+    except OSError:
+        append_event({"event": "failure", "category": "result-read-failed"})
+        return EXIT_RESULT_READ_FAILED
+    append_event({
+        "event": "output-normalization",
+        "inputState": "empty" if not result_bytes else
+            "oversized" if len(result_bytes) > max_output else "within-limit",
+        "stdoutState": "present" if stdout else "empty",
+    })
+    if not result_bytes:
+        append_event({"event": "failure", "category": "result-empty"})
+        return EXIT_RESULT_EMPTY
+    if len(result_bytes) > max_output:
+        append_event({"event": "failure", "category": "result-too-large"})
+        return EXIT_RESULT_TOO_LARGE
     try:
         result = result_bytes.decode("utf-8").strip()
     except UnicodeDecodeError:
-        append_event({"event": "failure", "category": "result-write-failed"})
-        return EXIT_RESULT_WRITE_FAILED
+        append_event({"event": "failure", "category": "result-invalid-utf8"})
+        return EXIT_RESULT_INVALID_UTF8
     if not result:
-        append_event({"event": "failure", "category": "result-write-failed"})
-        return EXIT_RESULT_WRITE_FAILED
+        append_event({"event": "failure", "category": "result-whitespace-only"})
+        return EXIT_RESULT_WHITESPACE_ONLY
     append_progress("output-normalized", outputBytes=len(result.encode("utf-8")))
     append_progress("output-write-attempt")
     try:
-        OUT_PATH.write_text(result, encoding="utf-8")
-    except OSError as error:
-        safe_os_error(error, "output-write")
+        write_file(OUT_PATH, result, "output-write")
+    except OSError:
         append_event({"event": "failure", "category": "result-write-failed"})
         return EXIT_RESULT_WRITE_FAILED
     append_progress("output-written", outputBytes=len(result.encode("utf-8")))

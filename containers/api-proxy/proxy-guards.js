@@ -14,10 +14,6 @@ const { logRequest, sanitizeForLog } = require('./logging');
 const { writeBlockedRequestDiag } = require('./blocked-request-diagnostics');
 const { buildCommonGuardChecks } = require('./guards/common-guard-checks');
 const {
-  getEffectiveTokenBlockState,
-  buildEffectiveTokenLimitError,
-} = require('./guards/effective-token-guard');
-const {
   getMaxRunsBlockState,
   buildMaxRunsExceededError,
 } = require('./guards/max-runs-guard');
@@ -32,7 +28,7 @@ const {
 const {
   getAiCreditsBlockState,
   buildAiCreditsLimitError,
-  checkUnknownModelRejection,
+  checkModelPricing,
 } = require('./guards/ai-credits-guard');
 const {
   getModelMultiplierCapBlockState,
@@ -127,7 +123,10 @@ function sendGuardBlockedResponse(block, {
   });
   otel.endSpan(span, statusCode);
   res.writeHead(statusCode, { 'Content-Type': 'application/json', 'X-Request-ID': requestId });
+  if (req.awfRouting) req.awfRouting.rejected = true;
   res.end(JSON.stringify(buildError(block)));
+
+  if (req.awfRequestContext?.purpose === 'routing_classification') return;
 
   writeBlockedRequestDiag({
     requestId,
@@ -150,13 +149,8 @@ function sendGuardBlockedResponse(block, {
  *           inboundBytes: number }} ctx
  * @returns {boolean}
  */
-function enforceGuards({ body, provider, req, res, requestId, startTime, span, inboundBytes }) {
-  const checkModelMultiplier = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
-  const model = checkModelMultiplier ? extractModelFromBody(body) : null;
-
-  const guardChecks = buildCommonGuardChecks({
-    getEffectiveTokenBlockState,
-    buildEffectiveTokenLimitError,
+function getCurrentGuardChecks(model, provider, pricingOptions) {
+  return buildCommonGuardChecks({
     getMaxRunsBlockState,
     buildMaxRunsExceededError,
     getMaxCacheMissesBlockState,
@@ -169,10 +163,19 @@ function enforceGuards({ body, provider, req, res, requestId, startTime, span, i
     buildModelMultiplierCapError,
     getRetiredModelBlockState,
     buildRetiredModelError,
-    checkUnknownModelRejection,
+    checkModelPricing: (candidate, route) => checkModelPricing(candidate, route, pricingOptions),
     getModelPolicyBlockState,
     buildModelPolicyError,
   }, model, provider);
+}
+
+function enforceGuards({ body, provider, req, res, requestId, startTime, span, inboundBytes }) {
+  const checkModelMultiplier = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
+  const model = checkModelMultiplier ? extractModelFromBody(body) : null;
+
+  const pricingOptions = Object.hasOwn(req, 'awfCatalogue')
+    ? { catalogue: req.awfCatalogue, runtimeCatalog: req.awfRuntimePricing } : undefined;
+  const guardChecks = getCurrentGuardChecks(model, provider, pricingOptions);
 
   for (const guard of guardChecks) {
     if (!guard.isBlocked(guard.block)) continue;
@@ -198,5 +201,6 @@ function enforceGuards({ body, provider, req, res, requestId, startTime, span, i
 
 module.exports = {
   sendGuardBlockedResponse,
+  getCurrentGuardChecks,
   enforceGuards,
 };

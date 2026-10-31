@@ -67,6 +67,15 @@ matter to AWF:
 This upstream-proxy hook is the single most important integration point for AWF:
 it lets AWF interpose its own Squid proxy *underneath* Docker's sandbox proxy.
 
+When an orchestrator starts the daemon with that setting, pass
+`--verify-sbx-egress` (or set `network.verifySbxEgress: true`) to make AWF run a
+fail-closed preflight before the agent starts. The preflight removes all standard
+proxy environment variables and attempts direct HTTPS connections to domains
+outside the allowlist and to a stable public IP address. Any successful
+connection aborts startup. The IP probe ensures that blocking only direct DNS is
+not mistaken for complete egress enforcement. This verifies the daemon-level
+control independently of cooperative client proxy settings.
+
 ### Lifecycle and CLI surface
 
 | Command | Purpose |
@@ -81,10 +90,12 @@ it lets AWF interpose its own Squid proxy *underneath* Docker's sandbox proxy.
 
 VMs persist until explicitly removed; stopping an agent does not delete the VM.
 
-### Enclave runtimes are independent
+### One backend, independent workload instances
 
 `container.containerRuntime: "sbx"` selects the primary agent's execution
-model. `enclaves[].runtime: "sbx"` on a keyed enclave entry is a separate enclave backend
+model. Every enabled enclave must use that same workload backend; an omitted
+enclave runtime inherits it, and explicit mismatches are rejected. An
+`enclaves[].runtime: "sbx"` entry would use a separate instance
 behind the AWF-owned MCP server and must never reuse the primary agent VM,
 agent-ingress capability, gateway capability, or agent credentials.
 
@@ -317,10 +328,10 @@ running before compose teardown.
 Inside the microVM, AWF's internal Docker network (`172.30.0.0/24`) is **not
 reachable** — the VM is on its own network. AWF compensates with two indirections:
 
-- **Squid** is reached at the **sbx gateway IP** (`172.17.0.0` in code, i.e. the
-  docker0 bridge range) on its published port `3128`, rather than the internal
-  `172.30.0.10`. AWF sets `HTTP_PROXY`/`HTTPS_PROXY` inside the sandbox to
-  `http://172.17.0.0:3128`, so proxy-aware agent tools route through AWF's Squid
+- **Squid** is reached through the host gateway (`host.docker.internal`) on its
+  published port `3128`, rather than the internal `172.30.0.10`. AWF sets
+  `HTTP_PROXY`/`HTTPS_PROXY` inside the sandbox to
+  `http://host.docker.internal:3128`, so proxy-aware agent tools route through AWF's Squid
   domain ACL. `DOCKER_SANDBOXES_PROXY` (the sbx daemon-level upstream knob) is
   **not** currently set by AWF — it must be present when the sbx daemon starts, a
   point AWF does not control — so the sbx daemon's own egress is not filtered by
@@ -344,8 +355,9 @@ ACL.
 ### Configuration surface
 
 - CLI: `--container-runtime sbx`.
-- gh-aw workflow frontmatter: `sandbox.agent.runtime: docker-sbx` (see the
-  `smoke-docker-sbx*` workflows under `.github/workflows/`).
+- gh-aw workflow frontmatter: `sandbox.agent.runtime: docker-sbx`. The
+  Docker SBX CI smoke workflows have been retired in favor of their Cloud
+  Hypervisor equivalents.
 - Strict-security note (`src/commands/validators/security-mode.ts`): sbx
   enforces isolation at the hypervisor layer via `DOCKER_SANDBOXES_PROXY`, so
   AWF's Docker **network-isolation topology is not forced on** for it
@@ -438,8 +450,8 @@ sandbox egress through AWF's host-side Squid:
   `HTTPS_PROXY` settings may improve client compatibility, but are not an
   enforceable security boundary.
 - Reproduce the boundary-crossing addressing pattern: sbx reaches Squid at the
-  **bridge gateway IP + published port** (not the internal `172.30.0.x`) via
-  `SBX_GATEWAY_IP`/`SBX_HOST_DOCKER_INTERNAL` in `src/sbx-runtime-backend.ts`,
+  **host gateway + published port** (not the internal `172.30.0.x`) via
+  `SBX_GATEWAY_HOST`/`SBX_HOST_DOCKER_INTERNAL` in `src/sbx-runtime-backend.ts`,
   because the sbx microVM sits outside `awf-net`. Cloud Hypervisor instead uses
   an AWF-managed namespace, veth pair, TAP device, and nftables policy. Pick the
   addressing model that matches how your VMM attaches to the host.
@@ -492,4 +504,5 @@ a way to force egress through AWF's Squid.
   `src/commands/main-action.ts`, `src/commands/validators/security-mode.ts`,
   `src/cloud-hypervisor-runtime-backend.ts` (KVM backend built on this seam)
 - Related: [Cloud Hypervisor architecture](./cloud-hypervisor-foundation.md),
+  [NVX one-shot security design](./nvx-security-design.md),
   [Sandbox design](./sandbox-design.md), [Architecture](./architecture.md)

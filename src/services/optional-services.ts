@@ -6,13 +6,20 @@ import { buildApiProxyService } from './api-proxy-service';
 import { buildDohProxyService } from './doh-proxy-service';
 import { buildCliProxyService } from './cli-proxy-service';
 import { buildEnclaveMcpService } from './enclave-mcp-service';
+import { buildRouterService, ROUTER_SERVICE_NAME } from './router-service';
 import { buildSysrootStageService, isSysrootEnabled } from './sysroot-service';
 import { resolveDockerHostGateway } from './host-gateway';
 import { runtimeUsesIptables } from '../container-runtime';
-import { applyHostPathPrefixToVolumes } from './host-path-prefix';
+import { applyHostPathPrefixToVolumes, normalizeDockerHostPathPrefix, prefixHostPath } from './host-path-prefix';
 import { buildCustomVolumeMounts } from './agent-volumes/workspace-mounts';
 import { resolveComposeFilesystemAllowWrite } from './agent-volumes/filesystem-write-policy';
 import { NetworkConfig, ImageBuildConfig } from './squid-service';
+import { isGeminiProxyRoutingEnabled, shouldPinGeminiAuthType } from './credentials/gemini-cli-settings';
+import {
+  buildGeminiSettingsService,
+  GEMINI_SETTINGS_SERVICE,
+  GEMINI_SETTINGS_VOLUME,
+} from './gemini-settings-service';
 
 interface AssembleOptionalServicesParams {
   services: Record<string, any>;
@@ -58,7 +65,7 @@ function presetSidecarIpEnvVars(
   }
 }
 
-function filterAgentVolumesForSysroot(
+export function filterAgentVolumesForSysroot(
   agentVolumes: string[],
   config: WrapperConfig,
   effectiveHome: string,
@@ -71,7 +78,18 @@ function filterAgentVolumesForSysroot(
     '/host/lib64',
     '/host/opt',
   ]);
-  const normalizedWorkDirPrefix = config.workDir.replace(/\/+$/, '');
+  // `agentVolumes` has already had `--docker-host-path-prefix` applied (it's
+  // the last step of `buildAgentVolumes`), so a bare `workDir`/`effectiveHome`
+  // no longer matches its own derived mount sources once that prefix is set.
+  // Prefix them the same way before comparing, or every match below silently
+  // stops firing on split-fs (ARC/DinD) runs — see gh-aw-firewall#7994.
+  const normalizedDockerHostPathPrefix = config.dockerHostPathPrefix
+    ? normalizeDockerHostPathPrefix(config.dockerHostPathPrefix)
+    : '';
+  const prefixedHostPath = (hostPath: string): string =>
+    normalizedDockerHostPathPrefix ? prefixHostPath(hostPath, normalizedDockerHostPathPrefix) : hostPath;
+  const normalizedWorkDirPrefix = prefixedHostPath(config.workDir).replace(/\/+$/, '');
+  const prefixedEffectiveHome = prefixedHostPath(effectiveHome);
   const hostHomeMountPrefix = `/host${effectiveHome}`;
   // Source:target pairs of explicitly supplied `--mount` specs.  Their sources
   // are chosen by the caller (the gh-aw compiler or the user), who asserts the
@@ -108,12 +126,12 @@ function filterAgentVolumesForSysroot(
     // daemon visibility, and a writable `/host$HOME` is required for the
     // credential-hiding overlays and the agent entrypoint to work.
     if (
-      source.startsWith(effectiveHome) &&
+      source.startsWith(prefixedEffectiveHome) &&
       target.startsWith(hostHomeMountPrefix) &&
       !explicitMountSpecs.has(mountSpecKey(source, target))
     ) {
       const normalizedSource = source.replace(/\/+$/, '') || '/';
-      const relPath = normalizedSource.slice(effectiveHome.length);
+      const relPath = normalizedSource.slice(prefixedEffectiveHome.length);
       if (relPath.startsWith('/.') || relPath === '') return false;
     }
 
@@ -304,6 +322,12 @@ function assembleApiProxyService(params: AssembleOptionalServicesParams): void {
   };
 }
 
+function assembleRouterService(params: AssembleOptionalServicesParams): void {
+  const { services, config, imageConfig } = params;
+  if (config.experimentalModelRouting !== true || !config.modelRouting || !config.modelRoutingBootstrap) return;
+  services[ROUTER_SERVICE_NAME] = buildRouterService({ imageConfig });
+}
+
 function assembleDohProxyService(params: AssembleOptionalServicesParams): void {
   const { services, agentService, config, networkConfig } = params;
 
@@ -345,16 +369,16 @@ function assembleEnclaveMcpService(params: AssembleOptionalServicesParams): void
   if (!config.enclaves?.enabled) return;
   if (!executors?.script.enabled && !executors?.agent.enabled) return;
   const {
+    toolchainImageService,
     scriptImageService,
     agentImageService,
     agentApiProxyService,
-    agentCliProxyService,
     service,
   } = buildEnclaveMcpService({ config, imageConfig, networkConfig: params.networkConfig });
+  if (toolchainImageService) services['enclave-build-tools-image'] = toolchainImageService;
   if (scriptImageService) services['enclave-script-image'] = scriptImageService;
   if (agentImageService) services['enclave-agent-image'] = agentImageService;
   if (agentApiProxyService) services['enclave-agent-api-proxy'] = agentApiProxyService;
-  if (agentCliProxyService) services['enclave-agent-cli-proxy'] = agentCliProxyService;
   services['enclave-mcp-server'] = service;
   // The gateway readiness gate is host-orchestrated before agent startup. There
   // is deliberately no agent dependency, mount, environment, or direct URL.
@@ -398,6 +422,7 @@ export function assembleOptionalServices(
 
   presetSidecarIpEnvVars(environment, config, networkConfig);
   assembleEnclaveMcpService(params);
+  assembleRouterService(params);
   if (includeComposeAgent) {
     assembleSysrootService(params, imageConfig.registry, imageConfig.parsedTag, sysrootActive);
     assembleIptablesInitService(params, skipIptables);
@@ -406,9 +431,16 @@ export function assembleOptionalServices(
   assembleDohProxyService(params);
   assembleCliProxyService(params);
 
-  const namedVolumes = includeComposeAgent
+  let namedVolumes = includeComposeAgent
     ? finalizeSysrootVolumes(agentVolumes, sysrootActive)
     : undefined;
+  if (includeComposeAgent && isGeminiProxyRoutingEnabled(config) && shouldPinGeminiAuthType(config)) {
+    params.services[GEMINI_SETTINGS_SERVICE] = buildGeminiSettingsService(params.agentService);
+    params.agentService.depends_on[GEMINI_SETTINGS_SERVICE] = {
+      condition: 'service_completed_successfully',
+    };
+    namedVolumes = { ...namedVolumes, [GEMINI_SETTINGS_VOLUME]: {} };
+  }
   return { namedVolumes };
 }
 
@@ -417,4 +449,5 @@ export function assembleOptionalServices(
 export const testHelpers = {
   presetSidecarIpEnvVars,
   filterAgentVolumesForSysroot,
+  assembleRouterService,
 };

@@ -1,4 +1,4 @@
-const { injectStreamOptions } = require('./body-transform');
+const { injectSteeringMessage, injectStreamOptions } = require('./body-transform');
 
 describe('injectStreamOptions', () => {
   test('injects include_usage for streaming chat completions requests', () => {
@@ -8,6 +8,100 @@ describe('injectStreamOptions', () => {
 
     expect(transformed).not.toBeNull();
     expect(JSON.parse(transformed.body.toString('utf8')).stream_options).toEqual({ include_usage: true });
+  });
+
+  describe('injectSteeringMessage for Responses requests', () => {
+    const warning = '[AWF AI CREDIT WARNING] Use the remaining budget carefully.';
+
+    test.each([
+      ['tool loop ending in a function result', {
+        instructions: 'Keep working carefully.',
+        input: [
+          { role: 'user', content: [{ type: 'input_text', text: 'Continue the task.' }] },
+          { type: 'reasoning', id: 'reasoning-1', summary: [] },
+          { type: 'function_call', call_id: 'call-1', name: 'read_file', arguments: '{}' },
+          { type: 'function_call_output', call_id: 'call-1', output: 'file contents' },
+        ],
+      }],
+      ['input ending in a user message', {
+        instructions: 'Keep working carefully.',
+        input: [{ role: 'user', content: 'Continue the task.' }],
+      }],
+      ['no instructions', { input: [{ role: 'user', content: 'Continue the task.' }] }],
+      ['null instructions', { instructions: null, input: [{ role: 'user', content: 'Continue the task.' }] }],
+      ['string input', { instructions: 'Keep working carefully.', input: 'Continue the task.' }],
+      ['empty input', { input: [] }],
+    ])('appends one final developer notice preserving the prefix for %s', (_name, request) => {
+      const original = {
+        model: 'gpt-5-mini',
+        ...request,
+        tools: [{ type: 'function', name: 'read_file', parameters: { type: 'object' } }],
+        prompt_cache_key: 'stable-cache-key',
+        stream: true,
+      };
+      const body = Buffer.from(JSON.stringify(original));
+      const input = typeof original.input === 'string'
+        ? [{ role: 'user', content: original.input }]
+        : original.input;
+      const baseline = JSON.stringify({ ...original, input });
+      const prefixEnd = baseline.indexOf(JSON.stringify(input)) + JSON.stringify(input).length - 1;
+
+      const result = injectSteeringMessage(body, 'copilot', warning, '/v1/responses');
+
+      expect(result).not.toBeNull();
+      expect(result.subarray(0, Buffer.byteLength(baseline.slice(0, prefixEnd))))
+        .toEqual(Buffer.from(baseline.slice(0, prefixEnd)));
+      const parsed = JSON.parse(result.toString());
+      expect(parsed.input).toHaveLength(input.length + 1);
+      expect(parsed.input.pop()).toEqual({ type: 'message', role: 'developer', content: warning });
+      expect(JSON.stringify(parsed)).toBe(baseline);
+      if (typeof original.input === 'string') parsed.input = original.input;
+      expect(Buffer.from(JSON.stringify(parsed))).toEqual(body);
+    });
+
+    test('also appends a notice for Responses body shapes on unrecognized paths', () => {
+      const result = injectSteeringMessage(
+        Buffer.from(JSON.stringify({ input: 'Continue the task.' })),
+        'openai',
+        warning,
+        '/unknown',
+      );
+
+      expect(JSON.parse(result.toString())).toEqual({
+        input: [
+          { role: 'user', content: 'Continue the task.' },
+          { type: 'message', role: 'developer', content: warning },
+        ],
+      });
+    });
+
+    test('returns null for malformed Responses input or instructions', () => {
+      expect(injectSteeringMessage(
+        Buffer.from(JSON.stringify({ input: { text: 'not a supported input' } })),
+        'openai',
+        warning,
+        '/v1/responses',
+      )).toBeNull();
+      expect(injectSteeringMessage(
+        Buffer.from(JSON.stringify({ input: 'hello', instructions: [] })),
+        'openai',
+        warning,
+        '/v1/responses',
+      )).toBeNull();
+    });
+  });
+
+  describe('injectSteeringMessage for Gemini requests', () => {
+    const warning = '[AWF AI CREDIT WARNING] Use the remaining budget carefully.';
+
+    test.each([null, 'malformed', []])('returns null for malformed systemInstruction %p', (systemInstruction) => {
+      const body = Buffer.from(JSON.stringify({
+        contents: [{ role: 'user', parts: [{ text: 'Continue the task.' }] }],
+        systemInstruction,
+      }));
+
+      expect(injectSteeringMessage(body, 'gemini', warning)).toBeNull();
+    });
   });
 
   test('does not inject include_usage for OpenAI responses endpoint', () => {
@@ -60,6 +154,40 @@ describe('injectStreamOptions', () => {
     const transformed = injectStreamOptions(body, 'copilot', '/v1/chat/completions');
     expect(transformed).not.toBeNull();
     expect(JSON.parse(transformed.body.toString('utf8')).stream_options).toEqual({ include_usage: true });
+  });
+
+  describe.each(['v1', 'v1beta1'])('Vertex %s endpoints', (version) => {
+    test.each(['rawPredict', 'streamRawPredict'])(
+      'does not inject include_usage for Anthropic %s',
+      (method) => {
+        const request = {
+          anthropic_version: 'vertex-2023-10-16',
+          stream: true,
+          max_tokens: 16,
+          messages: [{ role: 'user', content: 'hi' }],
+        };
+        const body = Buffer.from(JSON.stringify(request));
+        const path = `/${version}/projects/test-project/locations/us-east5/publishers/anthropic/models/claude-sonnet-4-5:${method}`;
+
+        expect(injectStreamOptions(body, 'vertex', path)).toBeNull();
+        expect(injectStreamOptions(body, 'vertex', `${path}?alt=sse`)).toBeNull();
+        expect(injectStreamOptions(body, 'vertex', path.slice(1))).toBeNull();
+        expect(JSON.parse(body.toString('utf8'))).toEqual(request);
+      }
+    );
+
+    test.each(['', '?alt=sse'])(
+      'still injects include_usage for OpenAI-compatible chat completions%s',
+      (query) => {
+        const body = Buffer.from(JSON.stringify({ stream: true, messages: [{ role: 'user', content: 'hi' }] }));
+        const path = `/${version}/projects/test-project/locations/us-east5/endpoints/openapi/chat/completions${query}`;
+
+        const transformed = injectStreamOptions(body, 'vertex', path);
+
+        expect(transformed).not.toBeNull();
+        expect(JSON.parse(transformed.body.toString('utf8')).stream_options).toEqual({ include_usage: true });
+      }
+    );
   });
 
   test.each([

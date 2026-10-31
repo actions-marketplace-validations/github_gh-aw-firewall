@@ -5,8 +5,38 @@ const {
   MAX_SCHEMA_BYTES,
   strictParseJson,
 } = require('../../bounded-execution/finite-disclosure');
+const { TOOL_CALL_CAP_MESSAGE } = require('./tool-call-budget');
 
-const MCP_PROTOCOL_VERSION = '2025-06-18';
+const MCP_PROTOCOL_VERSION = '2025-11-25';
+
+/**
+ * Protocol revisions this server can speak, newest first.  The server speaks a
+ * fixed, tiny subset of MCP (initialize, tools/list, tools/call).  These
+ * revisions do not require batch handling, so a client that negotiates either of
+ * them is answered with its own requested revision.  A client that requests an
+ * unknown revision is answered with the newest supported one and decides for
+ * itself whether to continue.
+ */
+const SUPPORTED_MCP_PROTOCOL_VERSIONS = Object.freeze([
+  '2025-11-25',
+  '2025-06-18',
+]);
+
+/**
+ * Resolve the protocol version echoed back in the initialize result.
+ *
+ * @param {unknown} params initialize params as received from the client
+ * @returns {string}
+ */
+function negotiateProtocolVersion(params) {
+  const requested = params && typeof params === 'object' && !Array.isArray(params)
+    ? params.protocolVersion
+    : undefined;
+  if (typeof requested === 'string' && SUPPORTED_MCP_PROTOCOL_VERSIONS.includes(requested)) {
+    return requested;
+  }
+  return MCP_PROTOCOL_VERSION;
+}
 const TOOL_NAME = 'enclave_run_script';
 const AGENT_TOOL_NAME = 'enclave_run_agent';
 const JSONRPC_ERROR = Object.freeze({ status: 'error' });
@@ -18,14 +48,28 @@ function canonicalToolError() {
   };
 }
 
+/**
+ * In-band, model-facing denial for an exhausted run-wide tool-call cap. The
+ * decision depends only on the caller's own call count and trusted
+ * configuration, so it may be distinguished from the canonical error.
+ */
+function toolCallCapExhaustedResult() {
+  return {
+    content: [{ type: 'text', text: TOOL_CALL_CAP_MESSAGE }],
+    structuredContent: JSONRPC_ERROR,
+    isError: true,
+  };
+}
+
 const FINITE_SCHEMA_INPUT = Object.freeze({
   type: 'object',
-  description: 'An AWF finite-disclosure schema (const, boolean, enum, integer, object, tuple, array, or union).',
+  description:
+    'An AWF structured response schema (const, boolean, string for trusted repositories, enum, integer, object, tuple, array, or union).',
 });
 
 const TOOL = Object.freeze({
   name: TOOL_NAME,
-  description: 'Run a bounded script against one configured private repository and return one finite value.',
+  description: 'Run a bounded script against one configured repository and return one structured value.',
   inputSchema: Object.freeze({
     type: 'object',
     properties: Object.freeze({
@@ -61,8 +105,8 @@ const TOOL = Object.freeze({
 const AGENT_TOOL = Object.freeze({
   name: AGENT_TOOL_NAME,
   description:
-    'Run a bounded, single-use agent enclave against one configured private repository and return '
-    + 'one finite value.',
+    'Run a bounded, single-use agent enclave against one configured repository and return '
+    + 'one structured value.',
   inputSchema: Object.freeze({
     type: 'object',
     properties: Object.freeze({
@@ -96,6 +140,12 @@ const TOOL_PAYLOAD_KEYS = Object.freeze({
   [AGENT_TOOL_NAME]: 'prompt',
 });
 
+/** Executor kind behind each tool, used as the agent identity in cap warnings. */
+const TOOL_EXECUTOR_KINDS = Object.freeze({
+  [TOOL_NAME]: 'script',
+  [AGENT_TOOL_NAME]: 'agent',
+});
+
 const TOOLS_LIST_RESULT = Object.freeze({ tools: Object.freeze([TOOL]) });
 
 /**
@@ -114,9 +164,13 @@ function resolveHandlers(deps) {
  */
 function toolsListResult(deps) {
   const handlers = resolveHandlers(deps);
+  const advisory = deps.toolCallBudget && deps.toolCallBudget.advisory;
   const tools = Object.keys(TOOLS_BY_NAME)
     .filter((name) => handlers[name] !== undefined)
-    .map((name) => TOOLS_BY_NAME[name]);
+    .map((name) => TOOLS_BY_NAME[name])
+    // A configured run-wide tool-call cap is the only trusted value ever
+    // surfaced in the listing, as an advisory for the calling model.
+    .map((tool) => (advisory ? { ...tool, description: `${tool.description} ${advisory}` } : tool));
   return { tools };
 }
 
@@ -142,7 +196,7 @@ function hasOnlyKeys(value, allowed) {
   );
 }
 
-function handlerCall(handler, request) {
+function handlerCall(handler, request, signal) {
   return new Promise((resolve) => {
     handler.handle(request, (canonicalJson) => {
       const parsed = strictParseJson(canonicalJson);
@@ -157,7 +211,7 @@ function handlerCall(handler, request) {
           result: parsed.value.result,
         },
       });
-    });
+    }, { signal });
   });
 }
 
@@ -178,9 +232,10 @@ async function dispatchJsonRpc(message, deps) {
 
   if (message.method === 'initialize') {
     return rpcResult(message.id, {
-      protocolVersion: MCP_PROTOCOL_VERSION,
+      protocolVersion: negotiateProtocolVersion(message.params),
       capabilities: { tools: { listChanged: false } },
       serverInfo: { name: 'awf-enclave', version: '1.0.0' },
+      ...(deps.toolCallBudget && { instructions: deps.toolCallBudget.advisory }),
     });
   }
 
@@ -208,6 +263,16 @@ async function dispatchJsonRpc(message, deps) {
     if (!Object.prototype.hasOwnProperty.call(TOOL_PAYLOAD_KEYS, name)) {
       return rpcError(message.id, -32602, 'Invalid params');
     }
+    // Every attempted enclave tool call counts against the optional run-wide
+    // cap before any other admission decision, so busy, oversized, invalid,
+    // and failed calls all consume budget.
+    if (deps.toolCallBudget
+        && !deps.toolCallBudget.tryConsume(name, TOOL_EXECUTOR_KINDS[name])) {
+      deps.diagnosticAudit?.lifecycle('tool-admission', {
+        status: 'rejected', reason: 'tool-call-cap', executorKind: TOOL_EXECUTOR_KINDS[name],
+      });
+      return rpcResult(message.id, toolCallCapExhaustedResult());
+    }
     const payloadKey = TOOL_PAYLOAD_KEYS[name];
     const limit = payloadLimitFor(name, deps);
     // An oversized payload is dropped before the handler buffers it; the
@@ -223,11 +288,17 @@ async function dispatchJsonRpc(message, deps) {
     if (typeof deps.tryAcquireToolCall === 'function') {
       release = deps.tryAcquireToolCall();
       if (typeof release !== 'function') {
+        deps.diagnosticAudit?.lifecycle('tool-admission', {
+          status: 'rejected', reason: 'busy', executorKind: TOOL_EXECUTOR_KINDS[name],
+        });
         return rpcResult(message.id, canonicalToolError());
       }
     }
     try {
-      return rpcResult(message.id, await handlerCall(handlers[name], request));
+      deps.diagnosticAudit?.lifecycle('tool-admission', {
+        status: 'admitted', executorKind: TOOL_EXECUTOR_KINDS[name], oversized: tooLarge === true,
+      });
+      return rpcResult(message.id, await handlerCall(handlers[name], request, deps.signal));
     } finally {
       if (release) release();
     }
@@ -248,6 +319,8 @@ module.exports = {
   AGENT_TOOL,
   AGENT_TOOL_NAME,
   MCP_PROTOCOL_VERSION,
+  SUPPORTED_MCP_PROTOCOL_VERSIONS,
+  negotiateProtocolVersion,
   TOOL,
   TOOLS_BY_NAME,
   TOOL_NAME,

@@ -21,7 +21,7 @@ permissions:
   contents: write   # Required for creating releases, pushing version commits and tags
   packages: write   # Required for pushing to GHCR
   id-token: write   # Required for cosign keyless signing
-  attestations: write # Required for Cloud Hypervisor test artifact provenance
+  attestations: write # Required for release and Cloud Hypervisor artifact provenance
 
 jobs:
   bump-version:
@@ -32,7 +32,7 @@ jobs:
       version_number: ${{ steps.bump.outputs.version_number }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           fetch-depth: 0
           fetch-tags: true
@@ -44,7 +44,7 @@ jobs:
           exit 1
 
       - name: Setup Node.js
-        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
 
@@ -77,10 +77,12 @@ jobs:
             exit 0
           fi
 
+          node -e 'require("fs").writeFileSync("src/cloud-hypervisor/artifact-compatibility.json", JSON.stringify({releaseTag: process.argv[1]}, null, 2) + "\n")' "v$VERSION"
+
           # Create a commit with the bumped version and tag it.
           # Only push the tag — branch protection prevents pushing to main.
           # Downstream jobs checkout by tag, so they get the correct package.json.
-          git add package.json package-lock.json
+          git add package.json package-lock.json src/cloud-hypervisor/artifact-compatibility.json
           git commit -m "$VERSION"
           git tag "v$VERSION"
           git push origin "v$VERSION"
@@ -97,31 +99,31 @@ jobs:
       digest: ${{ steps.build_squid.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push Squid image
         id: build_squid
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/squid
           push: true
@@ -138,7 +140,7 @@ jobs:
             ghcr.io/${{ github.repository }}/squid@${{ steps.build_squid.outputs.digest }}
 
       - name: Generate SBOM for Squid image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/squid@${{ steps.build_squid.outputs.digest }}
           format: spdx-json
@@ -159,31 +161,31 @@ jobs:
       digest: ${{ steps.build_agent.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push Agent image
         id: build_agent
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/agent
           push: true
@@ -210,7 +212,7 @@ jobs:
             ghcr.io/${{ github.repository }}/agent@${{ steps.build_agent.outputs.digest }}
 
       - name: Generate SBOM for Agent image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/agent@${{ steps.build_agent.outputs.digest }}
           format: spdx-json
@@ -231,31 +233,31 @@ jobs:
       digest: ${{ steps.build_api_proxy.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push API Proxy image
         id: build_api_proxy
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/api-proxy
           push: true
@@ -275,7 +277,7 @@ jobs:
             ghcr.io/${{ github.repository }}/api-proxy@${{ steps.build_api_proxy.outputs.digest }}
 
       - name: Generate SBOM for API Proxy image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/api-proxy@${{ steps.build_api_proxy.outputs.digest }}
           format: spdx-json
@@ -288,6 +290,110 @@ jobs:
             --type spdxjson \
             ghcr.io/${{ github.repository }}/api-proxy@${{ steps.build_api_proxy.outputs.digest }}
 
+  build-router:
+    name: Build Router Image
+    runs-on: ubuntu-latest
+    needs: bump-version
+    outputs:
+      digest: ${{ steps.build_router.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ needs.bump-version.outputs.version }}
+
+      # The image version label is the router's own version (the Dockerfile's
+      # ARG VERSION default, which the build checks against main.go), not the
+      # AWF version, so VERSION is deliberately not passed.
+      # VCS_REF is the checked-out tag commit, not github.sha: bump-version
+      # creates a tag-only version commit on top of the dispatched commit.
+      - name: Compute router build arguments
+        id: router_args
+        run: |
+          set -euo pipefail
+          echo "vcs_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "openapi_sha256=$(sha256sum containers/router/openapi.yaml | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+
+      # No QEMU: the builder stage cross-compiles and the scratch runtime stage runs nothing.
+      - name: Build and push Router image
+        id: build_router
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./containers/router
+          push: true
+          pull: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}/router:${{ needs.bump-version.outputs.version_number }}
+            ghcr.io/${{ github.repository }}/router:latest
+          build-args: |
+            VCS_REF=${{ steps.router_args.outputs.vcs_ref }}
+            OPENAPI_SHA256=${{ steps.router_args.outputs.openapi_sha256 }}
+          cache-from: type=gha,scope=router
+          cache-to: type=gha,mode=max,scope=router
+
+      - name: Verify Router image labels and platforms
+        env:
+          REFERENCE: ghcr.io/${{ github.repository }}/router@${{ steps.build_router.outputs.digest }}
+          EXPECTED_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          EXPECTED_REVISION: ${{ steps.router_args.outputs.vcs_ref }}
+          EXPECTED_OPENAPI_SHA256: ${{ steps.router_args.outputs.openapi_sha256 }}
+        run: |
+          set -euo pipefail
+          docker pull --quiet "$REFERENCE"
+          labels=$(docker image inspect "$REFERENCE" --format '{{json .Config.Labels}}')
+          require() {
+            value=$(jq -r --arg key "$1" '.[$key] // ""' <<<"$labels")
+            if [[ "$value" != "$2" ]]; then
+              echo "::error::Router label $1 is '$value', expected '$2'"
+              exit 1
+            fi
+          }
+          require org.opencontainers.image.source "$EXPECTED_SOURCE"
+          require org.opencontainers.image.revision "$EXPECTED_REVISION"
+          require io.github.gh-aw-router.openapi-sha256 "$EXPECTED_OPENAPI_SHA256"
+          version=$(jq -r '.["org.opencontainers.image.version"] // ""' <<<"$labels")
+          if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+            echo "::error::Router version label is '$version', expected a semantic version"
+            exit 1
+          fi
+          docker buildx imagetools inspect "$REFERENCE" --format '{{json .Manifest}}' \
+            | jq -e '[.manifests[].platform | "\(.os)/\(.architecture)"] | index("linux/amd64") and index("linux/arm64")' > /dev/null \
+            || { echo "::error::Router image must include linux/amd64 and linux/arm64"; exit 1; }
+          echo "Router ${version} at ${REFERENCE}"
+
+      - name: Sign Router image with cosign
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}/router@${{ steps.build_router.outputs.digest }}
+
+      - name: Generate SBOM for Router image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ghcr.io/${{ github.repository }}/router@${{ steps.build_router.outputs.digest }}
+          format: spdx-json
+          output-file: router-sbom.spdx.json
+
+      - name: Attest SBOM for Router image
+        run: |
+          cosign attest --yes \
+            --predicate router-sbom.spdx.json \
+            --type spdxjson \
+            ghcr.io/${{ github.repository }}/router@${{ steps.build_router.outputs.digest }}
+
   build-cli-proxy:
     name: Build CLI Proxy Image
     runs-on: ubuntu-latest
@@ -296,31 +402,31 @@ jobs:
       digest: ${{ steps.build_cli_proxy.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push CLI Proxy image
         id: build_cli_proxy
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/cli-proxy
           push: true
@@ -337,7 +443,7 @@ jobs:
             ghcr.io/${{ github.repository }}/cli-proxy@${{ steps.build_cli_proxy.outputs.digest }}
 
       - name: Generate SBOM for CLI Proxy image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/cli-proxy@${{ steps.build_cli_proxy.outputs.digest }}
           format: spdx-json
@@ -354,38 +460,38 @@ jobs:
   build-enclaves:
     name: Build Enclave Images
     runs-on: ubuntu-latest
-    needs: bump-version
+    needs: [bump-version, build-build-tools]
     outputs:
       enclave_script_digest: ${{ steps.build_enclave_script.outputs.digest }}
       enclave_agent_digest: ${{ steps.build_enclave_agent.outputs.digest }}
       enclave_mcp_server_digest: ${{ steps.build_enclave_mcp_server.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push Enclave Script image
         id: build_enclave_script
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers
           file: ./containers/enclave/Dockerfile
@@ -404,7 +510,7 @@ jobs:
             ghcr.io/${{ github.repository }}/enclave-script@${{ steps.build_enclave_script.outputs.digest }}
 
       - name: Generate SBOM for Enclave Script image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/enclave-script@${{ steps.build_enclave_script.outputs.digest }}
           format: spdx-json
@@ -419,11 +525,13 @@ jobs:
 
       - name: Build and push Enclave Agent image
         id: build_enclave_agent
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers
           file: ./containers/enclave/Dockerfile
           target: enclave-agent
+          build-args: |
+            BUILD_TOOLS_IMAGE=ghcr.io/${{ github.repository }}/build-tools@${{ needs.build-build-tools.outputs.digest }}
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
@@ -438,7 +546,7 @@ jobs:
             ghcr.io/${{ github.repository }}/enclave-agent@${{ steps.build_enclave_agent.outputs.digest }}
 
       - name: Generate SBOM for Enclave Agent image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/enclave-agent@${{ steps.build_enclave_agent.outputs.digest }}
           format: spdx-json
@@ -453,11 +561,12 @@ jobs:
 
       - name: Build and push Enclave MCP Server image
         id: build_enclave_mcp_server
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers
           file: ./containers/enclave/Dockerfile
           target: enclave-mcp-server
+          build-args: AWF_SOURCE_REVISION=${{ github.sha }}
           push: true
           platforms: linux/amd64,linux/arm64
           tags: |
@@ -472,7 +581,7 @@ jobs:
             ghcr.io/${{ github.repository }}/enclave-mcp-server@${{ steps.build_enclave_mcp_server.outputs.digest }}
 
       - name: Generate SBOM for Enclave MCP Server image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/enclave-mcp-server@${{ steps.build_enclave_mcp_server.outputs.digest }}
           format: spdx-json
@@ -495,26 +604,26 @@ jobs:
       digest: ${{ steps.build_agent_act.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push Agent-Act image
         id: build_agent_act
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/agent
           push: true
@@ -532,7 +641,7 @@ jobs:
             ghcr.io/${{ github.repository }}/agent-act@${{ steps.build_agent_act.outputs.digest }}
 
       - name: Generate SBOM for Agent-Act image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/agent-act@${{ steps.build_agent_act.outputs.digest }}
           format: spdx-json
@@ -571,31 +680,31 @@ jobs:
       digest: ${{ steps.build_build_tools.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: linux/arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push Build-Tools image
         id: build_build_tools
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/build-tools
           push: true
@@ -611,7 +720,7 @@ jobs:
             ghcr.io/${{ github.repository }}/build-tools@${{ steps.build_build_tools.outputs.digest }}
 
       - name: Generate SBOM for Build-Tools image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/build-tools@${{ steps.build_build_tools.outputs.digest }}
           format: spdx-json
@@ -649,31 +758,31 @@ jobs:
       digest: ${{ steps.build_gh_aw_node.outputs.digest }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@49b3bc8e6bdd4a60e6116a5414239cba5943d3cf # v3.2.0
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
         with:
           platforms: arm64
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@59acb6260d9c0ba8f4a2f9d9b48431a222b68e20 # v3.5.0
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
 
       - name: Build and push gh-aw-node image
         id: build_gh_aw_node
-        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: ./containers/gh-aw-node
           push: true
@@ -691,7 +800,7 @@ jobs:
             ghcr.io/${{ github.repository }}/gh-aw-node@${{ steps.build_gh_aw_node.outputs.digest }}
 
       - name: Generate SBOM for gh-aw-node image
-        uses: anchore/sbom-action@28d71544de8eaf1b958d335707167c5f783590ad # v0.22.2
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
         with:
           image: ghcr.io/${{ github.repository }}/gh-aw-node@${{ steps.build_gh_aw_node.outputs.digest }}
           format: spdx-json
@@ -721,17 +830,17 @@ jobs:
   release:
     name: Create Release
     runs-on: ubuntu-latest
-    needs: [bump-version, build-squid, build-agent, build-api-proxy, build-cli-proxy, build-agent-act, build-build-tools, build-enclaves, build-gh-aw-node, build-cloud-hypervisor-test-artifacts]
+    needs: [bump-version, build-squid, build-agent, build-api-proxy, build-router, build-cli-proxy, build-agent-act, build-build-tools, build-enclaves, build-gh-aw-node, build-cloud-hypervisor-guest-base, build-cloud-hypervisor-profiles, build-cloud-hypervisor-test-artifacts, build-nvx-test-artifacts]
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}  # Checkout the version tag
           fetch-depth: 0  # Full history for tag listing and changelog generation
           fetch-tags: true
 
       - name: Setup Node.js
-        uses: actions/setup-node@6044e13b5dc448c55e2357c09f80417699197238 # v6.2.0
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: '22'
           cache: 'npm'
@@ -751,29 +860,26 @@ jobs:
           node release/awf-bundle.js --version
           node release/awf-bundle.js --help | head -5
 
-      - name: Install pkg for binary creation
-        run: npm install -g pkg
-
       - name: Create binaries
         run: |
           mkdir -p release
 
           # Create standalone executables for Linux (x64 and arm64)
-          pkg . \
-            --targets node18-linux-x64 \
+          ./node_modules/.bin/pkg . \
+            --targets node24-linux-x64 \
             --output release/awf-linux-x64
 
-          pkg . \
-            --targets node18-linux-arm64 \
+          ./node_modules/.bin/pkg . \
+            --targets node24-linux-arm64 \
             --output release/awf-linux-arm64
 
           # Create standalone executables for macOS (x64 and arm64)
-          pkg . \
-            --targets node18-macos-x64 \
+          ./node_modules/.bin/pkg . \
+            --targets node24-macos-x64 \
             --output release/awf-darwin-x64
 
-          pkg . \
-            --targets node18-macos-arm64 \
+          ./node_modules/.bin/pkg . \
+            --targets node24-macos-arm64 \
             --output release/awf-darwin-arm64
 
           # Verify the binaries were created
@@ -813,7 +919,7 @@ jobs:
           mv *.tgz release/awf.tgz
 
       - name: Download Cloud Hypervisor preview test artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: release-cloud-hypervisor-test-x86_64
           path: cloud-hypervisor-release-assets
@@ -826,8 +932,42 @@ jobs:
             release/cloud-hypervisor-test-x86_64.SHA256SUMS
           cp cloud-hypervisor-release-assets/manifest.json \
             release/cloud-hypervisor-test-x86_64.manifest.json
+          cp cloud-hypervisor-release-assets/manifest.sigstore.jsonl \
+            release/cloud-hypervisor-test-x86_64.manifest.sigstore.jsonl
           cp cloud-hypervisor-release-assets/sbom.spdx.json \
             release/cloud-hypervisor-test-x86_64.sbom.spdx.json
+          cp cloud-hypervisor-release-assets/awf-cloud-hypervisor-enclave-rootfs-x86_64.tar.gz \
+            release/cloud-hypervisor-enclave-rootfs-x86_64.tar.gz
+          gzip -n -c cloud-hypervisor-release-assets/enclave-rootfs.ext4 \
+            > release/enclave-rootfs.ext4.gz
+          cp cloud-hypervisor-release-assets/enclave-rootfs.sbom.spdx.json \
+            release/enclave-rootfs.sbom.spdx.json
+          cp cloud-hypervisor-release-assets/rootfs.sbom.spdx.json \
+            release/cloud-hypervisor-rootfs.sbom.spdx.json
+          cp cloud-hypervisor-release-assets/enclave-rootfs.provenance.sigstore.jsonl \
+            release/enclave-rootfs.provenance.sigstore.jsonl
+          cp cloud-hypervisor-release-assets/enclave-manifest.json \
+            release/cloud-hypervisor-enclave-rootfs-x86_64.manifest.json
+          cp cloud-hypervisor-release-assets/enclave-manifest.sigstore.jsonl \
+            release/cloud-hypervisor-enclave-rootfs-x86_64.manifest.sigstore.jsonl
+          cp cloud-hypervisor-release-assets/setup-cloud-hypervisor-enclave-artifacts.sh \
+            release/setup-cloud-hypervisor-enclave-artifacts.sh
+          chmod 0755 release/setup-cloud-hypervisor-enclave-artifacts.sh
+
+      - name: Download NVX preview test artifacts
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-nvx-test-x86_64
+          path: nvx-release-assets
+
+      - name: Stage NVX preview test assets
+        run: |
+          cp nvx-release-assets/nvx-test-x86_64.tar.gz \
+            release/nvx-test-x86_64.tar.gz
+          cp nvx-release-assets/nvx-test-x86_64/manifest.json \
+            release/nvx-test-x86_64.manifest.json
+          cp nvx-release-assets/nvx-test-x86_64/manifest.sigstore.jsonl \
+            release/nvx-test-x86_64.manifest.sigstore.jsonl
 
       - name: Generate containers list
         run: |
@@ -837,10 +977,14 @@ jobs:
             "ghcr.io/${{ github.repository }}/agent@${{ needs['build-agent'].outputs.digest }}" \
             "ghcr.io/${{ github.repository }}/agent-act@${{ needs['build-agent-act'].outputs.digest }}" \
             "ghcr.io/${{ github.repository }}/api-proxy@${{ needs['build-api-proxy'].outputs.digest }}" \
+            "ghcr.io/${{ github.repository }}/router@${{ needs['build-router'].outputs.digest }}" \
             "ghcr.io/${{ github.repository }}/cli-proxy@${{ needs['build-cli-proxy'].outputs.digest }}" \
             "ghcr.io/${{ github.repository }}/enclave-script@${{ needs['build-enclaves'].outputs.enclave_script_digest }}" \
             "ghcr.io/${{ github.repository }}/enclave-agent@${{ needs['build-enclaves'].outputs.enclave_agent_digest }}" \
             "ghcr.io/${{ github.repository }}/enclave-mcp-server@${{ needs['build-enclaves'].outputs.enclave_mcp_server_digest }}" \
+            "ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ needs['build-cloud-hypervisor-guest-base'].outputs.digest }}" \
+            "ghcr.io/${{ github.repository }}/cloud-hypervisor-primary@${{ needs['build-cloud-hypervisor-profiles'].outputs.primary_digest }}" \
+            "ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave@${{ needs['build-cloud-hypervisor-profiles'].outputs.enclave_digest }}" \
             "ghcr.io/${{ github.repository }}/gh-aw-node@${{ needs['build-gh-aw-node'].outputs.digest }}" \
             > release/containers.txt
           echo "Generated containers.txt:"
@@ -864,6 +1008,30 @@ jobs:
         run: |
           cd release
           sha256sum * > checksums.txt
+
+      - name: Bind release tag to checksums
+        env:
+          RELEASE_TAG: ${{ needs.bump-version.outputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(git rev-parse HEAD)" = "$(git rev-parse "refs/tags/${RELEASE_TAG}^{commit}")"
+          printf '%s  refs/tags/%s\n' "$(sha256sum release/checksums.txt | cut -d ' ' -f1)" \
+            "$RELEASE_TAG" > release/release-identity.txt
+
+      - name: Attest AWF release payloads and metadata
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            release/awf-linux-x64
+            release/awf-linux-arm64
+            release/awf-darwin-x64
+            release/awf-darwin-arm64
+            release/awf-bundle.js
+            release/awf.tgz
+            release/checksums.txt
+            release/containers.txt
+            release/release-identity.txt
 
       - name: Get previous release tag
         id: previous_tag
@@ -969,8 +1137,21 @@ jobs:
           echo "Release notes preview (first 20 lines):"
           head -20 release_notes.md
 
+      - name: Validate release asset sizes
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const limit = 2147483648;
+          for (const name of fs.readdirSync('release')) {
+            const size = fs.statSync(`release/${name}`).size;
+            if (size >= limit) {
+              throw new Error(`Release asset ${name} is ${size} bytes; size must be less than ${limit}`);
+            }
+          }
+          NODE
+
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2.5.0
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           tag_name: ${{ needs.bump-version.outputs.version }}
           name: Release ${{ needs.bump-version.outputs.version }}
@@ -987,34 +1168,250 @@ jobs:
             release/cloud-hypervisor-test-x86_64.tar.gz
             release/cloud-hypervisor-test-x86_64.SHA256SUMS
             release/cloud-hypervisor-test-x86_64.manifest.json
+            release/cloud-hypervisor-test-x86_64.manifest.sigstore.jsonl
             release/cloud-hypervisor-test-x86_64.sbom.spdx.json
+            release/cloud-hypervisor-enclave-rootfs-x86_64.tar.gz
+            release/cloud-hypervisor-enclave-rootfs-x86_64.manifest.json
+            release/cloud-hypervisor-enclave-rootfs-x86_64.manifest.sigstore.jsonl
+            release/nvx-test-x86_64.tar.gz
+            release/nvx-test-x86_64.manifest.json
+            release/nvx-test-x86_64.manifest.sigstore.jsonl
+            release/enclave-rootfs.ext4.gz
+            release/enclave-rootfs.sbom.spdx.json
+            release/cloud-hypervisor-rootfs.sbom.spdx.json
+            release/enclave-rootfs.provenance.sigstore.jsonl
+            release/setup-cloud-hypervisor-enclave-artifacts.sh
             release/containers.txt
             release/awf-config.schema.json
             release/awf-config.v1.schema.json
             release/audit.schema.json
             release/token-usage.schema.json
             release/checksums.txt
+            release/release-identity.txt
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload artifacts (for debugging)
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
           name: release-artifacts
           path: release/
           retention-days: 7
 
+  enclave-conformance:
+    name: Dispatch full release enclave conformance (${{ needs.bump-version.outputs.version }})
+    needs: [bump-version, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Dispatch exact published tag once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWF_RELEASE_TAG: ${{ needs.bump-version.outputs.version }}
+        run: node scripts/ci/dispatch-release-enclave-conformance.js
+
+  primary-agent-validation:
+    name: Dispatch release primary-agent live KVM (${{ needs.bump-version.outputs.version }})
+    needs: [bump-version, release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: write
+    steps:
+      - name: Checkout release source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Dispatch exact published tag once
+        env:
+          GH_TOKEN: ${{ github.token }}
+          AWF_RELEASE_TAG: ${{ needs.bump-version.outputs.version }}
+        run: node scripts/ci/dispatch-release-enclave-conformance.js --primary
+
+  build-cloud-hypervisor-guest-base:
+    name: Build Cloud Hypervisor Guest Base
+    runs-on: ubuntu-latest
+    needs: bump-version
+    outputs:
+      digest: ${{ steps.build_guest_base.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ needs.bump-version.outputs.version }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Set up guest supervisor Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25.0'
+          cache-dependency-path: guest/microvm-supervisor/go.mod
+      - name: Build shared guest supervisor
+        run: |
+          mkdir -p /tmp/awf-guest-supervisor
+          VERSION="${{ needs.bump-version.outputs.version }}" \
+            OUTPUT=/tmp/awf-guest-supervisor/awf-supervisor \
+            ./guest/microvm-supervisor/build.sh
+      - name: Build and push guest base
+        id: build_guest_base
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./containers
+          file: ./containers/cloud-hypervisor/Dockerfile
+          build-contexts: |
+            supervisor=/tmp/awf-guest-supervisor
+          target: guest-base
+          push: true
+          platforms: linux/amd64
+          tags: ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base:${{ needs.bump-version.outputs.version_number }}
+      - name: Sign guest base image with cosign
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ steps.build_guest_base.outputs.digest }}
+      - name: Generate SBOM for guest base image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ steps.build_guest_base.outputs.digest }}
+          format: spdx-json
+          output-file: cloud-hypervisor-guest-base-sbom.spdx.json
+      - name: Attest SBOM for guest base image
+        run: |
+          cosign attest --yes \
+            --predicate cloud-hypervisor-guest-base-sbom.spdx.json \
+            --type spdxjson \
+            ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ steps.build_guest_base.outputs.digest }}
+
+  build-cloud-hypervisor-profiles:
+    name: Build Cloud Hypervisor Guest Profiles
+    runs-on: ubuntu-latest
+    needs: [bump-version, build-build-tools, build-enclaves, build-cloud-hypervisor-guest-base]
+    outputs:
+      primary_digest: ${{ steps.build_primary.outputs.digest }}
+      enclave_digest: ${{ steps.build_enclave.outputs.digest }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ needs.bump-version.outputs.version }}
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Install cosign
+        uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+      - name: Build and push primary guest
+        id: build_primary
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./containers
+          file: ./containers/cloud-hypervisor/Dockerfile
+          target: primary
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            GUEST_BASE_IMAGE=ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ needs.build-cloud-hypervisor-guest-base.outputs.digest }}
+            BUILD_TOOLS_IMAGE=ghcr.io/${{ github.repository }}/build-tools@${{ needs.build-build-tools.outputs.digest }}
+          tags: ghcr.io/${{ github.repository }}/cloud-hypervisor-primary:${{ needs.bump-version.outputs.version_number }}
+      - name: Sign primary guest image with cosign
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}/cloud-hypervisor-primary@${{ steps.build_primary.outputs.digest }}
+      - name: Generate SBOM for primary guest image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ghcr.io/${{ github.repository }}/cloud-hypervisor-primary@${{ steps.build_primary.outputs.digest }}
+          format: spdx-json
+          output-file: cloud-hypervisor-primary-sbom.spdx.json
+      - name: Attest SBOM for primary guest image
+        run: |
+          cosign attest --yes \
+            --predicate cloud-hypervisor-primary-sbom.spdx.json \
+            --type spdxjson \
+            ghcr.io/${{ github.repository }}/cloud-hypervisor-primary@${{ steps.build_primary.outputs.digest }}
+      - name: Build and push shared enclave guest
+        id: build_enclave
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ./containers
+          file: ./containers/cloud-hypervisor/Dockerfile
+          target: enclave
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            GUEST_BASE_IMAGE=ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ needs.build-cloud-hypervisor-guest-base.outputs.digest }}
+            ENCLAVE_AGENT_IMAGE=ghcr.io/${{ github.repository }}/enclave-agent@${{ needs.build-enclaves.outputs.enclave_agent_digest }}
+          tags: ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave:${{ needs.bump-version.outputs.version_number }}
+      - name: Sign shared enclave guest image with cosign
+        run: |
+          cosign sign --yes \
+            ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave@${{ steps.build_enclave.outputs.digest }}
+      - name: Generate SBOM for shared enclave guest image
+        uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+        with:
+          image: ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave@${{ steps.build_enclave.outputs.digest }}
+          format: spdx-json
+          output-file: cloud-hypervisor-enclave-sbom.spdx.json
+      - name: Attest SBOM for shared enclave guest image
+        run: |
+          cosign attest --yes \
+            --predicate cloud-hypervisor-enclave-sbom.spdx.json \
+            --type spdxjson \
+            ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave@${{ steps.build_enclave.outputs.digest }}
+
   build-cloud-hypervisor-test-artifacts:
     name: Build Cloud Hypervisor Preview Test Artifacts
     runs-on: ubuntu-24.04
-    needs: [bump-version, build-build-tools]
-    timeout-minutes: 45
+    needs: [bump-version, build-cloud-hypervisor-guest-base, build-cloud-hypervisor-profiles]
+    timeout-minutes: 60
     steps:
       - name: Checkout code
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
         with:
           ref: ${{ needs.bump-version.outputs.version }}
+
+      - name: Free unused hosted-runner disk space
+        # Kernel, virtiofsd, three ext4 images and their bundles need room on the
+        # hosted runner. Remove preinstalled SDKs this job never uses.
+        run: |
+          df -h /
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /usr/local/.ghcup \
+            /opt/hostedtoolcache/CodeQL
+          df -h /
 
       - name: Set up Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
@@ -1027,12 +1424,26 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes --no-install-recommends \
             bc binutils bison build-essential ca-certificates cpio e2fsprogs \
-            file flex libelf-dev libssl-dev rsync virtiofsd xz-utils
+            file flex libcap2-bin libcap-ng-dev libelf-dev libseccomp-dev \
+            libssl-dev pkg-config rsync xz-utils
+          # virtiofsd is built from pinned upstream source by
+          # build-test-artifacts.sh with the rustup toolchain it pins.
+          rustup --version
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and verify pinned test artifacts
         run: |
-          BUILD_TOOLS_IMAGE="ghcr.io/${{ github.repository }}/build-tools@${{ needs.build-build-tools.outputs.digest }}" \
+          GUEST_BASE_IMAGE="ghcr.io/${{ github.repository }}/cloud-hypervisor-guest-base@${{ needs.build-cloud-hypervisor-guest-base.outputs.digest }}" \
+            PRIMARY_IMAGE="ghcr.io/${{ github.repository }}/cloud-hypervisor-primary@${{ needs.build-cloud-hypervisor-profiles.outputs.primary_digest }}" \
+            ENCLAVE_IMAGE="ghcr.io/${{ github.repository }}/cloud-hypervisor-enclave@${{ needs.build-cloud-hypervisor-profiles.outputs.enclave_digest }}" \
             VERSION="${{ needs.bump-version.outputs.version }}" \
+            AWF_CH_PRUNE_DOCKER_BUILD_CACHE=1 \
             ./guest/cloud-hypervisor/build-test-artifacts.sh
           ./guest/cloud-hypervisor/verify-test-artifacts.sh \
             release/cloud-hypervisor-test-x86_64
@@ -1042,10 +1453,152 @@ jobs:
         with:
           subject-path: release/cloud-hypervisor-test-x86_64/awf-cloud-hypervisor-test-x86_64.tar.gz
 
+      - name: Attest enclave rootfs bundle provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/cloud-hypervisor-test-x86_64/awf-cloud-hypervisor-enclave-rootfs-x86_64.tar.gz
+
+      - name: Attest shared enclave rootfs provenance
+        id: attest_cloud_hypervisor_enclave_rootfs
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/cloud-hypervisor-test-x86_64/enclave-rootfs.ext4
+
+      - name: Attest release-pinned guest artifact manifest
+        id: attest_cloud_hypervisor_manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/cloud-hypervisor-test-x86_64/manifest.json
+
+      - name: Bundle manifest attestation for offline verification
+        env:
+          BUNDLE_PATH: ${{ steps.attest_cloud_hypervisor_manifest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" \
+            release/cloud-hypervisor-test-x86_64/manifest.sigstore.jsonl
+
+      - name: Attest release-pinned enclave artifact manifest
+        id: attest_cloud_hypervisor_enclave_manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/cloud-hypervisor-test-x86_64/enclave-manifest.json
+
+      - name: Bundle enclave provenance for offline verification
+        env:
+          ROOTFS_BUNDLE: ${{ steps.attest_cloud_hypervisor_enclave_rootfs.outputs.bundle-path }}
+          MANIFEST_BUNDLE: ${{ steps.attest_cloud_hypervisor_enclave_manifest.outputs.bundle-path }}
+        run: |
+          cp "$ROOTFS_BUNDLE" \
+            release/cloud-hypervisor-test-x86_64/enclave-rootfs.provenance.sigstore.jsonl
+          cp "$MANIFEST_BUNDLE" \
+            release/cloud-hypervisor-test-x86_64/enclave-manifest.sigstore.jsonl
+
       - name: Upload Cloud Hypervisor test artifacts
-        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-cloud-hypervisor-test-x86_64
           path: release/cloud-hypervisor-test-x86_64/
+          if-no-files-found: error
+          retention-days: 7
+
+  build-nvx-test-artifacts:
+    name: Build NVX Preview Test Artifacts
+    runs-on: ubuntu-24.04
+    needs: bump-version
+    timeout-minutes: 20
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v4
+        with:
+          ref: ${{ needs.bump-version.outputs.version }}
+
+      - name: Fetch and verify pinned NVX release artifacts
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          NVX_RELEASE: v0.1.0-dev.be859aa77ffa
+          NVX_ARCHIVE: nvx-0.1.0-linux-kvm.tar.gz
+          NVX_ARCHIVE_SHA256: ad6bf948d84d60d92f35103b52dc3ad33a421e9a4457ce0823d1890a6985a912
+        run: |
+          set -euo pipefail
+          package_dir="$RUNNER_TEMP/nvx-package"
+          artifact_dir="release/nvx-test-x86_64"
+          mkdir -p "$package_dir" "$artifact_dir"
+          gh release download "$NVX_RELEASE" \
+            --repo microsoft/nvx \
+            --pattern "$NVX_ARCHIVE" \
+            --dir "$package_dir"
+          printf '%s  %s\n' \
+            "$NVX_ARCHIVE_SHA256" \
+            "$package_dir/$NVX_ARCHIVE" |
+            sha256sum --check --status
+          tar -xzf "$package_dir/$NVX_ARCHIVE" -C "$package_dir"
+          extracted="$package_dir/nvx-0.1.0-linux-kvm"
+          (
+            cd "$extracted"
+            sha256sum --check SHA256SUMS
+          )
+          install -m 0555 "$extracted/bin/openvmm" "$artifact_dir/openvmm"
+          install -m 0444 "$extracted/guest/vmlinux" "$artifact_dir/vmlinux"
+          install -m 0444 \
+            "$extracted/guest/initramfs.cpio.gz" \
+            "$artifact_dir/initramfs.cpio.gz"
+          jq -n \
+            --arg release_tag "${{ needs.bump-version.outputs.version }}" \
+            --arg source_commit "$(git rev-parse HEAD)" \
+            --arg openvmm_sha "$(sha256sum "$artifact_dir/openvmm" | cut -d' ' -f1)" \
+            --arg kernel_sha "$(sha256sum "$artifact_dir/vmlinux" | cut -d' ' -f1)" \
+            --arg initramfs_sha "$(sha256sum "$artifact_dir/initramfs.cpio.gz" | cut -d' ' -f1)" \
+            --argjson openvmm_size "$(stat -c %s "$artifact_dir/openvmm")" \
+            --argjson kernel_size "$(stat -c %s "$artifact_dir/vmlinux")" \
+            --argjson initramfs_size "$(stat -c %s "$artifact_dir/initramfs.cpio.gz")" \
+            '{
+              schemaVersion:2,
+              release:{
+                repository:"github/gh-aw-firewall",
+                workflow:"github/gh-aw-firewall/.github/workflows/release.yml",
+                tag:$release_tag,
+                sourceCommit:$source_commit
+              },
+              upstream:{
+                releaseTag:"v0.1.0-dev.be859aa77ffa",
+                nvxCommit:"be859aa77ffa7a20f9ef50f68c5386acdfca9955",
+                openvmmCommit:"762bc1c7a203b16aee752324d6a4ab0bde1a713a"
+              },
+              architecture:"x86_64",
+              artifacts:{
+                openvmm:{file:"openvmm",sizeBytes:$openvmm_size,sha256:$openvmm_sha},
+                kernel:{file:"vmlinux",sizeBytes:$kernel_size,sha256:$kernel_sha},
+                initramfs:{
+                  file:"initramfs.cpio.gz",
+                  sizeBytes:$initramfs_size,
+                  sha256:$initramfs_sha
+                }
+              }
+            }' > "$artifact_dir/manifest.json"
+
+      - name: Attest release-pinned NVX artifact manifest
+        id: attest_nvx_manifest
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: release/nvx-test-x86_64/manifest.json
+
+      - name: Bundle NVX manifest attestation
+        env:
+          BUNDLE_PATH: ${{ steps.attest_nvx_manifest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE_PATH" \
+            release/nvx-test-x86_64/manifest.sigstore.jsonl
+          tar -czf release/nvx-test-x86_64.tar.gz \
+            -C release/nvx-test-x86_64 \
+            openvmm vmlinux initramfs.cpio.gz
+
+      - name: Upload NVX test artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-nvx-test-x86_64
+          path: |
+            release/nvx-test-x86_64.tar.gz
+            release/nvx-test-x86_64/manifest.json
+            release/nvx-test-x86_64/manifest.sigstore.jsonl
           if-no-files-found: error
           retention-days: 7

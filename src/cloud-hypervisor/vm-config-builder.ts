@@ -1,4 +1,5 @@
 import type { MicrovmNetworkPlan } from '../microvm/network';
+import { MICROVM_SCRATCH_INIT_GUEST_PATH } from '../microvm/scratch-init';
 import type { CloudHypervisorOptions } from '../types/runtime-options';
 import {
   validateCloudHypervisorExports,
@@ -12,9 +13,11 @@ import {
 } from './launcher';
 import {
   CLOUD_HYPERVISOR_GUEST_VSOCK_PORT,
+  type CloudHypervisorEnclaveResourceProfile,
   type CloudHypervisorManagerGuestConfig,
   type CloudHypervisorRunPaths,
 } from './manager-types';
+import { CLOUD_HYPERVISOR_ENCLAVE_RESOURCE_PROFILES } from './workload-profile';
 import type { VirtiofsdDevice } from './virtiofsd';
 
 const CLOUD_HYPERVISOR_GUEST_SUPERVISOR = '/usr/sbin/awf-supervisor';
@@ -22,8 +25,9 @@ const CLOUD_HYPERVISOR_GUEST_SUPERVISOR = '/usr/sbin/awf-supervisor';
 export interface CloudHypervisorVmConfigInput {
   config: CloudHypervisorOptions;
   paths: CloudHypervisorRunPaths;
-  networkPlan: MicrovmNetworkPlan;
+  networkPlan?: MicrovmNetworkPlan;
   guestConfig?: CloudHypervisorManagerGuestConfig;
+  enclaveResources?: CloudHypervisorEnclaveResourceProfile;
   fsDevices?: readonly VirtiofsdDevice[];
 }
 
@@ -36,35 +40,59 @@ export function buildCloudHypervisorVmConfig({
   paths,
   networkPlan,
   guestConfig,
+  enclaveResources,
   fsDevices = [],
 }: CloudHypervisorVmConfigInput) {
+  const profileResources = guestConfig?.enclaveResources;
+  if (profileResources || enclaveResources) {
+    const resources = profileResources;
+    const expected = resources
+      ? CLOUD_HYPERVISOR_ENCLAVE_RESOURCE_PROFILES[resources.role]
+      : undefined;
+    if (
+      !resources ||
+      enclaveResources !== resources ||
+      !expected ||
+      Object.keys(expected).length !== Object.keys(resources).length ||
+      Object.keys(expected).some((key) => (
+        expected[key as keyof typeof expected] !==
+        resources[key as keyof CloudHypervisorEnclaveResourceProfile]
+      )) ||
+      !guestConfig
+    ) {
+      throw new Error('Cloud Hypervisor enclave VM limits must match its closed guest resource profile');
+    }
+  }
+  const effectiveResources = profileResources;
+  const vmMemoryMiB = effectiveResources?.memoryMiB ?? config.memoryMib;
+  const vmVcpuCount = effectiveResources?.vcpuCount ?? config.vcpuCount;
   const landlockRules = computeCloudHypervisorLandlockRules({
     kernelPath: paths.kernelPath,
     rootfsPath: paths.rootfsPath,
     runDirectory: paths.runDirectory,
     apiSocketPath: paths.apiSocketPath,
     vsockSocketPath: paths.vsockSocketPath,
-    tapName: networkPlan.tapName,
+    ...(networkPlan ? { tapName: networkPlan.tapName } : {}),
   });
   return {
     cpus: {
-      boot_vcpus: config.vcpuCount,
-      max_vcpus: config.vcpuCount,
+      boot_vcpus: vmVcpuCount,
+      max_vcpus: vmVcpuCount,
     },
     memory: {
-      size: config.memoryMib * 1024 * 1024,
+      size: vmMemoryMiB * 1024 * 1024,
       ...(fsDevices.length > 0 ? { shared: true } : {}),
     },
     payload: {
       kernel: paths.kernelPath,
       ...(guestConfig
-        ? { cmdline: buildSupervisorBootArgs(networkPlan, guestConfig) }
+        ? { cmdline: buildSupervisorBootArgs(networkPlan, guestConfig, config.scratchMib) }
         : {}),
     },
     disks: [{
       id: 'rootfs',
       path: paths.rootfsPath,
-      readonly: false,
+      readonly: Boolean(effectiveResources),
       image_type: 'Raw' as const,
     }],
     ...(fsDevices.length > 0
@@ -77,25 +105,19 @@ export function buildCloudHypervisorVmConfig({
           })),
         }
       : {}),
-    net: [{
-      id: 'net0',
-      tap: networkPlan.networkInterface.host_dev_name,
-      mac: networkPlan.networkInterface.guest_mac ?? '',
-      // Cloud Hypervisor defaults all three offloads to enabled. This
-      // entire network path is a fully-software bridge/veth/tap chain
-      // with no real NIC downstream to finish partially-offloaded
-      // (unchecksummed / not-yet-segmented) frames; live-KVM validation
-      // showed guest-to-Squid traffic being forwarded (visible in nft
-      // counters) but the return path never matching the
-      // established/related accept rule, with zero visibility into
-      // whether nftables' conntrack was marking replies as invalid.
-      // Disable all three explicitly rather than rely on Cloud
-      // Hypervisor's own defaults, removing offload-related packet
-      // malformation as a possible cause.
-      offload_tso: false,
-      offload_ufo: false,
-      offload_csum: false,
-    }],
+    ...(networkPlan
+      ? {
+          net: [{
+            id: 'net0',
+            tap: networkPlan.networkInterface.host_dev_name,
+            mac: networkPlan.networkInterface.guest_mac ?? '',
+            // This fully-software path cannot complete partial offloads.
+            offload_tso: false,
+            offload_ufo: false,
+            offload_csum: false,
+          }],
+        }
+      : {}),
     rng: { src: '/dev/urandom' },
     serial: { mode: 'File' as const, file: paths.serialLogPath },
     console: { mode: 'Off' as const },
@@ -109,13 +131,22 @@ export function buildCloudHypervisorVmConfig({
 }
 
 export function buildSupervisorBootArgs(
-  networkPlan: MicrovmNetworkPlan,
+  networkPlan: MicrovmNetworkPlan | undefined,
   guestConfig: CloudHypervisorManagerGuestConfig,
+  scratchMib?: number,
 ): string {
+  if (scratchMib !== undefined && (
+    !Number.isInteger(scratchMib) || scratchMib < 1 || scratchMib > 0xffffffff
+  )) {
+    throw new Error('Cloud Hypervisor scratch MiB must be an integer in 1-4294967295');
+  }
   const port = guestConfig.vsockPort ?? CLOUD_HYPERVISOR_GUEST_VSOCK_PORT;
   if (!Number.isInteger(port) || port < 1 || port > 65_535) {
     throw new Error(`Cloud Hypervisor guest vsock port must be in 1-65535: ${port}`);
   }
+  const workspaceMount = guestConfig.workspaceMount === undefined
+    ? '/workspace'
+    : guestConfig.workspaceMount;
   return [
     'console=ttyS0',
     'reboot=k',
@@ -123,21 +154,30 @@ export function buildSupervisorBootArgs(
     'root=/dev/vda',
     'rootfstype=ext4',
     'rootflags=data=ordered',
-    'rw',
-    // Cloud Hypervisor requires PCI; pin legacy `ethN` interface naming so the guest's
-    // single virtio-pci NIC has a deterministic name across boots.
-    'net.ifnames=0',
-    'biosdevname=0',
-    `init=${CLOUD_HYPERVISOR_GUEST_SUPERVISOR}`,
-    'awf.workspace-mount=/workspace',
+    guestConfig.enclaveResources ? 'ro' : 'rw',
+    ...(networkPlan ? ['net.ifnames=0', 'biosdevname=0'] : []),
+    `init=${scratchMib !== undefined && !guestConfig.enclaveResources
+      ? MICROVM_SCRATCH_INIT_GUEST_PATH
+      : CLOUD_HYPERVISOR_GUEST_SUPERVISOR}`,
+    ...(guestConfig.enclaveResources
+      ? [`awf.enclave-role=${guestConfig.enclaveResources.role}`]
+      : []),
+    ...(!networkPlan ? ['awf.network-mode=none'] : []),
+    ...(workspaceMount ? [`awf.workspace-mount=${workspaceMount}`] : []),
     `awf.virtiofs=${encodeVirtiofsBootArg(guestConfig.exports, {
       allowReadOnlyWorkspace: hasReadOnlyWorkspaceMountPlan(guestConfig.mountEnforcement),
+      requireWorkspace: workspaceMount !== null,
+      ...(workspaceMount === null ? { maxExports: 6 } : {}),
     })}`,
     `awf.vsock-port=${port}`,
-    `awf.guest-ip=${networkPlan.guestIp}`,
-    `awf.guest-prefix=${networkPlan.guestPrefixLength}`,
-    `awf.guest-gateway=${networkPlan.guestGatewayIp}`,
-    'awf.guest-interface=eth0',
+    ...(networkPlan
+      ? [
+          `awf.guest-ip=${networkPlan.guestIp}`,
+          `awf.guest-prefix=${networkPlan.guestPrefixLength}`,
+          `awf.guest-gateway=${networkPlan.guestGatewayIp}`,
+          'awf.guest-interface=eth0',
+        ]
+      : []),
   ].join(' ');
 }
 

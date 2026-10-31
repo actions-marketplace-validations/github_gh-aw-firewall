@@ -105,14 +105,25 @@ function parseProviderModelMetadata(provider, json, options = {}) {
     if (!id) return null;
     const pricing = format === 'copilot' ? normalizeCopilotPricing(entry) : null;
     const promotion = format === 'copilot' ? normalizePromotion(entry) : null;
+    const displayName = entry.display_name || entry.displayName || (entry.id ? entry.name : null);
     return {
       provider,
       id,
+      ...(typeof displayName === 'string' && displayName.length > 0 ? { displayName } : {}),
       source: 'provider',
       observedAt,
       ...(options.apiVersion ? { apiVersion: options.apiVersion } : {}),
       ...(entry.capabilities && typeof entry.capabilities === 'object'
         ? { capabilities: entry.capabilities }
+        : {}),
+      ...(Array.isArray(entry.supportedReasoningEfforts)
+        ? { supportedReasoningEfforts: [...entry.supportedReasoningEfforts] }
+        : {}),
+      ...(Array.isArray(entry.supported_endpoints)
+        ? { supportedEndpoints: [...entry.supported_endpoints] }
+        : {}),
+      ...(typeof entry.model_picker_enabled === 'boolean'
+        ? { modelPickerEnabled: entry.model_picker_enabled }
         : {}),
       ...(pricing ? { pricing } : {}),
       ...(promotion ? { promotion } : {}),
@@ -188,8 +199,20 @@ function getRuntimeModels(provider) {
   return runtimeCatalog[provider] || null;
 }
 
-function findRuntimeModel(provider, model) {
-  const records = getRuntimeModels(provider);
+function getWireApi(record) {
+  if (!Array.isArray(record.supportedEndpoints) || record.supportedEndpoints.length !== 1) return undefined;
+  if (record.supportedEndpoints[0] === '/responses') return 'responses';
+  if (record.supportedEndpoints[0] === '/chat/completions') return 'completions';
+  return undefined;
+}
+
+function getWireApiReflectFields(record) {
+  const wireApi = getWireApi(record);
+  return wireApi ? { wire_api: wireApi } : {};
+}
+
+function findRuntimeModel(provider, model, catalog = runtimeCatalog) {
+  const records = catalog[provider];
   if (!records || !model) return null;
   const lower = model.toLowerCase();
   const exact = records.find(record => record.id.toLowerCase() === lower);
@@ -198,8 +221,8 @@ function findRuntimeModel(provider, model) {
   return records.find(record => canonicalizeModel(record.id) === canonical) || null;
 }
 
-function resolveRuntimePricing(provider, model, inputTokens = 0) {
-  const record = findRuntimeModel(provider, model);
+function resolveRuntimePricing(provider, model, inputTokens = 0, catalog = runtimeCatalog) {
+  const record = findRuntimeModel(provider, model, catalog);
   if (!record?.pricing?.default) return null;
   const longContext = record.pricing.longContext;
   const threshold = record.pricing.default.threshold;
@@ -224,6 +247,7 @@ function getRuntimeCatalogSnapshot() {
       source: record.source,
       observed_at: record.observedAt,
       ...(record.apiVersion ? { api_version: record.apiVersion } : {}),
+      ...getWireApiReflectFields(record),
       ...(record.pricing ? {
         pricing: {
           default: record.pricing.default,
@@ -250,6 +274,7 @@ module.exports = {
   getRuntimeModels,
   findRuntimeModel,
   resolveRuntimePricing,
+  captureRuntimePricing: () => structuredClone(runtimeCatalog),
   getRuntimeCatalogSnapshot,
   testHelpers: {
     normalizeCopilotPricing,

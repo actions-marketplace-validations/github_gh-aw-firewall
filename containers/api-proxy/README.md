@@ -65,6 +65,43 @@ Agent-side routing for Vertex mode:
 - `GOOGLE_VERTEX_BASE_URL=http://api-proxy:10004`
 - `GOOGLE_API_KEY=google-api-key-placeholder-for-credential-isolation` (placeholder; real key remains in sidecar)
 
+## Upstream error diagnostics
+
+Terminal non-2xx upstream responses are logged as `upstream_error_response`
+records containing the sanitized response headers and a redacted, size-capped
+copy of the response body (`AWF_MAX_ERROR_RESPONSE_CAPTURE_BYTES`, default
+64 KiB). Retryable buffered `400` attempts that are handled internally and
+retried do not emit a record. To make zero-token terminal `400` rejections
+attributable to the tool surface the agent sent (for example an MCP server whose
+`tools/list` failed), the same record also summarizes the request's `tools`
+array:
+
+- `request_tool_count` - number of tool definitions sent
+- `request_tool_names` - first 32 tool names (names only; no descriptions or schemas)
+- `request_unnamed_tool_count` - tool entries with no resolvable name
+
+When the captured body is complete (not truncated and not omitted) and parses
+as JSON - regardless of `Content-Type`, since Copilot sends JSON error
+envelopes as `text/plain` - the record also carries the provider's error
+identifiers as their own fields, so consumers never need to read
+`response_body`:
+
+- `error_code` - `error.code` (or `response.error.code` for Responses
+  `response.failed`, or the top-level `code` of a `type: "error"` event)
+- `error_type` - the matching `type`
+- `error_param` - the matching `param`
+
+Only string values matching `^[A-Za-z0-9_.:-]{1,64}$` are kept; `message` and
+all other fields are never copied. Keys without a valid value are omitted
+(never `null`).
+
+When AWF replaces the provider's rejection with its own envelope (Copilot's
+endpoint rejection rewritten to `model_endpoint_incompatible` or
+`unsupported_wire_api_feature`), `response_body` is AWF's replacement and
+`response_transformed` is `true`, but the error fields are taken from the
+provider's original body (and omitted when it has none), so AWF's code is
+never attributed to the provider.
+
 ## Security
 
 - Runs as non-root user (apiproxy)

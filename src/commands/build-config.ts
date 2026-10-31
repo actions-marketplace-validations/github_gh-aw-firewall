@@ -6,8 +6,17 @@ import { logger } from '../logger';
 import {
   CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS,
   CLOUD_HYPERVISOR_DEFAULT_BINARY,
+  CLOUD_HYPERVISOR_DEFAULT_MOUNT_POLICY,
   CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB,
   CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT,
+  CLOUD_HYPERVISOR_MOUNT_POLICIES,
+  type CloudHypervisorMountPolicy,
+  NVX_DEFAULT_MEMORY_MIB,
+  NVX_DEFAULT_MEMORY_MAX_BYTES,
+  NVX_DEFAULT_MOUNT_POLICY,
+  NVX_DEFAULT_PIDS_MAX,
+  NVX_MOUNT_POLICIES,
+  type NvxMountPolicy,
 } from '../types/runtime-options';
 
 /**
@@ -61,6 +70,7 @@ interface BuildConfigInputs {
   dnsServers: string[];
   dnsServersExplicit?: boolean;
   dnsOverHttps: string | undefined;
+  networkSubnet?: string;
   allowedUrls: string[] | undefined;
   memoryLimit: string | undefined;
   pidsLimit: number | undefined;
@@ -68,10 +78,9 @@ interface BuildConfigInputs {
   modelAliases: Record<string, string[]> | undefined;
   allowedModels: string[] | undefined;
   disallowedModels: string[] | undefined;
-  maxEffectiveTokens: number | undefined;
   maxAiCredits: number | undefined;
-  effectiveTokenModelMultipliers: Record<string, number> | undefined;
-  effectiveTokenDefaultModelMultiplier: number | undefined;
+  modelMultipliers: Record<string, number> | undefined;
+  defaultModelMultiplier: number | undefined;
   maxModelMultiplierCap?: number;
   maxRuns: number | undefined;
   maxPermissionDenied: number | undefined;
@@ -101,6 +110,7 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     dnsServers,
     dnsServersExplicit,
     dnsOverHttps,
+    networkSubnet,
     allowedUrls,
     memoryLimit,
     pidsLimit,
@@ -108,10 +118,9 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     modelAliases,
     allowedModels,
     disallowedModels,
-    maxEffectiveTokens,
     maxAiCredits,
-    effectiveTokenModelMultipliers,
-    effectiveTokenDefaultModelMultiplier,
+    modelMultipliers,
+    defaultModelMultiplier,
     maxModelMultiplierCap,
     maxRuns,
     maxPermissionDenied,
@@ -124,6 +133,7 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
   const chrootIdentity = buildChrootIdentity(options);
   const dind = buildDindConfig(options);
   const cloudHypervisor = buildCloudHypervisorConfig(options);
+  const nvx = buildNvxConfig(options);
   const apiCredentials = resolveApiCredentials(options, {
     resolvedCopilotApiTarget,
     resolvedCopilotApiBasePath,
@@ -163,9 +173,15 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     auditDir: (options.auditDir as string | undefined) || process.env.AWF_AUDIT_DIR,
     sessionStateDir:
       (options.sessionStateDir as string | undefined) || process.env.AWF_SESSION_STATE_DIR,
+    commandOutputCaptureDir: options.captureCommandOutput as string | undefined,
+    commandOutputCaptureMaxBytes: options.captureCommandOutputMaxBytes === undefined
+      ? undefined
+      : Number(options.captureCommandOutputMaxBytes),
     runnerToolCachePath: options.runnerToolCachePath as string | undefined,
     enableHostAccess: options.enableHostAccess as boolean,
     networkIsolation: options.networkIsolation as boolean | undefined,
+    networkSubnet,
+    verifySbxEgress: options.verifySbxEgress as boolean | undefined,
     topologyAttach: options.topologyAttach as string[] | undefined,
     localhostDetected,
     allowHostPorts: options.allowHostPorts as string | undefined,
@@ -179,18 +195,24 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     apiProxyCaCert: options.apiProxyCaCert as string | undefined,
     modelFallback:
       options.modelFallback as { enabled?: boolean; strategy?: 'middle_power' } | undefined,
+    fallbackModels: options.fallbackModels as string[] | undefined,
+    experimentalModelRouting: options.experimentalModelRouting as boolean | undefined,
+    modelRouting: options.modelRouting as WrapperConfig['modelRouting'],
     requestedModel: options.requestedModel as string | undefined,
     anthropicAutoCache: options.anthropicAutoCache as boolean,
     anthropicCacheTailTtl: options.anthropicCacheTailTtl as '5m' | '1h' | undefined,
+    claudeHostedWeb: options.claudeHostedWeb as WrapperConfig['claudeHostedWeb'],
+    codexHostedWeb: options.codexHostedWeb as WrapperConfig['codexHostedWeb'],
     modelAliases,
     allowedModels,
     disallowedModels,
-    maxEffectiveTokens,
     maxAiCredits,
     defaultAiCreditsPricing: options.defaultAiCreditsPricing as WrapperConfig['defaultAiCreditsPricing'],
     apiProxyProviders: options.apiProxyProviders as WrapperConfig['apiProxyProviders'],
-    effectiveTokenModelMultipliers,
-    effectiveTokenDefaultModelMultiplier,
+    modelPricingCatalog: options.modelPricingCatalog as WrapperConfig['modelPricingCatalog'],
+    modelCatalogue: options.modelCatalogue as WrapperConfig['modelCatalogue'],
+    modelMultipliers,
+    defaultModelMultiplier,
     maxModelMultiplierCap,
     maxRuns,
     maxPermissionDenied,
@@ -218,6 +240,15 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     copilotByokSessionId: options.copilotByokSessionId as string | undefined,
     difcProxyHost: options.difcProxyHost as string | undefined,
     difcProxyCaCert: options.difcProxyCaCert as string | undefined,
+    maxGithubApiPointsRest: options.maxGithubApiPointsRest === undefined
+      ? undefined
+      : Number(options.maxGithubApiPointsRest),
+    maxGithubApiPointsGraphql: options.maxGithubApiPointsGraphql === undefined
+      ? undefined
+      : Number(options.maxGithubApiPointsGraphql),
+    maxNumToolCalls: options.maxNumToolCalls === undefined
+      ? undefined
+      : Number(options.maxNumToolCalls),
     diagnosticLogs: (options.diagnosticLogs as boolean) || false,
     awfDockerHost: options.dockerHost as string | undefined,
     upstreamProxy,
@@ -229,8 +260,10 @@ export function buildConfig(inputs: BuildConfigInputs): WrapperConfig {
     chrootIdentity,
     dind,
     cloudHypervisor,
+    nvx,
     enclaves: normalizeEnclavesConfig(
       options.enclaves as AwfFileConfig['enclaves'] | undefined,
+      { primaryRuntime: options.containerRuntime as string | undefined },
     ),
   };
 }
@@ -262,13 +295,20 @@ function buildCloudHypervisorConfig(
 ): WrapperConfig['cloudHypervisor'] {
   const selected = options.containerRuntime === 'cloud-hypervisor';
   const configured = options.cloudHypervisorPreview === true
+    || options.cloudHypervisorDevelopmentAllowUnattestedArtifacts === true
+    || options.cloudHypervisorEnclaveDebugPublic === true
     || [
+      'cloudHypervisorMountPolicy',
       'cloudHypervisorBinary',
       'cloudHypervisorKernel',
       'cloudHypervisorRootfs',
       'cloudHypervisorSupervisor',
+      'cloudHypervisorArtifactManifest',
+      'cloudHypervisorArtifactManifestBundle',
+      'cloudHypervisorArtifactReleaseTag',
       'cloudHypervisorVcpus',
       'cloudHypervisorMemoryMib',
+      'cloudHypervisorScratchMib',
       'cloudHypervisorApiTimeoutMs',
       'cloudHypervisorBinarySha256',
       'cloudHypervisorVirtiofsdSha256',
@@ -288,11 +328,21 @@ function buildCloudHypervisorConfig(
 
   return {
     previewEnabled: options.cloudHypervisorPreview === true,
+    mountPolicy: parseCloudHypervisorMountPolicy(options.cloudHypervisorMountPolicy),
     cloudHypervisorBinary:
       (options.cloudHypervisorBinary as string | undefined) ?? CLOUD_HYPERVISOR_DEFAULT_BINARY,
     kernelPath: options.cloudHypervisorKernel as string | undefined,
     rootfsPath: options.cloudHypervisorRootfs as string | undefined,
     supervisorPath: options.cloudHypervisorSupervisor as string | undefined,
+    artifactManifestPath: options.cloudHypervisorArtifactManifest as string | undefined,
+    artifactManifestBundlePath:
+      options.cloudHypervisorArtifactManifestBundle as string | undefined,
+    artifactReleaseTag: options.cloudHypervisorArtifactReleaseTag as string | undefined,
+    developmentAllowUnattestedArtifacts:
+      options.cloudHypervisorDevelopmentAllowUnattestedArtifacts === true,
+    ...(options.cloudHypervisorEnclaveDebugPublic !== undefined
+      ? { enclaveDebugPublic: options.cloudHypervisorEnclaveDebugPublic === true }
+      : {}),
     vcpuCount: parsePositiveIntegerOption(
       options.cloudHypervisorVcpus,
       '--cloud-hypervisor-vcpus',
@@ -303,6 +353,9 @@ function buildCloudHypervisorConfig(
       '--cloud-hypervisor-memory-mib',
       CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB,
     ),
+    ...(options.cloudHypervisorScratchMib !== undefined
+      ? { scratchMib: parseCloudHypervisorScratchMib(options.cloudHypervisorScratchMib) }
+      : {}),
     apiTimeoutMs: parsePositiveIntegerOption(
       options.cloudHypervisorApiTimeoutMs,
       '--cloud-hypervisor-api-timeout-ms',
@@ -312,6 +365,106 @@ function buildCloudHypervisorConfig(
       ? sha256
       : undefined,
   };
+}
+
+function parseNvxMountPolicy(value: unknown): NvxMountPolicy {
+  const policy = value ?? NVX_DEFAULT_MOUNT_POLICY;
+  if (
+    typeof policy !== 'string' ||
+    !NVX_MOUNT_POLICIES.includes(policy as NvxMountPolicy)
+  ) {
+    throw new Error(
+      '--nvx-mount-policy must be "workspace-only" or "workspace-and-tool-cache"',
+    );
+  }
+  return policy as NvxMountPolicy;
+}
+
+function parseCloudHypervisorMountPolicy(value: unknown): CloudHypervisorMountPolicy {
+  const policy = value ?? CLOUD_HYPERVISOR_DEFAULT_MOUNT_POLICY;
+  if (
+    typeof policy !== 'string' ||
+    !CLOUD_HYPERVISOR_MOUNT_POLICIES.includes(policy as CloudHypervisorMountPolicy)
+  ) {
+    throw new Error(
+      '--cloud-hypervisor-mount-policy must be "workspace-only" or "workspace-and-tool-cache"',
+    );
+  }
+  return policy as CloudHypervisorMountPolicy;
+}
+
+function parseCloudHypervisorScratchMib(value: unknown): number {
+  const parsed = parsePositiveIntegerOption(value, '--cloud-hypervisor-scratch-mib', 1);
+  if (parsed > 0xffffffff) {
+    throw new Error('--cloud-hypervisor-scratch-mib must be at most 4294967295');
+  }
+  return parsed;
+}
+
+/**
+ * Builds the NVX preview one-shot microVM runtime config (artifacts plus
+ * memory/pids/scratch settings). `--container-runtime nvx` requires
+ * explicit `--nvx-preview` opt-in and full artifact configuration, enforced
+ * by `assertNvxRuntimeCompatibility` in `src/nvx/runtime-validation.ts`.
+ */
+function buildNvxConfig(
+  options: Record<string, unknown>,
+): WrapperConfig['nvx'] {
+  const selected = options.containerRuntime === 'nvx';
+  const configured = options.nvxPreview === true
+    || [
+      'nvxMountPolicy',
+      'nvxLayer',
+      'nvxArtifactManifest',
+      'nvxArtifactManifestBundle',
+      'nvxSignerWorkflow',
+      'nvxOpenvmm',
+      'nvxKernel',
+      'nvxInitramfs',
+      'nvxMemoryMib',
+      'nvxMemoryMaxBytes',
+      'nvxPidsMax',
+      'nvxScratchBytes',
+    ].some((key) => options[key] !== undefined);
+  if (!selected && !configured) return undefined;
+
+  return {
+    previewEnabled: options.nvxPreview === true,
+    mountPolicy: parseNvxMountPolicy(options.nvxMountPolicy),
+    layerPath: options.nvxLayer as string | undefined,
+    artifactManifestPath: options.nvxArtifactManifest as string | undefined,
+    artifactManifestBundlePath: options.nvxArtifactManifestBundle as string | undefined,
+    signerWorkflow: options.nvxSignerWorkflow as string | undefined,
+    openvmmPath: options.nvxOpenvmm as string | undefined,
+    kernelPath: options.nvxKernel as string | undefined,
+    initramfsPath: options.nvxInitramfs as string | undefined,
+    memoryMib: parsePositiveIntegerOption(
+      options.nvxMemoryMib,
+      '--nvx-memory-mib',
+      NVX_DEFAULT_MEMORY_MIB,
+    ),
+    memoryMaxBytes: parsePositiveIntegerOption(
+      options.nvxMemoryMaxBytes,
+      '--nvx-memory-max-bytes',
+      NVX_DEFAULT_MEMORY_MAX_BYTES,
+    ),
+    pidsMax: parsePositiveIntegerOption(
+      options.nvxPidsMax,
+      '--nvx-pids-max',
+      NVX_DEFAULT_PIDS_MAX,
+    ),
+    scratchBytes: options.nvxScratchBytes === undefined
+      ? undefined
+      : parseScratchBytesOption(options.nvxScratchBytes),
+  };
+}
+
+function parseScratchBytesOption(value: unknown): number {
+  const parsed = typeof value === 'number' ? value : Number(value);
+  if (!Number.isInteger(parsed) || parsed <= 0) {
+    throw new Error('--nvx-scratch-bytes must be a positive integer');
+  }
+  return parsed;
 }
 
 function buildChrootIdentity(

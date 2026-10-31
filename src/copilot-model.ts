@@ -1,3 +1,7 @@
+import lifecycle from './model-information.compat.generated.json';
+import naming from './model-information.naming.generated.json';
+import { resolveIdentity } from './model-information-contract/resolution';
+
 interface CopilotModelValidationSuccess {
   valid: true;
   resolvedModel: string;
@@ -13,80 +17,23 @@ type CopilotModelValidationResult =
   | CopilotModelValidationSuccess
   | CopilotModelValidationFailure;
 
-/**
- * Normalize separators (`.` and `_`) to `-` for separator-agnostic model matching.
- * Mirrors the canonicalization used by api-proxy `canonicalizeModel()` helpers.
- */
-function normalizeSeparators(s: string): string {
-  return s.replace(/[._]/g, '-');
-}
+const RETIRED_COPILOT_MODEL_ALIASES = new Map(Object.entries(lifecycle.retired));
 
-const RETIRED_COPILOT_MODEL_ALIASES: Record<string, string> = {
-  'gpt-5-codex': 'gpt-5.3-codex',
+/**
+ * Compatibility projection of canonical Copilot CLI availability, plus the
+ * legacy `auto` selector. This does not assert native-API or Copilot-API support.
+ * Author facts in shared/model-information/sources and run models:generate.
+ */
+const SUPPORTED_COPILOT_MODELS = new Set(lifecycle.supported);
+
+const CLI_NAMING = {
+  models: naming.models.filter(model => SUPPORTED_COPILOT_MODELS.has(model.identity.rawId) ||
+    RETIRED_COPILOT_MODEL_ALIASES.has(model.identity.rawId)),
 };
-
-/**
- * Single source of truth for all Copilot CLI completion models that AWF accepts
- * as a `COPILOT_MODEL` value.  The host-side validator rejects any value not in
- * this set (or its separator-normalised form) before containers start.
- *
- * When **adding** a new Copilot CLI model here, also update:
- *   - `containers/api-proxy/ai-credits-pricing.js`  (AI-credits billing)
- *   - `docs/model-api-mapping.json`                  (endpoint routing, OpenAI/Anthropic only)
- *
- * When **retiring** a model, move it to `RETIRED_COPILOT_MODEL_ALIASES` (below)
- * and mirror the change in `containers/api-proxy/guards/retired-model-guard.js`.
- *
- * A CI guard in `src/copilot-model-catalog-sync.test.ts` fails if any model
- * present in `ai-credits-pricing.js` is missing from this set (and is not
- * explicitly listed as a non-CLI model in the test's exclusion set).
- */
-const SUPPORTED_COPILOT_MODELS = new Set([
-  'auto',
-  'gpt-4',
-  'gpt-4.1',
-  'gpt-4.5',
-  'gpt-4o',
-  'gpt-4o-mini',
-  'gpt-5.1',
-  'gpt-5.2',
-  'gpt-5.2-codex',
-  'gpt-5.3-codex',
-  'gpt-5.4',
-  'gpt-5.4-mini',
-  'gpt-5.5',
-  'gpt-5.6-luna',
-  'gpt-5.6-sol',
-  'gpt-5.6-terra',
-  'gpt-5-mini',
-  'o3',
-  'o3-mini',
-  'claude-fable-5',
-  'claude-haiku-4.5',
-  'claude-mythos-5',
-  'claude-opus-4.8',
-  'claude-opus-5',
-  'claude-sonnet-5',
-  'claude-sonnet-4.5',
-  'claude-sonnet-4.6',
-  'gemini-3.1-pro-preview',
-  'gemini-3.5-flash',
-  'mai-code-1-flash',
-]);
-
-/** Maps separator-normalized names (all `-`) → canonical model name. */
-const NORMALIZED_TO_CANONICAL = new Map<string, string>(
-  [...SUPPORTED_COPILOT_MODELS].map(m => [normalizeSeparators(m), m]),
-);
-
-/** Maps separator-normalized retired alias keys → canonical replacement. */
-const NORMALIZED_RETIRED_ALIASES = new Map<string, string>(
-  Object.entries(RETIRED_COPILOT_MODEL_ALIASES).map(([k, v]) => [normalizeSeparators(k), v]),
-);
 
 function suggestionFor(model: string): string | undefined {
   let best: { candidate: string; distance: number } | undefined;
-  for (const candidate of SUPPORTED_COPILOT_MODELS) {
+  for (const candidate of lifecycle.suggestionOrder) {
     const distance = levenshtein(model, candidate);
     if (!best || distance < best.distance) {
       best = { candidate, distance };
@@ -124,11 +71,13 @@ export function validateCopilotModel(rawModel: string): CopilotModelValidationRe
     return { valid: true, resolvedModel: trimmed };
   }
   const normalized = trimmed.toLowerCase();
-  const separatorNormalized = normalizeSeparators(normalized);
+  const resolution = resolveIdentity(trimmed, { provider: 'copilot', channel: 'copilot-cli' },
+    CLI_NAMING, { caseInsensitive: true, separators: true, providerPrefix: false });
+  // CLI validation deliberately excludes API parameter syntax and family-level guesses.
+  const canonicalModel = !resolution.parameterSuffix &&
+    ['exact', 'alias'].includes(resolution.matchKind) ? resolution.wireId : undefined;
 
-  // Check retired aliases (exact, then separator-normalized)
-  const retiredReplacement =
-    RETIRED_COPILOT_MODEL_ALIASES[normalized] ?? NORMALIZED_RETIRED_ALIASES.get(separatorNormalized);
+  const retiredReplacement = canonicalModel && RETIRED_COPILOT_MODEL_ALIASES.get(canonicalModel);
   if (retiredReplacement) {
     return {
       valid: false,
@@ -137,16 +86,10 @@ export function validateCopilotModel(rawModel: string): CopilotModelValidationRe
     };
   }
 
-  // Exact match
-  if (SUPPORTED_COPILOT_MODELS.has(normalized)) {
-    return { valid: true, resolvedModel: normalized };
-  }
-
-  // Separator-normalized match: treat `.`, `_`, `-` as equivalent
-  const canonicalModel = NORMALIZED_TO_CANONICAL.get(separatorNormalized);
-  if (canonicalModel) {
+  if (canonicalModel && SUPPORTED_COPILOT_MODELS.has(canonicalModel)) {
     return { valid: true, resolvedModel: canonicalModel };
   }
+  if (normalized === 'auto') return { valid: true, resolvedModel: 'auto' };
 
   const suggested = suggestionFor(normalized);
   return {

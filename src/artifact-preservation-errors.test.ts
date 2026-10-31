@@ -2,7 +2,7 @@
  * Error-path and uncovered-branch coverage for artifact-preservation.ts.
  *
  * Targets the following uncovered lines identified in the coverage report:
- *   21  – catch block in preserveIptablesAudit (fs.copyFileSync throws)
+ *   preserveIptablesAudit – safe destination open failure
  *   62  – catch block in preserveDirectory when runtimeDir chmod fails
  *   78  – catch block in preserveDirectory when no-runtimeDir renameSync fails
  *  101  – catch block for agent-logs renameSync in preserveCleanupArtifacts
@@ -23,6 +23,11 @@ jest.mock('./artifact-permissions', () => {
   };
 });
 
+jest.mock('./resolved-config-artifact', () => ({
+  ...jest.requireActual('./resolved-config-artifact'),
+  openArtifactDirectory: jest.fn(jest.requireActual('./resolved-config-artifact').openArtifactDirectory),
+}));
+
 // Wrap the fs methods we need to control with jest.fn() so individual tests
 // can inject one-shot errors without using jest.spyOn (which fails on non-
 // configurable properties in Jest's module sandbox).
@@ -42,6 +47,7 @@ import * as path from 'path';
 import * as os from 'os';
 import { fixArtifactPermissionsForRootless } from './artifact-permissions';
 import { logger } from './logger';
+import { openArtifactDirectory } from './resolved-config-artifact';
 import { mockExecaSync } from './test-helpers/mock-execa.test-utils';
 import {
   preserveIptablesAudit,
@@ -77,7 +83,7 @@ describe('artifact-preservation – error paths', () => {
   // ─── preserveIptablesAudit ──────────────────────────────────────────────
 
   describe('preserveIptablesAudit', () => {
-    it('does not throw when fs.copyFileSync errors (line 21)', () => {
+    it('reports incomplete preservation when safe destination open fails', () => {
       const workDir = makeTempDir('awf-audit-');
       try {
         const initSignalDir = path.join(workDir, 'init-signal');
@@ -87,11 +93,12 @@ describe('artifact-preservation – error paths', () => {
         const auditDir = path.join(workDir, 'audit');
         realFs.mkdirSync(auditDir);
 
-        mockCopyFileSync.mockImplementationOnce(() => {
-          throw new Error('ENOSPC: no space left on device');
+        jest.mocked(openArtifactDirectory).mockImplementationOnce(() => {
+          throw new Error('EACCES: permission denied');
         });
 
-        expect(() => preserveIptablesAudit(workDir, auditDir)).not.toThrow();
+        expect(preserveIptablesAudit(workDir, auditDir)).toBe(false);
+        expect(fs.existsSync(path.join(auditDir, 'iptables-audit.txt'))).toBe(false);
       } finally {
         realFs.rmSync(workDir, { recursive: true, force: true });
       }
@@ -126,8 +133,41 @@ describe('artifact-preservation – error paths', () => {
       }
     });
 
+    it('still reports squid logs as preserved when the post-rename chmod is denied', () => {
+      const workDir = makeTempDir();
+      const timestamp = path.basename(workDir).replace('awf-', '');
+      const destination = path.join(os.tmpdir(), `squid-logs-${timestamp}`);
+      const infoSpy = jest.spyOn(logger, 'info').mockImplementation(() => {});
+      const warnSpy = jest.spyOn(logger, 'warn').mockImplementation(() => {});
+      try {
+        const squidLogsDir = path.join(workDir, 'squid-logs');
+        realFs.mkdirSync(squidLogsDir);
+        realFs.writeFileSync(path.join(squidLogsDir, 'access.log'), 'log line');
+
+        mockExecaSync.mockImplementationOnce(() => {
+          throw Object.assign(new Error('Command failed with exit code 1: chmod -R a+rX'), {
+            stderr: `chmod: changing permissions of '${destination}': Operation not permitted`,
+            exitCode: 1,
+          });
+        });
+
+        expect(() => preserveCleanupArtifacts(workDir)).not.toThrow();
+
+        expect(realFs.existsSync(path.join(destination, 'access.log'))).toBe(true);
+        expect(infoSpy).toHaveBeenCalledWith(
+          expect.stringContaining(`Squid logs preserved at: ${destination}`),
+        );
+        expect(warnSpy).not.toHaveBeenCalled();
+      } finally {
+        infoSpy.mockRestore();
+        warnSpy.mockRestore();
+        realFs.rmSync(workDir, { recursive: true, force: true });
+        realFs.rmSync(destination, { recursive: true, force: true });
+      }
+    });
+
     it('keeps the primary failure as the last visible diagnostic when runtimeDir chmod is denied', () => {
-      // proxyLogsDir squid-logs uses runtimeDirMustExist:false → chmod always called.
+      // proxyLogsDir squid-logs repairs the shared root before inspecting direct files.
       // With no api-proxy-logs or cli-proxy-logs subdirs, squid-logs chmod is first.
       const externalDir = makeTempDir();
       const workDir = makeTempDir();

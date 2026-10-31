@@ -1,6 +1,7 @@
 import { buildConfig } from '../commands/build-config';
 import { mapAwfFileConfigToCliOptions } from '../config-mapper';
 import { validateAwfFileConfig } from '../config-file';
+import { buildMinimalBuildConfigInput } from '../test-helpers/build-config.test-utils';
 import {
   CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS,
   CLOUD_HYPERVISOR_DEFAULT_BINARY,
@@ -9,47 +10,17 @@ import {
 } from '../types/runtime-options';
 
 function buildCloudHypervisorConfig(options: Record<string, unknown>) {
-  return buildConfig({
+  const input = buildMinimalBuildConfigInput({
     options: {
-      keepContainers: false,
-      buildLocal: false,
-      skipPull: false,
+      ...buildMinimalBuildConfigInput().options,
       imageRegistry: 'registry',
-      imageTag: 'latest',
-      envAll: false,
-      sslBump: false,
-      enableDind: false,
-      enableDlp: false,
       ...options,
     },
     agentCommand: 'echo test',
-    logLevel: 'info',
     allowedDomains: [],
-    blockedDomains: [],
-    localhostDetected: false,
-    additionalEnv: {},
-    volumeMounts: undefined,
-    upstreamProxy: undefined,
     dnsServers: [],
-    dnsOverHttps: undefined,
-    allowedUrls: undefined,
-    memoryLimit: undefined,
-    pidsLimit: undefined,
-    agentImage: undefined,
-    modelAliases: undefined,
-    allowedModels: undefined,
-    disallowedModels: undefined,
-    maxEffectiveTokens: undefined,
-    maxAiCredits: undefined,
-    effectiveTokenModelMultipliers: undefined,
-    effectiveTokenDefaultModelMultiplier: undefined,
-    maxRuns: undefined,
-    maxPermissionDenied: undefined,
-    maxCacheMisses: undefined,
-    resolvedCopilotApiTarget: undefined,
-    resolvedCopilotApiBasePath: undefined,
-    dockerHostPathPrefix: undefined,
-  }).cloudHypervisor;
+  });
+  return buildConfig(input).cloudHypervisor;
 }
 
 describe('Cloud Hypervisor configuration (foundation only)', () => {
@@ -58,12 +29,17 @@ describe('Cloud Hypervisor configuration (foundation only)', () => {
     const mapped = mapAwfFileConfigToCliOptions({
       cloudHypervisor: {
         previewEnabled: true,
+        mountPolicy: 'workspace-and-tool-cache',
         cloudHypervisorBinary: '/opt/cloud-hypervisor',
         kernelPath: '/opt/vmlinux',
         rootfsPath: '/opt/rootfs.ext4',
         supervisorPath: '/opt/awf-supervisor',
+        artifactManifestPath: '/opt/manifest.json',
+        artifactManifestBundlePath: '/opt/manifest.sigstore.jsonl',
+        artifactReleaseTag: 'v0.23.1',
         vcpuCount: 4,
         memoryMib: 1024,
+        scratchMib: 96,
         apiTimeoutMs: 8000,
         sha256: { virtiofsd: digest, kernel: digest, supervisor: digest },
       },
@@ -71,12 +47,17 @@ describe('Cloud Hypervisor configuration (foundation only)', () => {
 
     expect(mapped).toEqual(expect.objectContaining({
       cloudHypervisorPreview: true,
+      cloudHypervisorMountPolicy: 'workspace-and-tool-cache',
       cloudHypervisorBinary: '/opt/cloud-hypervisor',
       cloudHypervisorKernel: '/opt/vmlinux',
       cloudHypervisorRootfs: '/opt/rootfs.ext4',
       cloudHypervisorSupervisor: '/opt/awf-supervisor',
+      cloudHypervisorArtifactManifest: '/opt/manifest.json',
+      cloudHypervisorArtifactManifestBundle: '/opt/manifest.sigstore.jsonl',
+      cloudHypervisorArtifactReleaseTag: 'v0.23.1',
       cloudHypervisorVcpus: 4,
       cloudHypervisorMemoryMib: 1024,
+      cloudHypervisorScratchMib: 96,
       cloudHypervisorApiTimeoutMs: 8000,
       cloudHypervisorVirtiofsdSha256: digest,
       cloudHypervisorKernelSha256: digest,
@@ -87,10 +68,15 @@ describe('Cloud Hypervisor configuration (foundation only)', () => {
   it('applies explicit safe defaults when Cloud Hypervisor is configured', () => {
     expect(buildCloudHypervisorConfig({ cloudHypervisorPreview: true })).toEqual({
       previewEnabled: true,
+      mountPolicy: 'workspace-only',
       cloudHypervisorBinary: CLOUD_HYPERVISOR_DEFAULT_BINARY,
       kernelPath: undefined,
       rootfsPath: undefined,
       supervisorPath: undefined,
+      artifactManifestPath: undefined,
+      artifactManifestBundlePath: undefined,
+      artifactReleaseTag: undefined,
+      developmentAllowUnattestedArtifacts: false,
       vcpuCount: CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT,
       memoryMib: CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB,
       apiTimeoutMs: CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS,
@@ -103,6 +89,42 @@ describe('Cloud Hypervisor configuration (foundation only)', () => {
       containerRuntime: 'gvisor',
       cloudHypervisorPreview: false,
     })).toBeUndefined();
+  });
+
+  it('accepts an explicit scratch bound without introducing a default', () => {
+    expect(buildCloudHypervisorConfig({ cloudHypervisorScratchMib: '96' })?.scratchMib).toBe(96);
+    expect(buildCloudHypervisorConfig({ cloudHypervisorPreview: true }))
+      .not.toHaveProperty('scratchMib');
+    expect(validateAwfFileConfig({ cloudHypervisor: { scratchMib: 96 } })).toEqual([]);
+  });
+
+  it('maps and validates host-only public enclave debug opt-in without enabling it by default', () => {
+    const options = mapAwfFileConfigToCliOptions({ cloudHypervisor: { enclaveDebugPublic: true } });
+    expect(options.cloudHypervisorEnclaveDebugPublic).toBe(true);
+    expect(buildCloudHypervisorConfig(options)?.enclaveDebugPublic).toBe(true);
+    expect(buildCloudHypervisorConfig({ cloudHypervisorPreview: true }))
+      .not.toHaveProperty('enclaveDebugPublic');
+    expect(buildCloudHypervisorConfig({ cloudHypervisorEnclaveDebugPublic: false })).toBeUndefined();
+    expect(validateAwfFileConfig({ cloudHypervisor: { enclaveDebugPublic: true } })).toEqual([]);
+    expect(validateAwfFileConfig({ cloudHypervisor: { enclaveDebugPublic: 'true' } })).not.toEqual([]);
+  });
+
+  it.each([0, -1, 1.5, '', 'bad', Infinity, 4294967296])(
+    'rejects invalid scratch bound %s from CLI and config file',
+    (value) => {
+      expect(() => buildCloudHypervisorConfig({ cloudHypervisorScratchMib: value }))
+        .toThrow(/--cloud-hypervisor-scratch-mib/);
+      expect(validateAwfFileConfig({ cloudHypervisor: { scratchMib: value } }))
+        .not.toEqual([]);
+    },
+  );
+
+  it('treats an explicitly configured secure mount policy as Cloud Hypervisor configuration', () => {
+    expect(buildCloudHypervisorConfig({
+      cloudHypervisorMountPolicy: 'workspace-only',
+    })).toEqual(expect.objectContaining({
+      mountPolicy: 'workspace-only',
+    }));
   });
 
   it('validates positive resources, digests, and unknown keys', () => {
@@ -119,6 +141,17 @@ describe('Cloud Hypervisor configuration (foundation only)', () => {
       .toContain('config.cloudHypervisor.sha256.kernel must match pattern "^[A-Fa-f0-9]{64}$"');
     expect(validateAwfFileConfig({ cloudHypervisor: { unsupported: true } }))
       .toContain('config.cloudHypervisor.unsupported is not supported');
+    expect(validateAwfFileConfig({ cloudHypervisor: { mountPolicy: 'automatic' } }))
+      .toContain('config.cloudHypervisor.mountPolicy must be one of: workspace-only, workspace-and-tool-cache');
+  });
+
+  it('rejects unknown CLI mount policies', () => {
+    expect(() => buildCloudHypervisorConfig({
+      containerRuntime: 'cloud-hypervisor',
+      cloudHypervisorMountPolicy: 'automatic',
+    })).toThrow(
+      '--cloud-hypervisor-mount-policy must be "workspace-only" or "workspace-and-tool-cache"',
+    );
   });
 
   it('accepts "cloud-hypervisor" as a container runtime', () => {

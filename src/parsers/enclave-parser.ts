@@ -8,6 +8,7 @@ import {
   type RawEnclaveScriptEntry,
   type RawEnclavesConfig,
 } from '../types/enclave-options';
+import { resolveRunSandboxBackend, validateRunSandboxBackend } from '../enclave/run-backend';
 
 function isScriptEntry(entry: RawEnclaveEntry): entry is RawEnclaveScriptEntry {
   return Object.prototype.hasOwnProperty.call(entry, 'script');
@@ -60,9 +61,13 @@ function entryCommon(entry: RawEnclaveEntry | undefined): object {
  * Structural violations fail closed at parse time: an entry must carry exactly
  * one `script` or `agent` key, and at most one entry may exist per executor
  * kind.
+ * Production assembly supplies the primary selection to inherit omitted
+ * runtimes and reject conflicts. Without it this is a structural normalizer
+ * for trusted executor-level tooling; run validation still checks consistency.
  */
 export function normalizeEnclavesConfig(
   raw: RawEnclavesConfig | undefined,
+  selection?: { primaryRuntime?: string },
 ): EnclavesConfig | undefined {
   if (!raw) return undefined;
   if (!Array.isArray(raw)) {
@@ -79,20 +84,33 @@ export function normalizeEnclavesConfig(
       throw new Error('each enclaves entry must declare exactly one "script" or "agent" key');
     }
     if (scriptEntry) {
+      if (entry.dynamic !== undefined) {
+        throw new Error('enclaves[].dynamic is agent-only and cannot be declared on a "script" entry');
+      }
       if (script) throw new Error('enclaves may declare at most one "script" entry');
       script = entry;
     } else if (agentEntry) {
+      if (entry.dynamic !== undefined && (entry.repos ?? []).length > 0) {
+        throw new Error('enclaves[].dynamic and enclaves[].repos are mutually exclusive on the same entry');
+      }
       if (agent) throw new Error('enclaves may declare at most one "agent" entry');
       agent = entry;
     }
   }
 
-  return {
+  const backend = selection && raw.length > 0
+    ? resolveRunSandboxBackend(selection.primaryRuntime)
+    : undefined;
+  if (backend === 'nvx') {
+    throw new Error('NVX enclaves are not implemented; no runtime fallback is permitted');
+  }
+  const normalized: EnclavesConfig = {
     enabled: raw.length > 0,
     privateRepos: mergeRepositories(raw),
     executors: {
       script: {
         ...ENCLAVE_SCRIPT_EXECUTOR_DEFAULTS,
+        ...(backend !== undefined && { runtime: backend }),
         ...entryCommon(script),
         ...script?.script,
         enabled: script !== undefined,
@@ -100,11 +118,19 @@ export function normalizeEnclavesConfig(
       },
       agent: {
         ...ENCLAVE_AGENT_EXECUTOR_DEFAULTS,
+        ...(backend !== undefined && { runtime: backend }),
         ...entryCommon(agent),
         ...agent?.agent,
         enabled: agent !== undefined,
         timeout: agent?.timeout ?? ENCLAVE_AGENT_EXECUTOR_DEFAULTS.timeout,
+        repos: agent?.repos ?? [],
+        ...(agent?.dynamic !== undefined && { dynamic: agent.dynamic }),
       },
     },
   };
+  if (selection) {
+    const errors = validateRunSandboxBackend(selection.primaryRuntime, normalized);
+    if (errors.length) throw new Error(errors.join('; '));
+  }
+  return normalized;
 }

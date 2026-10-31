@@ -11,6 +11,7 @@ import {
   type GuestProtocolFrame,
 } from './guest-protocol';
 import { GuestExecutionError, MicrovmVsockClient } from './vsock-client';
+import { classifyGuestRejection, type GuestExecutionDiagnostics } from './execution-diagnostics';
 
 async function createServer(
   handler: (frame: GuestProtocolFrame, socket: net.Socket) => void,
@@ -80,6 +81,95 @@ async function createRawServer(
 }
 
 describe('MicrovmVsockClient', () => {
+  it.each([
+    ['resolve workspace mount: PRIVATE_PATH PRIVATE_TOKEN', 'workspace-resolution'],
+    ['resolve cwd: PRIVATE_PATH', 'cwd-resolution'],
+    ['cwd must remain under the workspace mount', 'cwd-validation'],
+    ['command not found in PATH: PRIVATE_ARGV', 'command-resolution'],
+    ['fork/exec /PRIVATE_COMMAND: permission denied', 'process-start'],
+    ['PRIVATE_ERROR', 'unknown'],
+  ])('classifies existing guest errors without retaining dynamic details: %s', (message, expected) => {
+    expect(classifyGuestRejection(message)).toBe(expected);
+  });
+  it.each(['disconnect', 'guest-error', 'output-failure', 'partial-frame', 'exit', 'signal', 'timeout'] as const)(
+    'reports bounded execution metadata for %s without disclosing payload or error text', async (scenario) => {
+      const events: GuestExecutionDiagnostics[] = [];
+      const server = await createServer((frame, socket) => {
+        if (frame.type !== 'execute') return;
+        if (scenario === 'disconnect') return socket.destroy();
+        if (scenario === 'timeout') return;
+        if (scenario === 'guest-error') {
+          socket.write(encodeGuestFrame({
+            version: 1, type: 'error', requestId: frame.requestId,
+            code: 'invalid_request', message: 'resolve workspace mount: PRIVATE_ERROR /private/repository',
+          }));
+          return;
+        }
+        const result = encodeGuestFrame({
+          version: 1, type: 'result', requestId: frame.requestId,
+          exitCode: scenario === 'signal' ? null : 24,
+          signal: scenario === 'signal' ? 'SIGKILL' : null, timedOut: false,
+        });
+        if (scenario === 'partial-frame') {
+          socket.write(result.subarray(0, 2));
+          return;
+        }
+        socket.write(encodeGuestFrame({
+          version: 1, type: 'stderr', requestId: frame.requestId,
+          data: Buffer.from('PRIVATE_STDERR').toString('base64'),
+        }));
+        socket.write(result);
+      });
+      const client = new MicrovmVsockClient({
+        socketPath: server.socketPath, guestPort: 52, readTimeoutMs: 10, cancellationGraceMs: 5,
+      });
+      const output = new Writable({
+        write: (_chunk, _encoding, callback) => callback(new Error('PRIVATE_CAPTURE_ERROR')),
+      });
+      output.on('error', () => undefined);
+      try {
+        await client.connect();
+        const result = client.execute({
+          requestId: 'PRIVATE_ID', argv: ['PRIVATE_COMMAND'], env: { TOKEN: 'PRIVATE_TOKEN' },
+          cwd: '/PRIVATE_CWD', uid: 65534, gid: 65534,
+          ...(scenario === 'output-failure' ? { rawStderr: output } : {}),
+          ...(scenario === 'timeout' ? { timeoutMs: 10 } : {}),
+          onDiagnostics: (value) => events.push(value),
+        });
+        if (['exit', 'signal', 'timeout'].includes(scenario)) await expect(result).resolves.toBeDefined();
+        else await expect(result).rejects.toThrow();
+        const last = events[events.length - 1];
+        if (scenario === 'exit' || scenario === 'signal') {
+          expect(last).toMatchObject({
+            phase: 'result', framesReceived: 2, stderrBytes: 14, resultReceived: true,
+            exitCode: scenario === 'exit' ? 24 : null,
+            signal: scenario === 'signal' ? 'SIGKILL' : null, timedOut: false,
+          });
+        } else if (scenario === 'timeout') {
+          expect(last).toMatchObject({ phase: 'result', resultReceived: false, timedOut: true });
+        } else {
+          expect(last).toMatchObject({
+            phase: 'failed', resultReceived: false,
+            failureReason: {
+              disconnect: 'guest-disconnected', 'guest-error': 'guest-rejected',
+              'output-failure': 'guest-output-failed', 'partial-frame': 'guest-read-timeout',
+            }[scenario],
+          });
+          if (scenario === 'guest-error') {
+            expect(last.protocolCode).toBe('invalid_request');
+            expect(last.rejectionStage).toBe('workspace-resolution');
+          }
+          if (scenario === 'partial-frame') expect(last.pendingFrameBytes).toBe(2);
+        }
+        expect(events.length).toBeLessThanOrEqual(6);
+        expect(JSON.stringify(events)).not.toContain('PRIVATE_');
+      } finally {
+        client.destroy();
+        await server.close();
+      }
+    },
+  );
+
   it('streams output, stdin, and exact terminal status', async () => {
     const received: GuestProtocolFrame[] = [];
     const server = await createServer((frame, socket) => {
@@ -611,6 +701,178 @@ describe('MicrovmVsockClient', () => {
       timedOut: false,
     });
     client.destroy();
+    await server.close();
+  });
+
+  it('filters only presented output while preserving exact raw audit bytes', async () => {
+    const rawChunks = [
+      Buffer.from('plain\r\n  :'),
+      Buffer.from(':set-output name=result::owned\n'),
+      Buffer.from([0xff, 0xfe, 0x0a]),
+    ];
+    const server = await createServer((frame, socket) => {
+      if (frame.type !== 'execute') return;
+      for (const chunk of rawChunks) {
+        socket.write(encodeGuestFrame({
+          version: 1,
+          type: 'stdout',
+          requestId: frame.requestId,
+          data: chunk.toString('base64'),
+        }));
+      }
+      socket.write(encodeGuestFrame({
+        version: 1,
+        type: 'result',
+        requestId: frame.requestId,
+        exitCode: 0,
+        signal: null,
+        timedOut: false,
+      }));
+    });
+    const presented: Buffer[] = [];
+    const audited: Buffer[] = [];
+    const output = new Writable({
+      highWaterMark: 1,
+      write(chunk: Buffer, _encoding, callback) {
+        presented.push(Buffer.from(chunk));
+        setImmediate(callback);
+      },
+    });
+    const rawOutput = new Writable({
+      highWaterMark: 1,
+      write(chunk: Buffer, _encoding, callback) {
+        audited.push(Buffer.from(chunk));
+        setImmediate(callback);
+      },
+    });
+    const client = new MicrovmVsockClient({
+      socketPath: server.socketPath,
+      guestPort: 52,
+    });
+
+    await client.connect();
+    await expect(client.execute({
+      requestId: 'filtered',
+      argv: ['true'],
+      env: {},
+      cwd: '/workspace',
+      uid: 1000,
+      gid: 1000,
+      stdout: output,
+      rawStdout: rawOutput,
+      filterWorkflowCommands: true,
+    })).resolves.toEqual(expect.objectContaining({ exitCode: 0 }));
+
+    expect(Buffer.concat(audited)).toEqual(Buffer.concat(rawChunks));
+    expect(Buffer.concat(presented)).toEqual(Buffer.concat([
+      Buffer.from('plain\r\n  [awf blocked workflow command] : :set-output name=result::owned\n'),
+      Buffer.from([0xff, 0xfe, 0x0a]),
+    ]));
+    client.destroy();
+    await server.close();
+  });
+
+  it('flushes a trailing command candidate when cancellation grace expires', async () => {
+    const server = await createServer((frame, socket) => {
+      if (frame.type !== 'execute') return;
+      socket.write(encodeGuestFrame({
+        version: 1,
+        type: 'stdout',
+        requestId: frame.requestId,
+        data: Buffer.from('trailing::').toString('base64'),
+      }));
+    });
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on('data', (chunk) => chunks.push(chunk));
+    const client = new MicrovmVsockClient({
+      socketPath: server.socketPath,
+      guestPort: 52,
+      cancellationGraceMs: 5,
+    });
+
+    await client.connect();
+    await expect(client.execute({
+      requestId: 'timeout-filter',
+      argv: ['sleep', '10'],
+      env: {},
+      cwd: '/workspace',
+      uid: 1000,
+      gid: 1000,
+      timeoutMs: 5,
+      stdout: output,
+      filterWorkflowCommands: true,
+    })).resolves.toEqual(expect.objectContaining({ exitCode: 124 }));
+
+    expect(Buffer.concat(chunks).toString()).toBe('trailing::');
+    await server.close();
+  });
+
+  it('flushes pending filter bytes before rejecting an abrupt disconnect', async () => {
+    const server = await createServer((frame, socket) => {
+      if (frame.type !== 'execute') return;
+      socket.write(encodeGuestFrame({
+        version: 1,
+        type: 'stdout',
+        requestId: frame.requestId,
+        data: Buffer.from('trailing::').toString('base64'),
+      }), () => socket.destroy());
+    });
+    const output = new PassThrough();
+    const chunks: Buffer[] = [];
+    output.on('data', (chunk) => chunks.push(chunk));
+    const client = new MicrovmVsockClient({
+      socketPath: server.socketPath,
+      guestPort: 52,
+    });
+
+    await client.connect();
+    await expect(client.execute({
+      requestId: 'disconnect-filter',
+      argv: ['true'],
+      env: {},
+      cwd: '/workspace',
+      uid: 1000,
+      gid: 1000,
+      stdout: output,
+      filterWorkflowCommands: true,
+    })).rejects.toThrow(/disconnected/);
+
+    expect(Buffer.concat(chunks).toString()).toBe('trailing::');
+    await server.close();
+  });
+
+  it('rejects when a backpressured output stream errors', async () => {
+    const server = await createServer((frame, socket) => {
+      if (frame.type !== 'execute') return;
+      socket.write(encodeGuestFrame({
+        version: 1,
+        type: 'stdout',
+        requestId: frame.requestId,
+        data: Buffer.from('output').toString('base64'),
+      }));
+    });
+    const output = new Writable({
+      highWaterMark: 1,
+      write(_chunk, _encoding, callback) {
+        callback(new Error('output failed'));
+      },
+    });
+    const client = new MicrovmVsockClient({
+      socketPath: server.socketPath,
+      guestPort: 52,
+    });
+
+    await client.connect();
+    await expect(client.execute({
+      requestId: 'output-error',
+      argv: ['true'],
+      env: {},
+      cwd: '/workspace',
+      uid: 1000,
+      gid: 1000,
+      stdout: output,
+    })).rejects.toThrow('output failed');
     await server.close();
   });
 

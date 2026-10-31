@@ -3,6 +3,8 @@ import * as path from 'path';
 import execa, { type ExecaChildProcess } from 'execa';
 import type { CloudHypervisorCgroup } from './launcher';
 import type { CloudHypervisorDirectoryExport } from './exports';
+import type { CloudHypervisorCleanupHandle } from './cleanup-registry';
+import { assertBoundedEnclaveWritableExports } from './enclave-storage';
 import {
   StagedHostMountTree,
   selectMountPlan,
@@ -12,11 +14,19 @@ import {
   type VirtiofsdExportMountPlan,
   type VirtiofsdMountEnforcement,
 } from './mount-tree';
+import {
+  VIRTIOFSD_ENVIRONMENT,
+  captureVirtiofsdProcessIdentity,
+  findForbiddenVirtiofsdOption,
+  verifyVirtiofsdSandbox,
+  type VirtiofsdSandboxDependencies,
+} from './virtiofsd-sandbox';
 
 export type {
   MountTreeDependencies,
   MountTreeStats,
   VirtiofsdExportMountPlan,
+  VirtiofsdMaskOverlay,
   VirtiofsdMountEnforcement,
   VirtiofsdOverlayKind,
   VirtiofsdWritableOverlay,
@@ -31,9 +41,11 @@ export interface VirtiofsdDevice {
   readonly export: CloudHypervisorDirectoryExport;
   readonly socketPath: string;
   readonly logPath: string;
+  readonly evidencePath: string;
 }
 
-export interface VirtiofsdDependencies extends MountTreeDependencies {
+export interface VirtiofsdDependencies
+  extends MountTreeDependencies, VirtiofsdSandboxDependencies {
   launch(
     command: string,
     args: string[],
@@ -46,16 +58,16 @@ export interface VirtiofsdDependencies extends MountTreeDependencies {
   ): ExecaChildProcess<string>;
   lstat(filePath: string): Promise<{ isSocket(): boolean }>;
   chown(filePath: string, uid: number, gid: number): Promise<void>;
-  writeFile(filePath: string, contents: Buffer, options: { mode: number }): Promise<void>;
+  writeFile(filePath: string, contents: Buffer | string, options: { mode: number }): Promise<void>;
   rm(filePath: string, options: { force: true }): Promise<void>;
   mkdir(directory: string, options: { recursive: true; mode: number }): Promise<unknown>;
   rmdir(directory: string): Promise<void>;
   runTool(command: string, args: readonly string[]): Promise<void>;
   captureTool(command: string, args: readonly string[]): Promise<string>;
   statPath(filePath: string): Promise<MountTreeStats>;
+  assertWritableStorageBound: typeof assertBoundedEnclaveWritableExports;
   realpath(filePath: string): Promise<string>;
   readMountInfo(): Promise<string>;
-  sleep(milliseconds: number): Promise<void>;
 }
 
 const defaultDependencies: VirtiofsdDependencies = {
@@ -63,6 +75,9 @@ const defaultDependencies: VirtiofsdDependencies = {
   lstat: fs.lstat,
   chown: fs.chown,
   writeFile: fs.writeFile,
+  readFile: fs.readFile,
+  readlink: fs.readlink,
+  statIdentity: (filePath) => fs.stat(filePath, { bigint: true }),
   rm: (filePath, options) => fs.rm(filePath, options),
   mkdir: fs.mkdir,
   rmdir: fs.rmdir,
@@ -96,6 +111,7 @@ const defaultDependencies: VirtiofsdDependencies = {
     return result.stdout;
   },
   statPath: fs.lstat,
+  assertWritableStorageBound: assertBoundedEnclaveWritableExports,
   realpath: fs.realpath,
   readMountInfo: () => fs.readFile('/proc/self/mountinfo', 'utf8'),
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
@@ -108,10 +124,30 @@ interface RunningDaemon extends VirtiofsdDevice {
   readonlyBindPath?: string;
   mountTree?: StagedHostMountTree;
   socketRemoved: boolean;
+  cleanupStarted: boolean;
+  exit?: {
+    code: number | null;
+    signal: string | null;
+    elapsedMs: number;
+    cleanupStarted: boolean;
+  };
 }
 
 export class VirtiofsdManager {
+  static withStorageVerifier(
+    verifier: VirtiofsdDependencies['assertWritableStorageBound'],
+    ...args: [
+      string, string, string, { uid: number; gid: number }, { uid: number; gid: number },
+      Pick<CloudHypervisorCgroup, 'assign' | 'cgroupPath'>,
+      { readonly mount: string; readonly umount: string }, CloudHypervisorCleanupHandle?,
+    ]
+  ): VirtiofsdManager {
+    const [binary, run, share, identity, workspace, cgroup, tools, cleanup] = args;
+    return new VirtiofsdManager(binary, run, share, identity, workspace, cgroup, tools,
+      { ...defaultDependencies, assertWritableStorageBound: verifier }, cleanup);
+  }
   private readonly running: RunningDaemon[] = [];
+  private readonly diagnosticDevices: VirtiofsdDevice[] = [];
   /** Mount trees whose staging failed with residue that still needs unmounting. */
   private readonly orphanedMountTrees: StagedHostMountTree[] = [];
 
@@ -120,9 +156,15 @@ export class VirtiofsdManager {
     private readonly runDirectory: string,
     private readonly shareDirectory: string,
     private readonly identity: { uid: number; gid: number },
-    private readonly cgroup: Pick<CloudHypervisorCgroup, 'assign'>,
+    /**
+     * Host uid/gid of the workspace user. Every guest uid/gid used to create a
+     * file or set an owner in an export is squashed to this identity.
+     */
+    private readonly workspaceIdentity: { uid: number; gid: number },
+    private readonly cgroup: Pick<CloudHypervisorCgroup, 'assign' | 'cgroupPath'>,
     private readonly tools: { readonly mount: string; readonly umount: string },
     private readonly dependencies: VirtiofsdDependencies = defaultDependencies,
+    private readonly cleanupRecord?: CloudHypervisorCleanupHandle,
   ) {}
 
   /**
@@ -135,16 +177,21 @@ export class VirtiofsdManager {
   async start(
     exports: readonly CloudHypervisorDirectoryExport[],
     enforcement?: VirtiofsdMountEnforcement,
+    writableStorageLimitBytes?: number,
   ): Promise<VirtiofsdDevice[]> {
     try {
       assertPlansMatchExports(enforcement, exports);
+      if (writableStorageLimitBytes !== undefined) {
+        await this.dependencies.assertWritableStorageBound(exports, writableStorageLimitBytes);
+      }
       for (const [index, directoryExport] of exports.entries()) {
         await this.startOne(directoryExport, index, selectMountPlan(enforcement, directoryExport.tag));
       }
-      return this.running.map(({ export: item, socketPath, logPath }) => ({
+      return this.running.map(({ export: item, socketPath, logPath, evidencePath }) => ({
         export: item,
         socketPath,
         logPath,
+        evidencePath,
       }));
     } catch (error) {
       try {
@@ -172,6 +219,7 @@ export class VirtiofsdManager {
       }
     }
     for (const daemon of [...this.running].reverse()) {
+      daemon.cleanupStarted = true;
       let processTerminated = daemon.process.exitCode !== null || daemon.process.signalCode !== null;
       try {
         if (!processTerminated) {
@@ -191,6 +239,11 @@ export class VirtiofsdManager {
       }
       try {
         const diagnostic = Buffer.concat([
+          Buffer.from(`${JSON.stringify({
+            exportTag: daemon.export.tag,
+            parentPid: daemon.process.pid,
+            exit: daemon.exit ?? null,
+          })}\n`),
           Buffer.from('--- stdout ---\n'),
           daemon.stdout.contents(),
           Buffer.from('\n--- stderr ---\n'),
@@ -244,6 +297,10 @@ export class VirtiofsdManager {
     }
   }
 
+  getDiagnosticDevices(): VirtiofsdDevice[] {
+    return this.diagnosticDevices.map((device) => ({ ...device }));
+  }
+
   private async startOne(
     directoryExport: CloudHypervisorDirectoryExport,
     index: number,
@@ -251,6 +308,7 @@ export class VirtiofsdManager {
   ): Promise<void> {
     const socketPath = path.join(this.runDirectory, `virtiofs-${index}.sock`);
     const logPath = path.join(this.runDirectory, `virtiofs-${index}.log`);
+    const evidencePath = path.join(this.runDirectory, `virtiofs-${index}-confinement.json`);
     let sharedDirectory = directoryExport.source;
     let readonlyBindPath: string | undefined;
     let mountTree: StagedHostMountTree | undefined;
@@ -300,13 +358,30 @@ export class VirtiofsdManager {
     }
     const args = buildVirtiofsdArgs(directoryExport, socketPath, sharedDirectory, {
       announceSubmounts: mountTree !== undefined,
+      workspaceIdentity: this.workspaceIdentity,
     });
+    const cleanupKey = `virtiofsd-${index}`;
+    const workerCleanupKey = `${cleanupKey}-worker`;
+    const expectedExecutable = await this.dependencies.realpath(this.binaryPath);
+    await this.cleanupRecord?.prepareProcess(
+      cleanupKey,
+      expectedExecutable,
+      socketPath,
+      sharedDirectory,
+    );
+    await this.cleanupRecord?.prepareProcess(
+      workerCleanupKey,
+      expectedExecutable,
+      socketPath,
+      sharedDirectory,
+    );
     const child = this.dependencies.launch(this.binaryPath, args, {
       reject: false,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { PATH: '/usr/sbin:/usr/bin:/sbin:/bin' },
+      env: VIRTIOFSD_ENVIRONMENT,
       extendEnv: false,
     });
+    const launchedAt = Date.now();
     const stdout = new BoundedCapture(CAPTURE_LIMIT_BYTES);
     const stderr = new BoundedCapture(CAPTURE_LIMIT_BYTES);
     child.stdout?.on('data', (chunk: Buffer | string) => stdout.append(chunk));
@@ -315,17 +390,47 @@ export class VirtiofsdManager {
       export: directoryExport,
       socketPath,
       logPath,
+      evidencePath,
       process: child,
       stdout,
       stderr,
       readonlyBindPath,
       mountTree,
       socketRemoved: false,
+      cleanupStarted: false,
     };
+    child.once('exit', (code: number | null, signal: string | null) => {
+      daemon.exit = {
+        code,
+        signal,
+        elapsedMs: Date.now() - launchedAt,
+        cleanupStarted: daemon.cleanupStarted,
+      };
+    });
     this.running.push(daemon);
+    this.diagnosticDevices.push({
+      export: directoryExport,
+      socketPath,
+      logPath,
+      evidencePath,
+    });
     if (!child.pid) throw new Error(`virtiofsd for "${directoryExport.tag}" did not expose a PID`);
     await this.cgroup.assign(child.pid);
+    const parentIdentity = await captureVirtiofsdProcessIdentity(child.pid, this.dependencies);
     await this.waitForSocket(daemon);
+    const workerIdentity = await verifyVirtiofsdSandbox({
+      exportTag: directoryExport.tag,
+      parentIdentity,
+      expectedExecutable,
+      socketPath,
+      sharedDirectory,
+      requiredArguments: args.filter((arg) => arg.startsWith('--translate-')),
+      cgroupPath: this.cgroup.cgroupPath,
+      evidencePath,
+      assignToCgroup: (pid) => this.cgroup.assign(pid),
+    }, this.dependencies);
+    await this.cleanupRecord?.captureProcess(cleanupKey, child.pid);
+    await this.cleanupRecord?.captureProcess(workerCleanupKey, workerIdentity.pid);
     await this.dependencies.chown(socketPath, this.identity.uid, this.identity.gid);
   }
 
@@ -356,7 +461,19 @@ export class VirtiofsdManager {
   }
 }
 
+/**
+ * Upper bound of the guest id range squashed by `--translate-uid` /
+ * `--translate-gid`: `squash-guest:0:<host id>:4294967295` covers every guest
+ * uid/gid, including 0.
+ */
+const SQUASH_GUEST_ID_COUNT = 4294967295;
+
 export interface VirtiofsdArgOptions {
+  /**
+   * Host workspace identity that every guest uid/gid (including guest root)
+   * is squashed to on create/chown. Must be a resolved, non-root identity.
+   */
+  readonly workspaceIdentity: { readonly uid: number; readonly gid: number };
   /**
    * Required when the shared directory is a staged mount tree: the guest must
    * see each writable child bind as its own submount instead of a hole in an
@@ -368,21 +485,44 @@ export interface VirtiofsdArgOptions {
 export function buildVirtiofsdArgs(
   directoryExport: CloudHypervisorDirectoryExport,
   socketPath: string,
-  sharedDirectory = directoryExport.source,
-  options: VirtiofsdArgOptions = {},
+  sharedDirectory: string,
+  options: VirtiofsdArgOptions,
 ): string[] {
   if (!path.isAbsolute(socketPath)) {
     throw new Error(`virtiofsd socket path must be absolute: ${socketPath}`);
   }
-  return [
+  const uid = assertWorkspaceId('uid', options.workspaceIdentity?.uid);
+  const gid = assertWorkspaceId('gid', options.workspaceIdentity?.gid);
+  const args = [
     `--socket-path=${socketPath}`,
     `--shared-dir=${sharedDirectory}`,
     '--sandbox=namespace',
     '--seccomp=kill',
     '--cache=auto',
     '--inode-file-handles=never',
+    `--translate-uid=squash-guest:0:${uid}:${SQUASH_GUEST_ID_COUNT}`,
+    `--translate-gid=squash-guest:0:${gid}:${SQUASH_GUEST_ID_COUNT}`,
     ...(options.announceSubmounts ? ['--announce-submounts'] : []),
   ];
+  const forbidden = findForbiddenVirtiofsdOption(args);
+  if (forbidden !== undefined) {
+    throw new Error(`virtiofsd must not be launched with ${forbidden}`);
+  }
+  return args;
+}
+
+function assertWorkspaceId(kind: 'uid' | 'gid', value: number | undefined): number {
+  if (
+    typeof value !== 'number' ||
+    !Number.isSafeInteger(value) ||
+    value < 1 ||
+    value >= SQUASH_GUEST_ID_COUNT
+  ) {
+    throw new Error(
+      `virtiofsd requires a resolved non-root workspace ${kind} for guest id squashing; got ${String(value)}`,
+    );
+  }
+  return value;
 }
 
 class BoundedCapture {

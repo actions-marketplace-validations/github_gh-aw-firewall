@@ -4,19 +4,19 @@ import {
   computeCloudHypervisorLandlockRules,
   type CloudHypervisorCgroupDependencies,
 } from './launcher';
+import { CLOUD_HYPERVISOR_ENCLAVE_RESOURCE_PROFILES as profiles } from './workload-profile';
 
 describe('buildCloudHypervisorLaunchCommand', () => {
   const baseOptions = {
     tools: { ip: '/usr/sbin/ip', setpriv: '/usr/bin/setpriv' },
     namespaceName: 'awfch-abc123',
     identity: { uid: 1000, gid: 1000 },
-    kvmGid: 978,
     cloudHypervisorBinary: '/opt/cloud-hypervisor',
     apiSocketPath: '/run/awf/api.socket',
     logFilePath: '/run/awf/cloud-hypervisor.log',
   };
 
-  it('joins the namespace, drops privileges but retains the kvm group and CAP_NET_ADMIN, then execs Cloud Hypervisor with no shell', () => {
+  it('joins the namespace, drops privileges and groups, empties capabilities, then execs without a shell', () => {
     const result = buildCloudHypervisorLaunchCommand(baseOptions);
     expect(result.command).toBe('/usr/sbin/ip');
     expect(result.args).toEqual([
@@ -24,11 +24,11 @@ describe('buildCloudHypervisorLaunchCommand', () => {
       '/usr/bin/setpriv',
       '--reuid=1000',
       '--regid=1000',
-      '--groups=978',
+      '--clear-groups',
       '--no-new-privs',
-      '--inh-caps=-all,+net_admin',
-      '--bounding-set=-all,+net_admin',
-      '--ambient-caps=+net_admin',
+      '--inh-caps=-all',
+      '--bounding-set=-all',
+      '--ambient-caps=-all',
       '--',
       '/opt/cloud-hypervisor',
       '--api-socket', 'path=/run/awf/api.socket',
@@ -36,7 +36,19 @@ describe('buildCloudHypervisorLaunchCommand', () => {
       '-v',
       '--seccomp', 'true',
     ]);
-    expect(result.args).not.toContain('--clear-groups');
+    expect(result.args).toContain('--clear-groups');
+    expect(result.confinementPolicy).toEqual({
+      supplementaryGroups: [],
+      capabilities: {
+        inheritable: '0000000000000000',
+        permitted: '0000000000000000',
+        effective: '0000000000000000',
+        bounding: '0000000000000000',
+        ambient: '0000000000000000',
+      },
+      noNewPrivs: 1,
+    });
+    expect(result.args.some((arg) => arg.includes('+net_admin'))).toBe(false);
     // No argument contains shell metacharacters that would matter if ever
     // interpolated; more importantly, args are a plain array (never joined
     // into a shell string) so metacharacters have no special meaning here.
@@ -47,16 +59,11 @@ describe('buildCloudHypervisorLaunchCommand', () => {
     ['unsafe namespace name', { namespaceName: '../etc' }, /Unsafe Cloud Hypervisor network namespace name/],
     ['zero uid', { identity: { uid: 0, gid: 1000 } }, /uid must be a positive integer/],
     ['negative gid', { identity: { uid: 1000, gid: -1 } }, /gid must be a positive integer/],
-    ['negative kvm gid', { kvmGid: -1 }, /\/dev\/kvm group id must be a non-negative integer/],
     ['relative binary path', { cloudHypervisorBinary: 'cloud-hypervisor' }, /binary path must be absolute/],
     ['relative socket path', { apiSocketPath: 'api.socket' }, /API socket path must be absolute/],
   ])('rejects %s', (_label, overrides, error) => {
     expect(() => buildCloudHypervisorLaunchCommand({ ...baseOptions, ...overrides }))
       .toThrow(error);
-  });
-
-  it('accepts a kvm gid of 0 (root-owned /dev/kvm on unusual hosts)', () => {
-    expect(() => buildCloudHypervisorLaunchCommand({ ...baseOptions, kvmGid: 0 })).not.toThrow();
   });
 });
 
@@ -77,7 +84,7 @@ describe('computeCloudHypervisorLandlockRules', () => {
       { path: '/run/awf/run', access: 'rw' },
       { path: '/dev/kvm', access: 'rw' },
       { path: '/dev/net/tun', access: 'rw' },
-      { path: '/sys/class/net/vmtabc123', access: 'r' },
+      { path: '/sys/class/net/vmtabc123/tun_flags', access: 'r' },
     ]);
     expect(rules).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ path: '/host/workspace' }),
@@ -97,7 +104,7 @@ describe('computeCloudHypervisorLandlockRules', () => {
     expect(rules.some((rule) => rule.path.includes('workspace'))).toBe(false);
   });
 
-  it('grants read access to the TAP sysfs directory so tun_flags is readable under Landlock', () => {
+  it('grants read access only to the TAP tun_flags attribute required under Landlock', () => {
     // Regression test: /sys/class/net/<tap>/tun_flags is a world-readable
     // (0444) kernel sysfs attribute with no capability requirement of its
     // own, but Landlock still blocks the read if the path isn't in the
@@ -112,7 +119,8 @@ describe('computeCloudHypervisorLandlockRules', () => {
       tapName: 'vmtabc123',
     });
 
-    expect(rules).toContainEqual({ path: '/sys/class/net/vmtabc123', access: 'r' });
+    expect(rules).toContainEqual({ path: '/sys/class/net/vmtabc123/tun_flags', access: 'r' });
+    expect(rules).not.toContainEqual({ path: '/sys/class/net/vmtabc123', access: 'r' });
   });
 });
 
@@ -199,6 +207,56 @@ describe('CloudHypervisorCgroup', () => {
       '/sys/fs/cgroup/awf-cloud-hypervisor/run-1/pids.max',
       '256',
     );
+  });
+
+  it('enforces the exact fractional CPU budget for an enclave without VMM headroom', async () => {
+    const deps = dependencies();
+    const cgroup = new CloudHypervisorCgroup(
+      '/sys/fs/cgroup/awf-cloud-hypervisor/enclave-1',
+      { memoryMib: 768, vcpuCount: 1, cpuQuotaMilli: 500 },
+      deps,
+    );
+    await cgroup.setup();
+
+    expect(cgroup.expectedLimits().cpuMax).toBe('50000 100000');
+    expect(deps.writeFile).toHaveBeenCalledWith(
+      '/sys/fs/cgroup/awf-cloud-hypervisor/enclave-1/cpu.max',
+      '50000 100000',
+    );
+    expect(() => new CloudHypervisorCgroup(
+      '/sys/fs/cgroup/awf-cloud-hypervisor/invalid',
+      { memoryMib: 768, vcpuCount: 1, cpuQuotaMilli: 1001 },
+    ).expectedLimits()).toThrow(/resource limits are invalid/);
+  });
+
+  it.each(['script', 'agent'] as const)('budgets host tmpfs pages separately from %s guest memory', async (role) => {
+    const profile = profiles[role];
+    const deps = dependencies();
+    const cgroup = new CloudHypervisorCgroup(
+      '/sys/fs/cgroup/awf-cloud-hypervisor/enclave-storage',
+      {
+        memoryMib: profile.memoryMiB,
+        vcpuCount: profile.vcpuCount,
+        cpuQuotaMilli: profile.cpuQuotaMilli,
+        writableStorageBytes: profile.writableStorageBytes,
+      },
+      deps,
+    );
+    await cgroup.setup();
+    expect(cgroup.expectedLimits().memoryMax).toBe(
+      String((profile.memoryMiB + 256) * 1024 * 1024 + profile.writableStorageBytes),
+    );
+    expect(deps.writeFile).toHaveBeenCalledWith(
+      '/sys/fs/cgroup/awf-cloud-hypervisor/enclave-storage/memory.max',
+      cgroup.expectedLimits().memoryMax,
+    );
+  });
+
+  it.each([0, -1, NaN, Infinity, Number.MAX_SAFE_INTEGER])('rejects invalid storage memory budget %s', (size) => {
+    expect(() => new CloudHypervisorCgroup(
+      '/sys/fs/cgroup/awf-cloud-hypervisor/invalid',
+      { memoryMib: 768, vcpuCount: 1, writableStorageBytes: size },
+    ).expectedLimits()).toThrow(/resource limits are invalid/);
   });
 
   it('assigns a PID into cgroup.procs and rejects invalid PIDs', async () => {

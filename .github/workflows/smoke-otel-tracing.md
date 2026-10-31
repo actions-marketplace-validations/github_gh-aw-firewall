@@ -26,6 +26,8 @@ observability:
 name: Smoke OTel Tracing
 engine:
   id: copilot
+  version: 1.0.101
+  checksums-sha256: 018625eac68670d66ede904b9b82cdcd6ab8f87ba20e6e1fbdf0b62c8295d5be
 sandbox:
   agent:
     id: awf
@@ -140,8 +142,9 @@ post-steps:
         wc -l /tmp/gh-aw/sandbox/firewall/logs/api-proxy/token-usage.jsonl
       fi
   - name: Validate safe outputs were invoked
+    env:
+      OUTPUTS_FILE: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}
     run: |
-      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-${RUNNER_TEMP}/gh-aw/safeoutputs/outputs.jsonl}"
       if [ ! -s "$OUTPUTS_FILE" ]; then
         echo "::error::No safe outputs were invoked. Smoke tests require the agent to call safe output tools."
         exit 1

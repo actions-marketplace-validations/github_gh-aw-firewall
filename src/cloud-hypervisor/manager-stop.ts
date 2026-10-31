@@ -12,6 +12,9 @@ import type { CloudHypervisorCgroup } from './launcher';
 import type { MicrovmRootfsPreparer } from '../microvm/rootfs';
 import type { VirtiofsdManager, VirtiofsdDevice } from './virtiofsd';
 import type { CloudHypervisorGuestChannel } from './guest-execution';
+import type { CloudHypervisorCleanupHandle } from './cleanup-registry';
+import type { CloudHypervisorVmmIdentityManager } from './vmm-identity';
+import type { CloudHypervisorNetworkLifecycle } from './network-namespace';
 
 const SHUTDOWN_GRACE_MS = 5_000;
 
@@ -21,18 +24,22 @@ export interface CloudHypervisorStopContext {
   paths: CloudHypervisorRunPaths;
   process?: ExecaChildProcess<string>;
   client?: CloudHypervisorApiClient;
-  network?: MicrovmNetworkLifecycle;
+  network?: MicrovmNetworkLifecycle | CloudHypervisorNetworkLifecycle;
   networkPlan?: MicrovmNetworkPlan;
   rootfsPreparer?: MicrovmRootfsPreparer;
   virtiofsd?: VirtiofsdManager;
   fsDevices: VirtiofsdDevice[];
   guest?: CloudHypervisorGuestChannel;
   cgroup?: CloudHypervisorCgroup;
+  cleanupRecord?: CloudHypervisorCleanupHandle;
+  deferCleanupRecordCompletion: boolean;
+  vmmIdentity?: CloudHypervisorVmmIdentityManager;
   instanceStarted: boolean;
   lastVmInfo?: CloudHypervisorVmInfo;
   lastVmCounters?: CloudHypervisorVmCounters;
   preserve?: boolean;
   beforeCleanup?: () => Promise<void>;
+  preserveSourcesOnBeforeCleanupFailure?: boolean;
   setProcess(process: ExecaChildProcess<string> | undefined): void;
   setClient(client: CloudHypervisorApiClient | undefined): void;
   setNetwork(network: MicrovmNetworkLifecycle | undefined): void;
@@ -42,6 +49,8 @@ export interface CloudHypervisorStopContext {
   setFsDevices(devices: VirtiofsdDevice[]): void;
   setGuest(guest: CloudHypervisorGuestChannel | undefined): void;
   setCgroup(cgroup: CloudHypervisorCgroup | undefined): void;
+  setVmmIdentity(identity: CloudHypervisorVmmIdentityManager | undefined): void;
+  setCleanupRecordReady(ready: boolean): void;
   setInstanceStarted(started: boolean): void;
   setLastVmInfo(info: CloudHypervisorVmInfo | undefined): void;
   setLastVmCounters(counters: CloudHypervisorVmCounters | undefined): void;
@@ -49,6 +58,7 @@ export interface CloudHypervisorStopContext {
 
 export async function stopCloudHypervisor(context: CloudHypervisorStopContext): Promise<void> {
   const errors: unknown[] = [];
+  let identityResourcesRemoved = true;
   const instanceWasStarted = context.instanceStarted;
   if (context.client && instanceWasStarted) {
     try { context.setLastVmInfo(await context.client.vmInfo()); } catch { context.setLastVmInfo(undefined); }
@@ -91,7 +101,7 @@ export async function stopCloudHypervisor(context: CloudHypervisorStopContext): 
   }
   if (!terminationConfirmed && context.process) {
     if (errors.length === 0) errors.push(new Error('Cloud Hypervisor process termination was not confirmed'));
-    try { await context.virtiofsd?.stop(); context.setVirtiofsd(undefined); context.setFsDevices([]); }
+    try { await context.virtiofsd?.stop(); context.setVirtiofsd(undefined); }
     catch (error) { errors.push(error); }
     throw new Error(`Cloud Hypervisor cleanup stopped before network/run-directory removal: ${errors.map(formatError).join('; ')}`);
   }
@@ -101,7 +111,16 @@ export async function stopCloudHypervisor(context: CloudHypervisorStopContext): 
   try { await context.virtiofsd?.stop(); context.setVirtiofsd(undefined); }
   catch (error) { virtiofsdTerminationConfirmed = false; errors.push(error); }
   if (context.beforeCleanup) {
-    try { await context.beforeCleanup(); } catch (error) { errors.push(error); }
+    try {
+      await context.beforeCleanup();
+    } catch (error) {
+      errors.push(error);
+      if (context.preserveSourcesOnBeforeCleanupFailure) {
+        throw new Error(
+          `Cloud Hypervisor cleanup stopped before diagnostic sources were removed: ${errors.map(formatError).join('; ')}`,
+        );
+      }
+    }
   }
   if (!virtiofsdTerminationConfirmed) {
     throw new Error(`Cloud Hypervisor cleanup stopped before cgroup/run-directory removal: ${errors.map(formatError).join('; ')}`);
@@ -117,20 +136,42 @@ export async function stopCloudHypervisor(context: CloudHypervisorStopContext): 
   if (context.preserve) {
     try { await context.cgroup?.cleanup(); } catch (error) { errors.push(error); }
     context.setCgroup(undefined);
+    if (errors.length === 0) await context.cleanupRecord?.complete();
+    if (errors.length === 0) context.setCleanupRecordReady(false);
     throwCleanupErrors(errors, 'Cloud Hypervisor preservation failed: ');
     return;
   }
   try { await context.network?.cleanup(); context.setNetwork(undefined); context.setNetworkPlan(undefined); }
-  catch (error) { errors.push(error); }
+  catch (error) { identityResourcesRemoved = false; errors.push(error); }
   try { await context.cgroup?.cleanup(); } catch (error) { errors.push(error); }
   context.setCgroup(undefined);
   if (!instanceWasStarted || terminationConfirmed) {
     try {
       await context.dependencies.rm(
-        path.join(context.paths.runBaseDir, path.basename(context.config.cloudHypervisorBinary), context.paths.runId),
+        context.paths.runDirectory,
         { recursive: true, force: true },
       );
-    } catch (error) { errors.push(error); }
+    } catch (error) { identityResourcesRemoved = false; errors.push(error); }
+  }
+  if (identityResourcesRemoved) {
+    try {
+      await context.vmmIdentity?.cleanup();
+      context.setVmmIdentity(undefined);
+    } catch (error) {
+      errors.push(error);
+    }
+  } else if (context.vmmIdentity) {
+    errors.push(new Error(
+      'Cloud Hypervisor VMM identity retained because owned run resources could not be fully removed',
+    ));
+  }
+  if (errors.length === 0) {
+    if (context.deferCleanupRecordCompletion) {
+      context.setCleanupRecordReady(true);
+    } else {
+      await context.cleanupRecord?.complete();
+      context.setCleanupRecordReady(false);
+    }
   }
   throwCleanupErrors(errors, 'Cloud Hypervisor cleanup failed: ');
 }

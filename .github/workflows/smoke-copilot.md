@@ -18,16 +18,17 @@ permissions:
 name: Smoke Copilot
 engine:
   id: copilot
-  version: 1.0.34
+  version: 1.0.101
+  checksums-sha256: 018625eac68670d66ede904b9b82cdcd6ab8f87ba20e6e1fbdf0b62c8295d5be
 network:
   allowed:
     - defaults
     - github
 tools:
-  bash:
-    - "*"
+  bash: [cat]
   github:
     toolsets: [pull_requests]
+    allowed: [list_pull_requests]
 safe-outputs:
   threat-detection:
     enabled: false
@@ -45,7 +46,7 @@ strict: false
 jobs:
   verify_token_usage:
     needs: agent
-    if: always() && needs.agent.result != 'skipped' && needs.agent.result != 'cancelled'
+    if: needs.agent.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -55,13 +56,16 @@ jobs:
         with:
           persist-credentials: false
       - name: Download agent artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: agent
           path: /tmp/gh-aw-agent
       - name: Token-usage sanity check
         run: node scripts/ci/check-token-usage.js --artifact-root /tmp/gh-aw-agent --engine copilot
 steps:
+  - name: Build local AWF smoke images
+    timeout-minutes: 35
+    run: bash "${RUNNER_TEMP}/awf-smoke/build-smoke-images.sh"
   - name: Pre-compute smoke test data
     run: |
       echo "::group::Fetching last 2 merged PRs"
@@ -85,18 +89,29 @@ steps:
       echo "Wrote and read back: $FILE_CONTENT"
       echo "::endgroup::"
 
-      # Write results to files for agent context
-      mkdir -p /tmp/gh-aw/agent
-      echo "$HTTP_CODE" > /tmp/gh-aw/agent/smoke-http-code.txt
-      echo "$FILE_CONTENT" > /tmp/gh-aw/agent/smoke-file-content.txt
-      echo "$TEST_FILE" > /tmp/gh-aw/agent/smoke-file-path.txt
-      echo "$PR_DATA" > /tmp/gh-aw/agent/smoke-pr-data.txt
+      PR_AUTHOR=""
+      PR_ASSIGNEES=""
+      if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
+        PR_AUTHOR=$(jq -r '.pull_request.user.login // ""' "$GITHUB_EVENT_PATH")
+        PR_ASSIGNEES=$(jq -r '[.pull_request.assignees[]?.login] | join(", ")' "$GITHUB_EVENT_PATH")
+      fi
+
+      {
+        printf 'Repository: %s\n' "$GITHUB_REPOSITORY"
+        printf 'Trigger: %s\n' "$GITHUB_EVENT_NAME"
+        printf 'github.com HTTP status: %s\n' "$HTTP_CODE"
+        printf 'File write/read content: %s\n' "$FILE_CONTENT"
+        printf 'Current pull request author: %s\n' "$PR_AUTHOR"
+        printf 'Current pull request assignees: %s\n' "$PR_ASSIGNEES"
+        printf 'Pre-fetched merged PRs:\n%s\n' "$PR_DATA"
+      } > "$TEST_DIR/smoke-test-data.txt"
     env:
       GH_TOKEN: ${{ github.token }}
 post-steps:
   - name: Validate safe outputs were invoked
+    env:
+      OUTPUTS_FILE: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}
     run: |
-      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-${RUNNER_TEMP}/gh-aw/safeoutputs/outputs.jsonl}"
       if [ ! -s "$OUTPUTS_FILE" ]; then
         echo "::error::No safe outputs were invoked. Smoke tests require the agent to call safe output tools."
         echo "Checked path: $OUTPUTS_FILE"
@@ -115,41 +130,37 @@ post-steps:
 
 # Smoke Test: Copilot Engine Validation
 
-**CRITICAL REQUIREMENT: You MUST call `add_comment` on pull_request triggers. This is the primary success criterion. Do this FIRST before any other analysis.**
+The host preparation step builds the checked-out Squid, agent, and API proxy
+images with a separate 35-minute budget. Repository post-processing selects
+those run-specific local images with `--skip-pull`, leaving the 15-minute agent
+execution budget for startup and the smoke checks rather than cold builds.
 
-**Keep all outputs extremely short and concise. Use single-line responses where possible. No verbose explanations.**
+**CRITICAL: On pull_request triggers, call `add_comment` first. Keep all outputs extremely short, using single lines where possible.**
 
-## Pre-Computed Test Results
+## Tests
 
-The following tests were already executed in a deterministic pre-agent step. Your job is to verify the results and produce the summary comment.
-
-### 1. GitHub MCP Testing
-Verify MCP connectivity by calling `github-list_pull_requests` for ${{ github.repository }} (limit 1, state merged). Confirm the result matches the pre-fetched data below.
+### 1. GitHub MCP
+Make exactly one GitHub MCP call: `github-list_pull_requests` for the repository listed in the pre-computed data, with `perPage: 1` and `fields: [number, title]`. Do not call `pull_request_read` or any other GitHub MCP tool. A successful response confirms MCP connectivity.
 
 ### 2. GitHub.com Connectivity
-Pre-step result: HTTP (see `/tmp/gh-aw/agent/smoke-http-code.txt`) from github.com.
-✅ if HTTP 200 or 301, ❌ otherwise.
+Use the pre-computed HTTP status; ✅ for 200 or 301, ❌ otherwise.
 
-### 3. File Write/Read Test
-Pre-step wrote and read back: "(see `/tmp/gh-aw/agent/smoke-file-content.txt`)"
-File path: (see `/tmp/gh-aw/agent/smoke-file-path.txt`)
-Verify by running `cat` on the file path using bash to confirm it exists.
-
-## Pre-Fetched PR Data
-
-```
-(see `/tmp/gh-aw/agent/smoke-pr-data.txt`)
-```
+### 3. File Write/Read
+Use the pre-step's write/read result.
 
 ## Output (MANDATORY)
 
-**If triggered by a pull request** (check: `${{ github.event_name }}` equals "pull_request"), you MUST call `add_comment` to post a **very brief** comment (max 5-10 lines) on the current pull request with:
+If the pre-computed trigger is `pull_request`, call `add_comment` to post a very brief comment (max 5–10 lines) on the current pull request with:
 - PR titles only (no descriptions)
 - ✅ or ❌ for each test result
 - Overall status: PASS or FAIL
-- Mention the pull request author and any assignees
+- Mention the current pull request author and any assignees listed in the pre-computed data
 
-If all tests pass on a pull request trigger:
+If all tests pass on a `pull_request` trigger:
 - Use the `add_labels` safe-output tool to add the label `smoke-copilot` to the pull request
 
-**If triggered by workflow_dispatch or schedule** (no PR context), call `noop` with a concise PASS/FAIL summary instead. Do NOT attempt to add pull request comments or labels when there is no pull request.
+For a `workflow_dispatch` or `schedule` trigger, call `noop` with a concise PASS/FAIL summary instead. Do not attempt pull request comments or labels when there is no pull request.
+
+## Pre-computed data
+
+Read `/tmp/gh-aw/agent/smoke-test-data.txt` once with `cat` and use its results.

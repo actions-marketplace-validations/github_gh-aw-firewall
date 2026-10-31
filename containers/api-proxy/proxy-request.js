@@ -7,7 +7,10 @@
  * should be reviewed carefully for header-injection and SSRF risks.
  */
 
+const http = require('http');
 const https = require('https');
+const { getCatalogueLoader } = require('./catalogue-loader');
+const { captureRuntimePricing } = require('./runtime-model-catalog');
 const { HTTPS_PROXY, proxyAgent } = require('./http-client');
 const { createBodyHandler, sleep, _setSleepForTests, _resetSleepForTests } = require('./body-handler');
 const { generateRequestId, sanitizeForLog, logRequest } = require('./logging');
@@ -25,15 +28,9 @@ const {
 } = require('./deprecated-header-tracker');
 const { extractBillingHeaders } = require('./billing-headers');
 const { createUpstreamResponseHandlers } = require('./upstream-response');
+const { replaceUpstreamEndpoint } = require('./wire-api-compat');
 const { createRateLimitChecker } = require('./rate-limit');
 const { createProxyWebSocket } = require('./websocket-proxy');
-const {
-  getEffectiveTokenBlockState,
-  getEffectiveTokenReflectState,
-  resetEffectiveTokenGuardForTests,
-  buildEffectiveTokenLimitError,
-  getAndClearPendingSteeringMessage,
-} = require('./guards/effective-token-guard');
 const {
   applyMaxRunsInvocation,
   getMaxRunsBlockState,
@@ -56,6 +53,7 @@ const {
 } = require('./guards/max-permission-denied-guard');
 const {
   getAndClearPendingTimeoutSteeringMessage,
+  getTimeoutSteeringReflectState,
   resetTimeoutSteeringForTests,
 } = require('./guards/timeout-steering');
 const {
@@ -67,7 +65,7 @@ const {
   getAiCreditsReflectState,
   getAiCreditsBlockState,
   buildAiCreditsLimitError,
-  checkUnknownModelRejection,
+  checkModelPricing,
   resetAiCreditsGuardForTests,
 } = require('./guards/ai-credits-guard');
 const {
@@ -78,7 +76,8 @@ const {
   getModelPolicyBlockState,
   buildModelPolicyError,
 } = require('./guards/model-policy-guard');
-const { enforceGuards } = require('./proxy-guards');
+const { enforceGuards, getCurrentGuardChecks } = require('./proxy-guards');
+const { isGithubCopilotCatalogTarget } = require('./providers/copilot-auth');
 
 // ── Optional token tracker (graceful degradation when not bundled) ────────────
 let trackTokenUsage;
@@ -153,8 +152,6 @@ const proxyWebSocket = createProxyWebSocket({
   buildUpstreamPath,
   shouldStripHeader,
   isValidRequestId,
-  getEffectiveTokenBlockState,
-  buildEffectiveTokenLimitError,
   getMaxRunsBlockState,
   buildMaxRunsExceededError,
   getMaxCacheMissesBlockState,
@@ -167,7 +164,7 @@ const proxyWebSocket = createProxyWebSocket({
   buildModelMultiplierCapError,
   getRetiredModelBlockState,
   buildRetiredModelError,
-  checkUnknownModelRejection,
+  checkModelPricing,
   getModelPolicyBlockState,
   buildModelPolicyError,
   trackWebSocketTokenUsage,
@@ -189,14 +186,38 @@ const { handleUpstreamResponse } = createUpstreamResponseHandlers({
   learnAndStripDeprecatedHeaderValue,
 });
 
+/**
+ * Provider adapter lookup used by cross-provider ordered fallback. Configured
+ * by server.js once the adapters are registered.
+ */
+let fallbackProviderLookup = null;
+
+/**
+ * Register the provider adapters that cross-provider fallback attempts may use.
+ *
+ * @param {{ getAdapter: (provider: string) => object|null|undefined }} options
+ */
+function configureFallbackProviders({ getAdapter } = {}) {
+  fallbackProviderLookup = typeof getAdapter === 'function' ? getAdapter : null;
+}
+
 const sendUpstreamRequest = createSendUpstreamRequest({
   https,
+  http,
   proxyAgent,
   handleUpstreamResponse,
   sleep,
   otel,
   handleRequestError,
   metrics,
+  logRequest,
+  // A fallback model must pass the same guards (model policy, retired models,
+  // multiplier cap, budgets) as the originally requested model.
+  isFallbackModelPermitted: (model, provider, req) =>
+    getCurrentGuardChecks(model, provider, {
+      catalogue: req.awfCatalogue, runtimeCatalog: req.awfRuntimePricing,
+    }).every(guard => !guard.isBlocked(guard.block)),
+  getProviderAdapter: (provider) => (fallbackProviderLookup ? fallbackProviderLookup(provider) || null : null),
 });
 
 // ── Core proxy: HTTP ──────────────────────────────────────────────────────────
@@ -212,10 +233,16 @@ const sendUpstreamRequest = createSendUpstreamRequest({
  * @param {string} [basePath=''] - Optional base-path prefix
  * @param {((body: Buffer) => (Buffer | null | Promise<Buffer | null>)) | null} [bodyTransform=null]
  * @param {((request: object) => Record<string,string>) | null} [requestSigner=null]
+ * @param {'http'|'https'} [targetScheme='https'] - Upstream scheme (see proxy-utils.js normalizeApiTarget)
  */
-function proxyRequest(req, res, targetHost, injectHeaders, provider, basePath = '', bodyTransform = null, requestSigner = null) {
+function proxyRequest(req, res, targetHost, injectHeaders, provider, basePath = '', bodyTransform = null, requestSigner = null, targetScheme = 'https') {
+  req.awfModelCatalogAuthoritative = provider === 'copilot' && isGithubCopilotCatalogTarget(targetHost);
+  if (!Object.hasOwn(req, 'awfCatalogue')) req.awfCatalogue = getCatalogueLoader().capture();
+  if (!req.awfRuntimePricing) req.awfRuntimePricing = captureRuntimePricing();
   const clientRequestId = req.headers['x-request-id'];
-  const requestId = isValidRequestId(clientRequestId) ? clientRequestId : generateRequestId();
+  const requestId = req.awfRouting?.requestId
+    || (isValidRequestId(clientRequestId) ? clientRequestId : generateRequestId());
+  if (req.awfRouting) req.awfRouting.requestId = requestId;
   const startTime = Date.now();
 
   // Start OTEL span (no-op when OTEL is not configured).
@@ -256,7 +283,7 @@ function proxyRequest(req, res, targetHost, injectHeaders, provider, basePath = 
     return;
   }
 
-  const upstreamPath = buildUpstreamPath(req.url, targetHost, basePath);
+  let upstreamPath = buildUpstreamPath(req.url, targetHost, basePath);
 
   // Step 1: collect body (enforces 10 MB limit; returns null if already rejected)
   collectRequestBody(req, provider, requestId, res, span, startTime, targetHost).then(async (rawBody) => {
@@ -264,23 +291,70 @@ function proxyRequest(req, res, targetHost, injectHeaders, provider, basePath = 
 
     // Step 2: apply transform pipeline
     const inboundBytes = rawBody.length;
-    const body = await transformRequestBody(rawBody, provider, req, requestId, bodyTransform);
+    let body;
+    let codexCompatibility = null;
+    let wireApiCompatibility = null;
+    let wireApiSourceBody = null;
+    let steering = null;
+    try {
+      ({ body, codexCompatibility, wireApiCompatibility, wireApiSourceBody, steering } =
+        await transformRequestBody(rawBody, provider, req, requestId, bodyTransform));
+    } catch (err) {
+      const statusCode = Number.isInteger(err && err.statusCode) ? err.statusCode : 400;
+      const duration = Date.now() - startTime;
+      metrics.gaugeDec('active_requests', { provider });
+      metrics.increment('requests_total', { provider, method: req.method, status_class: `${Math.floor(statusCode / 100)}xx` });
+      logRequest('warn', 'request_transform_failed', {
+        request_id: requestId,
+        provider,
+        method: req.method,
+        path: sanitizeForLog(req.url),
+        status: statusCode,
+        duration_ms: duration,
+        error_code: err && err.code ? err.code : 'request_transform_failed',
+      });
+      otel.endSpan(span, statusCode);
+      if (req.awfRouting) {
+        req.awfRouting.localError = {
+          code: err && err.code ? err.code : 'request_transform_failed',
+          type: err && err.type ? err.type : 'invalid_request_error',
+        };
+      }
+      res.writeHead(statusCode, { 'Content-Type': 'application/json', 'X-Request-ID': requestId });
+      res.end(JSON.stringify({
+        error: {
+          message: err && err.message ? err.message : 'Request body transform failed',
+          type: err && err.type ? err.type : 'invalid_request_error',
+          code: err && err.code ? err.code : 'request_transform_failed',
+          ...(typeof err?.retryable === 'boolean' ? { retryable: err.retryable } : {}),
+        },
+      }));
+      return;
+    }
+    if (steering) req.awfSteering = steering;
 
     // Step 3: dispatch upstream
+    if (wireApiCompatibility) {
+      upstreamPath = replaceUpstreamEndpoint(upstreamPath, wireApiCompatibility.upstreamEndpoint);
+    }
     const requestBytes = body.length;
     metrics.increment('request_bytes_total', { provider }, requestBytes);
 
-    const headers = buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider, targetHost, requestId });
+    const headers = buildRequestHeaders(body, inboundBytes, req, {
+      injectHeaders, provider, targetHost, requestId, codexCompatibility, wireApiCompatibility,
+    });
 
     if (enforceGuards({ body, provider, req, res, requestId, startTime, span, inboundBytes })) return;
 
     sendUpstreamRequest(headers, {
       body, targetHost, upstreamPath, req, res, provider, requestId, startTime, span, requestBytes, requestSigner,
+      targetScheme, codexCompatibility, wireApiCompatibility, wireApiSourceBody,
     });
   });
 }
 
 module.exports = {
+  configureFallbackProviders,
   isValidRequestId,
   checkRateLimit,
   collectRequestBody,
@@ -291,12 +365,11 @@ module.exports = {
   limiter,
   proxyAgent,
   HTTPS_PROXY,
-  getEffectiveTokenReflectState,
   getAiCreditsReflectState,
+  getTimeoutSteeringReflectState,
   getMaxRunsReflectState,
   getMaxCacheMissesReflectState,
   getPermissionDeniedReflectState,
-  resetEffectiveTokenGuardForTests,
   resetAiCreditsGuardForTests,
   resetMaxRunsGuardForTests,
   resetMaxCacheMissesGuardForTests,
@@ -304,7 +377,6 @@ module.exports = {
   resetMaxModelMultiplierGuardForTests,
   resetTimeoutSteeringForTests,
   resetAnthropicDeprecatedBetaHeadersForTests: resetDeprecatedHeaderValuesForTests,
-  getAndClearPendingSteeringMessage,
   getAndClearPendingTimeoutSteeringMessage,
   injectSteeringMessage,
   _setSleepForTests,

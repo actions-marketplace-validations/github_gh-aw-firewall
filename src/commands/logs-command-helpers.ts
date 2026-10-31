@@ -11,7 +11,7 @@ import {
   selectMostRecent,
   validateSource,
 } from '../logs/log-discovery';
-import { loadAndAggregate, loadAllLogs } from '../logs/log-aggregator';
+import { loadAndAggregate, loadAllLogs, isSkippableLogEntry } from '../logs/log-aggregator';
 import type { AggregatedStats } from '../logs/log-aggregator';
 import { enrichWithPolicyRules, computeRuleStats } from '../logs/audit-enricher';
 import { formatStats } from '../logs/stats-formatter';
@@ -138,11 +138,11 @@ async function loadLogsWithErrorHandling(
       ? new Set(manifest.topologyPeers.map(p => p.toLowerCase()))
       : undefined;
 
-    const stats = await loadAndAggregate(source, knownTopologyPeers);
+    const stats = await loadAndAggregate(source, knownTopologyPeers, manifest?.networkSubnet);
 
     // Enrich with policy rule stats when a manifest is available
     if (manifest) {
-      const entries = await loadAllLogs(source);
+      const entries = (await loadAllLogs(source)).filter(entry => !isSkippableLogEntry(entry));
       const enriched = enrichWithPolicyRules(entries, manifest);
       stats.byRule = computeRuleStats(enriched, manifest);
       logger.debug('Enriched stats with policy rule matching');

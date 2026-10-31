@@ -31,8 +31,108 @@ The workflow will:
 - Build and push Docker images to GHCR
 - Create Linux x64 and arm64 binaries
 - Create NPM tarball and checksums
+- Attest the AWF binaries, bundle, tarball, checksums, container manifest and
+  tag-to-checksums identity using the pinned build-provenance action
 - Generate versioned JSON Schema files with the release tag embedded in their `$id` URLs
 - Publish the GitHub Release with auto-generated changelog
+- Dispatch full Cloud Hypervisor Enclave Conformance on that exact published tag
+  after all release builds, signatures and asset uploads succeed
+- Independently dispatch Cloud Hypervisor Preview Integration on the same tag
+  with `run_live_kvm=true` for real primary-agent VM coverage
+
+### Release source identity and VM acceptance
+
+Git tags, not `main`'s `package.json`, are the authoritative published versions.
+The workflow synchronizes the package and lockfile to the latest version tag,
+bumps them, and creates a **tag-only version commit** on the selected source.
+It does not push that commit to protected `main`. All release build jobs check
+out the new tag. Thus `main` remaining at `0.23.1` while `v0.28.31` contains
+package version `0.28.31` is intentional, not an artifact publication bug.
+
+Cloud Hypervisor production preflight requires both artifact sets to match
+the running package version; an arbitrary source checkout must not consume a
+newer release's artifacts. Enclave live acceptance must therefore build AWF
+from the exact published release tag, with that tag containing the reviewed
+acceptance implementation. The acceptance workflow additionally requires a
+full `acceptance_commit` SHA and verifies its ancestry and harness presence
+before the Copilot credential is introduced. Both downloaded manifests must
+identify the checked-out tag commit; signature and digest verification still
+run through production preflight.
+
+A maintainer must merge the acceptance implementation and separately authorize
+the normal release workflow to publish its package-matched signed Cloud
+Hypervisor archive/manifest/bundle and both enclave role rootfs, SBOM and
+provenance sets. No package bump on `main`, retagging, or local artifact
+substitution is needed. Publishing through the supported release workflow also
+authorizes its automatic credential-bearing conformance handoff: all three
+inputs (`run_host_probes`, `run_live_kvm`, `run_environment_probe`) are enabled,
+and `acceptance_commit` is the full source SHA selected for that release, before
+the tag-only version commit. The launcher checks the exact published tag,
+package identity and complete required asset set; the native tagged conformance
+workflow retains all ancestry, attestation, host and resource admission checks.
+It uses the existing `GITHUB_TOKEN` with job-local `contents: read` and
+`actions: write`, not a release event (bot-created releases do not reliably
+trigger downstream workflows).
+
+The release workflow's concurrency group serializes automatic handoffs. The
+launcher refuses a pre-existing dispatch for the release commit and never retries
+a POST. On release reruns it checks all prior job attempts for that exact tag:
+publication failures whose dispatch step never ran may recover automatically,
+but a previously reached dispatch step fails closed, even if no downstream run
+is visible yet, to avoid repeating an ambiguous submission.
+A failed handoff is a release job failure, not a successful skip. Inspect the
+tag's conformance runs before using the [manual dispatch procedure
+below](cloud-hypervisor-foundation.md#explicit-enclave-acceptance-dispatch) for
+diagnosis or recovery. Do not rerun the whole release to retry acceptance.
+Successful submission does not mean conformance passed: inspect the separate
+**Cloud Hypervisor Enclave Conformance** run and all four jobs. Releases
+published outside the supported release workflow still require manual dispatch.
+
+The independent **Dispatch release primary-agent live KVM** job uses the same
+fail-closed publication, source/package identity and one-shot dispatch checks,
+with its own prior-attempt and downstream-run history. Neither launcher depends
+on the other's success: a failure must not suppress the other validation.
+It dispatches the native **Cloud Hypervisor Preview Integration** workflow on
+the exact release tag with `run_live_kvm=true` and the full release source SHA
+as `acceptance_commit`. It does not invoke the reusable candidate workflow:
+that path's job conditions do not run primary live KVM.
+
+Both primary jobs verify the tag/package/compatibility identity and reviewed
+source ancestry, including the required primary harness. The workflow builds
+its existing deterministic preview guest from the tagged source, attests the
+same-run guest bundles, and verifies their provenance against the native
+workflow, exact tag/SHA and GitHub-hosted runner before host preflight or VM
+execution. This is primary runtime smoke/security validation, **not**
+production release-asset acceptance: the existing preview harness uses
+explicit development-artifact mode after bundle verification. The separate
+enclave workflow continues to exercise release-attested production artifacts
+and retains all four existing jobs and credential/resource admission gates.
+No additional credentials or bypasses are introduced.
+
+Primary validation passes only when **both** the deterministic guest build
+and **Live Cloud Hypervisor KVM smoke/security** jobs succeed. A submitted run,
+successful build alone, or skipped live job is not VM acceptance. Inspect this
+separate run as well as enclave conformance after every release. A primary
+handoff failure fails its release job; an ambiguous POST or reached dispatch
+step must not be retried automatically, even if no downstream run is visible.
+For manual recovery after inspecting existing runs, dispatch
+`test-cloud-hypervisor.yml` on the exact published tag with `run_live_kvm=true`
+and `acceptance_commit` set to that release's reviewed source SHA.
+This automation applies only to future releases containing it; it does not
+rerun or mutate previously published tags.
+
+Successful Cloud Hypervisor preflight fixtures must derive their manifest tag,
+rootfs/supervisor versions, and configured release tag from
+`CLOUD_HYPERVISOR_ARTIFACT_RELEASE_TAG`, rather than the version currently on
+`main`. Validate deterministic acceptance and foundation preflight tests with
+the package and lockfile coherently set to another release version as well as
+the source version, then restore both files before committing. Negative tests
+must still reject mismatched release identities and reach their intended gate.
+
+A source fixture fix does not change an immutable published tag. In particular,
+the deterministic fixture failures on `v0.28.33` require a future release
+containing the fix before live acceptance can proceed; rerunning that old tag
+cannot consume the corrected tests.
 
 ### 2. Verify Release
 
@@ -52,6 +152,7 @@ Once the workflow completes:
    - `squid:<version>` and `squid:latest`
    - `agent:<version>` and `agent:latest`
    - `api-proxy:<version>` and `api-proxy:latest`
+   - `router:<version>` and `router:latest`
    - `cli-proxy:<version>` and `cli-proxy:latest`
    - `agent-act:<version>` and `agent-act:latest` (GitHub Actions parity image)
    - `enclave-script:<version>` and `enclave-script:latest`
@@ -65,13 +166,60 @@ Each release includes:
 ### GitHub Release Assets
 - `awf-linux-x64` - Linux x64 standalone executable
 - `awf-linux-arm64` - Linux arm64 standalone executable
+- `awf-darwin-x64`, `awf-darwin-arm64` - macOS standalone executables
+- `awf-bundle.js` - Lightweight Node.js executable bundle
 - `awf.tgz` - NPM package tarball (alternative installation method)
 - `checksums.txt` - SHA256 checksums for all files
 - `containers.txt` - Digest-pinned container manifest for published runtime images
+- `release-identity.txt` - Attested binding of the requested `refs/tags/<version>`
+  to the SHA256 digest of `checksums.txt`
 - `awf-config.schema.json` - AWF config JSON Schema
 - `awf-config.v1.schema.json` - **Deprecated alias** of `awf-config.schema.json` (kept for backward compatibility)
 - `audit.schema.json` - AWF audit JSONL record JSON Schema
 - `token-usage.schema.json` - AWF token-usage JSONL record JSON Schema
+
+### Bootstrap authentication and compatibility
+
+The installer and setup action require GitHub build-provenance attestations
+for the payload and release metadata. They constrain verification to
+`github/gh-aw-firewall`, signer workflow `.github/workflows/release.yml`,
+the GitHub Actions OIDC issuer, and GitHub-hosted runners. Attestations must
+be published before uploading the corresponding release assets.
+
+The release workflow is dispatched on `main` or a maintenance branch and
+then checks out the new tag. Its certificate's source ref is therefore the
+dispatch branch, **not** the checkout tag: adding
+`--source-ref refs/tags/<version>` would reject these real releases.
+Instead, the separately attested `release-identity.txt` contains exactly
+`<checksums SHA256>  refs/tags/<version>`. Consumers verify its provenance,
+require the requested tag and checksums digest to match, and verify the
+checksums' and payload's provenance before installation. The setup action
+also authenticates and checksum-checks `containers.txt` before reading
+image digests, requires all runtime image pins, and never falls back to
+mutable tags when a manifest or digest-pinned pull fails. Existing enclave
+artifact verification and acceptance checks remain additional requirements.
+
+Legacy releases without these attestations and identity file intentionally
+fail closed. Select a release published with this protocol; do not bypass
+verification or silently fall back to checksum-only installation.
+The signed tag binding prevents cross-release substitution but does not
+establish freshness of the unauthenticated `latest` API response. Pin an
+explicit known release version when rollback resistance is needed.
+
+**Initial trust is a prerequisite, not something the installer can create.**
+Obtain and review the installer (or pin the setup action to a reviewed commit)
+through an independently authenticated channel. Obtain `gh` with
+`attestation verify --signer-workflow` support, and any Node.js runtime used
+for the bundle, through a trusted package/image distribution or another
+authenticated bootstrap. Configure GitHub authentication for `gh`
+(`GH_TOKEN`/`GITHUB_TOKEN` or `gh auth login`; preserve it appropriately
+when using sudo). The installer does not download its own verifier.
+Use a verifier built with Go's fixed certificate validation where applicable,
+or an independently trusted verifier not affected by the reported CA-chain
+issue. A compromised verifier can subvert verification; a compromised CA
+can also affect HTTPS trust-root retrieval. Downloading both a payload and
+its checksum over HTTPS, or blindly running `curl | sudo bash`, is not an
+independent authentication mechanism.
 
 ### JSON Schema versioning
 
@@ -102,6 +250,7 @@ Docker images are published to `ghcr.io/github/gh-aw-firewall`:
 - `squid:<version>` and `squid:latest` - Squid proxy container
 - `agent:<version>` and `agent:latest` - Agent execution environment (minimal, ~200MB)
 - `api-proxy:<version>` and `api-proxy:latest` - API proxy sidecar for credential isolation
+- `router:<version>` and `router:latest` - Model router sidecar for routed runs, built from `containers/router`. Its `org.opencontainers.image.version` label is the router's own version (`ARG VERSION` in `containers/router/Dockerfile`, which the build checks against `version` in `containers/router/main.go`), not the AWF version, so the release doesn't pass a `VERSION` build argument
 - `cli-proxy:<version>` and `cli-proxy:latest` - CLI proxy sidecar for gh CLI access via mcpg DIFC proxy
 - `agent-act:<version>` and `agent-act:latest` - Agent with GitHub Actions parity (~2GB)
 - `enclave-script:<version>` and `enclave-script:latest` - No-network script executor, built from `containers/enclave/Dockerfile` target `enclave-script`
@@ -119,18 +268,18 @@ Before releasing, you can test the build process locally:
 ### Test Binary Creation
 
 ```bash
-# Install pkg globally
-npm install -g pkg
+# Install the lockfile-pinned local packager
+npm ci
 
 # Build TypeScript
 npm run build
 
 # Create Linux binary
 mkdir -p release
-pkg . --targets node18-linux-x64 --output release/awf
+./node_modules/.bin/pkg . --targets node24-linux-x64 --output release/awf-linux-x64
 
 # Test the binary (requires Docker images - see below)
-./release/awf-linux --help
+./release/awf-linux-x64 --help
 ```
 
 ### Test Docker Images Locally
@@ -140,6 +289,9 @@ pkg . --targets node18-linux-x64 --output release/awf
 docker build -t awf-test/squid:local ./containers/squid
 docker build -t awf-test/agent:local ./containers/agent
 docker build -t awf-test/api-proxy:local ./containers/api-proxy
+docker build -t awf-test/router:local \
+  --build-arg OPENAPI_SHA256="$(sha256sum containers/router/openapi.yaml | cut -d ' ' -f 1)" \
+  ./containers/router
 docker build -t awf-test/cli-proxy:local ./containers/cli-proxy
 
 # Test with local images
@@ -182,7 +334,7 @@ If users report that Docker images can't be pulled:
 
 To make packages public:
 1. Go to repository **Packages** page
-2. Click on the package (squid, agent, api-proxy, cli-proxy, or agent-act)
+2. Click on the package (squid, agent, api-proxy, router, cli-proxy, or agent-act)
 3. Go to **Package settings**
 4. Change visibility to **Public**
 

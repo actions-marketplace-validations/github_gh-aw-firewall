@@ -75,6 +75,7 @@ function createWebSocketTunnel({
     socket,
     head,
     targetHost,
+    targetScheme = 'https',
     injectHeaders,
     provider,
     requestId,
@@ -109,13 +110,17 @@ function createWebSocketTunnel({
 
     const proxyHost = proxyUrl.hostname;
     const proxyPort = parseInt(proxyUrl.port, 10) || 3128;
+    const isHttps = targetScheme !== 'http';
+    const targetUrl = new URL(`${targetScheme}://${targetHost}`);
+    const targetPort = targetUrl.port || (isHttps ? 443 : 80);
+    const targetAuthority = `${targetUrl.hostname}:${targetPort}`;
 
     const connectReq = http.request({
       host: proxyHost,
       port: proxyPort,
       method: 'CONNECT',
-      path: `${targetHost}:443`,
-      headers: { 'Host': `${targetHost}:443` },
+      path: targetAuthority,
+      headers: { 'Host': targetAuthority },
     });
 
     connectReq.once('error', (err) => abort(`CONNECT error: ${err.message}`));
@@ -126,13 +131,7 @@ function createWebSocketTunnel({
         return;
       }
 
-      const tlsSocket = tls.connect({ socket: tunnel, servername: targetHost, rejectUnauthorized: true });
-      const onTlsError = (err) => abort(`TLS handshake error: ${err.message}`, tunnel);
-      tlsSocket.once('error', onTlsError);
-
-      tlsSocket.once('secureConnect', () => {
-        tlsSocket.removeListener('error', onTlsError);
-
+      const sendUpgrade = (upstreamSocket) => {
         const forwardHeaders = {};
         for (const [name, value] of Object.entries(req.headers)) {
           if (!shouldStripHeader(name)) forwardHeaders[name] = value;
@@ -146,38 +145,58 @@ function createWebSocketTunnel({
           upgradeReqStr += `${name}: ${value}\r\n`;
         }
         upgradeReqStr += '\r\n';
-        tlsSocket.write(upgradeReqStr);
+        upstreamSocket.write(upgradeReqStr);
 
-        if (head && head.length > 0) tlsSocket.write(head);
+        if (head && head.length > 0) upstreamSocket.write(head);
 
         if (typeof onSocketsReady === 'function') {
-          onSocketsReady(socket, tlsSocket);
+          onSocketsReady(socket, upstreamSocket);
         }
 
-        tlsSocket.pipe(socket);
-        socket.pipe(tlsSocket);
+        upstreamSocket.pipe(socket);
+        socket.pipe(upstreamSocket);
 
-        trackWebSocketTokenUsage(tlsSocket, {
+        trackWebSocketTokenUsage(upstreamSocket, {
           requestId,
           provider,
           path: sanitizeForLog(req.url),
           startTime,
           metrics,
           requestModel: requestModel || extractRequestModelFromUrl(req.url),
+          caller: req.awfCaller || null,
           onUsage: (normalizedUsage, model) =>
-            computeTokenBudgetUsage({ logRequest, requestId, provider }, normalizedUsage, model),
+            computeTokenBudgetUsage({
+              logRequest, requestId, provider, catalogue: req.awfCatalogue,
+              runtimeCatalog: req.awfRuntimePricing,
+            }, normalizedUsage, model),
         });
 
         socket.once('close', () => {
           finalize(false);
-          tlsSocket.destroy();
+          upstreamSocket.destroy();
         });
-        tlsSocket.once('close', () => {
+        upstreamSocket.once('close', () => {
           finalize(false);
           socket.destroy();
         });
         socket.on('error', () => socket.destroy());
-        tlsSocket.on('error', () => tlsSocket.destroy());
+        upstreamSocket.on('error', () => upstreamSocket.destroy());
+      };
+
+      if (!isHttps) {
+        // Explicit http:// target — the tunnelled connection is already
+        // plaintext, so skip the TLS handshake entirely.
+        sendUpgrade(tunnel);
+        return;
+      }
+
+      const tlsSocket = tls.connect({ socket: tunnel, servername: targetUrl.hostname.replace(/^\[|\]$/g, ''), rejectUnauthorized: true });
+      const onTlsError = (err) => abort(`TLS handshake error: ${err.message}`, tunnel);
+      tlsSocket.once('error', onTlsError);
+
+      tlsSocket.once('secureConnect', () => {
+        tlsSocket.removeListener('error', onTlsError);
+        sendUpgrade(tlsSocket);
       });
     });
 

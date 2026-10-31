@@ -34,7 +34,11 @@ interface MountRecord {
  * time, and synthesises the matching /proc/self/mountinfo so the manager's
  * fail-closed verification is exercised for real.
  */
-function mountTable(options: { ineffectiveRemount?: boolean; shared?: boolean } = {}) {
+function mountTable(options: {
+  ineffectiveRemount?: boolean;
+  nestedReadOnly?: boolean;
+  shared?: boolean;
+} = {}) {
   const table = new Map<string, MountRecord>();
   const commands: string[][] = [];
   const childrenOf = (target: string): string[] =>
@@ -58,7 +62,7 @@ function mountTable(options: { ineffectiveRemount?: boolean; shared?: boolean } 
       });
       // Submount carried in by the recursive bind.
       table.set(`${target}/nested`, {
-        options: ['rw', 'relatime'],
+        options: [options.nestedReadOnly ? 'ro' : 'rw', 'relatime'],
         optionalFields: options.shared === false ? [] : ['shared:22'],
       });
       return;
@@ -81,6 +85,13 @@ function mountTable(options: { ineffectiveRemount?: boolean; shared?: boolean } 
       }
       return;
     }
+    if (args[0] === '-t' && args[1] === 'tmpfs') {
+      const optionsIndex = args.indexOf('-o');
+      const requested = args[optionsIndex + 1].split(',');
+      const target = args[args.length - 1];
+      table.set(target, { options: [...requested, 'relatime'], optionalFields: [] });
+      return;
+    }
     if (args[0] === '-o') {
       const requested = args[1].split(',');
       const target = args[2];
@@ -91,9 +102,23 @@ function mountTable(options: { ineffectiveRemount?: boolean; shared?: boolean } 
       if (!current) throw new Error(`not mounted: ${target}`);
       // Simulates a mount tool that reports success without changing anything.
       if (options.ineffectiveRemount) return;
+      const mode = requested.includes('ro')
+        ? 'ro'
+        : requested.includes('rw')
+          ? 'rw'
+          : current.options.includes('ro')
+            ? 'ro'
+            : 'rw';
       table.set(target, {
         ...current,
-        options: [requested.includes('ro') ? 'ro' : 'rw', 'nosuid', 'nodev', 'relatime'],
+        options: [
+          mode,
+          ...current.options.filter((option) =>
+            !['ro', 'rw', 'nosuid', 'nodev'].includes(option),
+          ),
+          'nosuid',
+          'nodev',
+        ],
       });
       return;
     }
@@ -133,6 +158,7 @@ function dependencies(
     statPath: jest.fn(async (filePath: string) => stats(filePath.endsWith('.json') ? 'file' : 'directory')),
     realpath: jest.fn(async (filePath: string) => filePath),
     readMountInfo: fake.readMountInfo,
+    sleep: jest.fn().mockResolvedValue(undefined),
     ...overrides,
   };
 }
@@ -148,8 +174,9 @@ function stats(kind: 'file' | 'directory' | 'symlink') {
 function plan(
   overlays: VirtiofsdExportMountPlan['writableOverlays'],
   tag = 'workspace',
+  maskedPaths?: VirtiofsdExportMountPlan['maskedPaths'],
 ): VirtiofsdExportMountPlan {
-  return { tag, writableOverlays: overlays };
+  return { tag, writableOverlays: overlays, ...(maskedPaths ? { maskedPaths } : {}) };
 }
 
 function tree(
@@ -244,6 +271,152 @@ describe('StagedHostMountTree', () => {
     ]);
     expect(staged.isStaged).toBe(true);
     expect(staged.rootPath).toBe(ROOT);
+  });
+
+  it('revalidates and retries a transient concurrent remount EBUSY', async () => {
+    const fake = mountTable();
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    let rootRemountAttempts = 0;
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (
+        command === tools.mount &&
+        args[0] === '-o' &&
+        args[2] === ROOT &&
+        ++rootRemountAttempts === 1
+      ) {
+        throw new Error(`${ROOT}: mount point is busy`);
+      }
+      return real(command, args);
+    });
+    const deps = dependencies(fake);
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([]),
+      tools,
+      dependencies: deps,
+    });
+
+    await expect(staged.stage()).resolves.toBeUndefined();
+    expect(rootRemountAttempts).toBe(2);
+    expect(deps.sleep).toHaveBeenCalledTimes(1);
+    expect(deps.sleep).toHaveBeenCalledWith(25);
+    expect(fake.table.get(ROOT)?.options).toContain('ro');
+  });
+
+  it('bounds a persistent concurrent remount EBUSY and rolls back cleanly', async () => {
+    const fake = mountTable();
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    let rootRemountAttempts = 0;
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (command === tools.mount && args[0] === '-o' && args[2] === ROOT) {
+        rootRemountAttempts += 1;
+        throw new Error(`${ROOT}: mount point is busy`);
+      }
+      return real(command, args);
+    });
+    const deps = dependencies(fake);
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([]),
+      tools,
+      dependencies: deps,
+    });
+
+    await expect(staged.stage()).rejects.toThrow(/mount point is busy/);
+    expect(rootRemountAttempts).toBe(5);
+    expect(deps.sleep).toHaveBeenCalledTimes(4);
+    expect(staged.hasResidue).toBe(false);
+    expect(fake.table.size).toBe(0);
+  });
+
+  it('accepts a busy remount only when exact revalidation proves it already succeeded', async () => {
+    const fake = mountTable();
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    let rootRemountAttempts = 0;
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (command === tools.mount && args[0] === '-o' && args[2] === ROOT) {
+        rootRemountAttempts += 1;
+        await real(command, args);
+        const error = new Error(`${ROOT}: mount point is busy`) as NodeJS.ErrnoException;
+        error.code = 'EBUSY';
+        throw error;
+      }
+      return real(command, args);
+    });
+    const deps = dependencies(fake);
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([]),
+      tools,
+      dependencies: deps,
+    });
+
+    await expect(staged.stage()).resolves.toBeUndefined();
+    expect(rootRemountAttempts).toBe(1);
+    expect(deps.sleep).not.toHaveBeenCalled();
+    expect(fake.table.get(ROOT)?.options).toEqual(
+      expect.arrayContaining(['ro', 'nosuid', 'nodev']),
+    );
+  });
+
+  it('fails closed when a busy remount no longer has exactly one owned record', async () => {
+    const fake = mountTable();
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (command === tools.mount && args[0] === '-o' && args[2] === ROOT) {
+        fake.table.delete(ROOT);
+        throw new Error(`${ROOT}: mount point is busy`);
+      }
+      return real(command, args);
+    });
+    const staged = tree(fake, plan([]));
+
+    await expect(staged.stage()).rejects.toThrow(
+      /Refusing to reconcile busy remount.*found 0 exact-path records.*mount point is busy/,
+    );
+  });
+
+  it('fails closed when a busy remount has stacked exact-path records', async () => {
+    const fake = mountTable();
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    const normalMountInfo = fake.readMountInfo.getMockImplementation() as () => Promise<string>;
+    let duplicateMountInfo = false;
+    fake.readMountInfo.mockImplementation(async () => {
+      const contents = await normalMountInfo();
+      return duplicateMountInfo ? `${contents}\n${contents}` : contents;
+    });
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (command === tools.mount && args[0] === '-o' && args[2] === ROOT) {
+        duplicateMountInfo = true;
+        throw new Error(`${ROOT}: mount point is busy`);
+      }
+      return real(command, args);
+    });
+    const staged = tree(fake, plan([]));
+
+    await expect(staged.stage()).rejects.toThrow(
+      /Refusing to reconcile busy remount.*found 2 exact-path records.*mount point is busy/,
+    );
+    expect(staged.hasResidue).toBe(false);
+    expect(fake.table.size).toBe(0);
   });
 
   it('stages a read-only export without overlays', async () => {
@@ -363,8 +536,9 @@ describe('StagedHostMountTree', () => {
       command: string,
       args: readonly string[],
     ) => Promise<void>;
-    fake.runTool.mockImplementationOnce(async () => {
-      throw new Error('target is busy');
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (command === tools.umount) throw new Error('target is busy');
+      return real(command, args);
     });
     await expect(staged.unmount()).rejects.toThrow(/target is busy/);
     expect(staged.hasResidue).toBe(true);
@@ -375,10 +549,152 @@ describe('StagedHostMountTree', () => {
     expect(fake.table.size).toBe(0);
   });
 
+  it('reconciles a busy unmount that already removed the exact owned mount', async () => {
+    const fake = mountTable();
+    const staged = tree(fake, plan([]));
+    await staged.stage();
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (command === tools.umount) {
+        await real(command, args);
+        throw new Error(`${ROOT}: target is busy`);
+      }
+      return real(command, args);
+    });
+
+    await expect(staged.unmount()).resolves.toBeUndefined();
+    expect(staged.hasResidue).toBe(false);
+    expect(fake.table.size).toBe(0);
+  });
+
+  it('retries transient busy staging-directory removal after mounts are gone', async () => {
+    const fake = mountTable();
+    let rmdirAttempts = 0;
+    const deps = dependencies(fake, {
+      rmdir: jest.fn(async () => {
+        rmdirAttempts += 1;
+        if (rmdirAttempts === 1) {
+          const error = new Error('directory busy') as NodeJS.ErrnoException;
+          error.code = 'EBUSY';
+          throw error;
+        }
+      }),
+    });
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([]),
+      tools,
+      dependencies: deps,
+    });
+    await staged.stage();
+
+    await expect(staged.unmount()).resolves.toBeUndefined();
+    expect(rmdirAttempts).toBe(2);
+    expect(deps.sleep).toHaveBeenCalledTimes(1);
+    expect(staged.hasResidue).toBe(false);
+  });
+
+  it('bounds persistent staging-directory removal and retains residue', async () => {
+    const fake = mountTable();
+    let busy = true;
+    let rmdirAttempts = 0;
+    const deps = dependencies(fake, {
+      rmdir: jest.fn(async () => {
+        rmdirAttempts += 1;
+        if (busy) {
+          const error = new Error('directory not empty') as NodeJS.ErrnoException;
+          error.code = 'ENOTEMPTY';
+          throw error;
+        }
+      }),
+    });
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([]),
+      tools,
+      dependencies: deps,
+    });
+    await staged.stage();
+
+    await expect(staged.unmount()).rejects.toThrow(/directory not empty/);
+    expect(rmdirAttempts).toBe(5);
+    expect(deps.sleep).toHaveBeenCalledTimes(4);
+    expect(staged.hasResidue).toBe(true);
+
+    busy = false;
+    await expect(staged.unmount()).resolves.toBeUndefined();
+    expect(rmdirAttempts).toBe(6);
+    expect(staged.hasResidue).toBe(false);
+  });
+
+  it('keeps bounded retries when an owned path has stacked mount records', async () => {
+    const fake = mountTable();
+    const deps = dependencies(fake);
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([]),
+      tools,
+      dependencies: deps,
+    });
+    await staged.stage();
+    const mountInfo = await fake.readMountInfo();
+    (deps.readMountInfo as jest.Mock).mockResolvedValue(`${mountInfo}\n${mountInfo}`);
+    (deps.runTool as jest.Mock).mockImplementation(async (command: string) => {
+      if (command === tools.umount) throw new Error(`${ROOT}: target is busy`);
+    });
+
+    await expect(staged.unmount()).rejects.toThrow(/target is busy/);
+    expect(deps.sleep).toHaveBeenCalledTimes(4);
+    expect(staged.hasResidue).toBe(true);
+  });
+
+  it('fails closed when busy cleanup no longer owns the staged root', async () => {
+    const fake = mountTable();
+    const staged = tree(
+      fake,
+      plan([
+        { source: '/host/workspace/out', destination: '/host/workspace/out', kind: 'directory' },
+      ]),
+    );
+    await staged.stage();
+    const pending = (staged as unknown as { pendingMounts: Set<string> }).pendingMounts;
+    pending.delete(ROOT);
+    fake.runTool.mockImplementation(async (command: string) => {
+      if (command === tools.umount) throw new Error(`${ROOT}: target is busy`);
+    });
+
+    await expect(staged.unmount()).rejects.toThrow(
+      /Refusing to retry busy unmount outside the owned staged mount tree/,
+    );
+  });
+
   it('fails closed when a remount silently leaves the tree writable', async () => {
     const fake = mountTable({ ineffectiveRemount: true });
     const staged = tree(fake, plan([]));
     await expect(staged.stage()).rejects.toThrow(/not recursively read-only/);
+    expect(staged.hasResidue).toBe(false);
+    expect(fake.table.size).toBe(0);
+  });
+
+  it('fails closed when remount verification finds a missing hardening flag', async () => {
+    const fake = mountTable();
+    const normalMountInfo = fake.readMountInfo.getMockImplementation() as () => Promise<string>;
+    let reads = 0;
+    const staged = tree(fake, plan([]), workspace, {
+      readMountInfo: jest.fn(async () => {
+        const contents = await normalMountInfo();
+        reads += 1;
+        return reads >= 2 ? contents.split(',nodev').join('') : contents;
+      }),
+    });
+
+    await expect(staged.stage()).rejects.toThrow(/missing nodev/);
     expect(staged.hasResidue).toBe(false);
     expect(fake.table.size).toBe(0);
   });
@@ -617,25 +933,70 @@ describe('StagedHostMountTree', () => {
     expect(fake.table.size).toBe(0);
   });
 
-  it('reports both failures when rollback cannot complete', async () => {
+  it('retries a transient concurrent rollback EBUSY without touching a sibling tree', async () => {
+    const fake = mountTable();
+    const siblingRoot = '/run/awf-shares/run/1-workspace';
+    fake.table.set(siblingRoot, { options: ['ro', 'nosuid', 'nodev'], optionalFields: [] });
+    const real = fake.runTool.getMockImplementation() as (
+      command: string,
+      args: readonly string[],
+    ) => Promise<void>;
+    let rootUnmountAttempts = 0;
+    fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
+      if (
+        command === tools.umount &&
+        args[args.length - 1] === ROOT &&
+        ++rootUnmountAttempts === 1
+      ) {
+        throw new Error(`${ROOT}: target is busy`);
+      }
+      return real(command, args);
+    });
+    const deps = dependencies(fake, { statPath: jest.fn(async () => stats('symlink')) });
+    const staged = new StagedHostMountTree({
+      directoryExport: workspace,
+      rootPath: ROOT,
+      plan: plan([
+        { source: '/host/workspace/out', destination: '/host/workspace/out', kind: 'directory' },
+      ]),
+      tools,
+      dependencies: deps,
+    });
+
+    await expect(staged.stage()).rejects.toThrow(/must not be a symbolic link/);
+    expect(rootUnmountAttempts).toBe(2);
+    expect(deps.sleep).toHaveBeenCalledTimes(1);
+    expect(staged.hasResidue).toBe(false);
+    expect(fake.table.has(siblingRoot)).toBe(true);
+    expect(fake.commands).not.toContainEqual([tools.umount, '-R', siblingRoot]);
+  });
+
+  it('reports both failures after bounded persistent rollback EBUSY retries', async () => {
     const fake = mountTable();
     const real = fake.runTool.getMockImplementation() as (
       command: string,
       args: readonly string[],
     ) => Promise<void>;
+    let rootUnmountAttempts = 0;
     fake.runTool.mockImplementation(async (command: string, args: readonly string[]) => {
-      if (command === tools.umount) throw new Error('target is busy');
+      if (command === tools.umount) {
+        rootUnmountAttempts += 1;
+        throw new Error('target is busy');
+      }
       return real(command, args);
     });
+    const deps = dependencies(fake, { statPath: jest.fn(async () => stats('symlink')) });
     const staged = tree(
       fake,
       plan([{ source: '/host/workspace/out', destination: '/host/workspace/out', kind: 'directory' }]),
       workspace,
-      { statPath: jest.fn(async () => stats('symlink')) },
+      deps,
     );
     await expect(staged.stage()).rejects.toThrow(
       /must not be a symbolic link; staged mount cleanup failed: target is busy/,
     );
+    expect(rootUnmountAttempts).toBe(5);
+    expect(deps.sleep).toHaveBeenCalledTimes(4);
     expect(staged.hasResidue).toBe(true);
   });
 
@@ -725,5 +1086,205 @@ describe('StagedHostMountTree', () => {
       },
     );
     await expect(staged.stage()).rejects.toThrow(/Writable overlay was not applied/);
+  });
+
+  describe('masked paths', () => {
+    it('masks a path without forcing the rest of a read-write export read-only', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/workspace/mcp-logs' }]),
+      );
+      await staged.stage();
+      expect(fake.commands).toEqual([
+        [tools.mount, '--rbind', '/host/workspace', ROOT],
+        [tools.mount, '--make-rprivate', ROOT],
+        [tools.mount, '-o', 'remount,bind,nosuid,nodev', `${ROOT}/nested`],
+        [tools.mount, '-o', 'remount,bind,nosuid,nodev', ROOT],
+        [
+          tools.mount,
+          '-t',
+          'tmpfs',
+          '-o',
+          'ro,nosuid,nodev,size=0,mode=000',
+          'none',
+          `${ROOT}/mcp-logs`,
+        ],
+      ]);
+      expect(staged.isStaged).toBe(true);
+      expect(fake.table.get(ROOT)?.options).toContain('rw');
+      expect(fake.table.get(`${ROOT}/nested`)?.options).toContain('rw');
+      expect(fake.table.get(`${ROOT}/mcp-logs`)?.options).toEqual(
+        expect.arrayContaining(['ro', 'nosuid', 'nodev']),
+      );
+    });
+
+    it('preserves read-only nested mounts in a masks-only writable export', async () => {
+      const fake = mountTable({ nestedReadOnly: true });
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/workspace/mcp-logs' }]),
+      );
+      await staged.stage();
+      expect(fake.commands.slice(2, 4)).toEqual([
+        [tools.mount, '-o', 'remount,bind,nosuid,nodev', `${ROOT}/nested`],
+        [tools.mount, '-o', 'remount,bind,nosuid,nodev', ROOT],
+      ]);
+      expect(fake.table.get(ROOT)?.options).toContain('rw');
+      expect(fake.table.get(`${ROOT}/nested`)?.options).toContain('ro');
+      expect(fake.table.get(`${ROOT}/nested`)?.options).toContain('nosuid');
+      expect(fake.table.get(`${ROOT}/nested`)?.options).toContain('nodev');
+    });
+
+    it('unmounts a masks-only writable root deepest-first', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/workspace/mcp-logs' }]),
+      );
+      await staged.stage();
+      await staged.unmount();
+      expect(fake.commands.slice(-2)).toEqual([
+        [tools.umount, `${ROOT}/mcp-logs`],
+        [tools.umount, '-R', ROOT],
+      ]);
+      expect(staged.hasResidue).toBe(false);
+      expect(fake.table.size).toBe(0);
+    });
+
+    it('applies masks after writable overlays on an otherwise read-only export', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan(
+          [{ source: '/host/workspace/out', destination: '/host/workspace/out', kind: 'directory' }],
+          'workspace',
+          [{ destination: '/host/workspace/mcp-logs' }],
+        ),
+      );
+      await staged.stage();
+      expect(fake.commands.slice(-4)).toEqual([
+        [tools.mount, '--bind', '/host/workspace/out', `${ROOT}/out`],
+        [tools.mount, '--make-rprivate', `${ROOT}/out`],
+        [tools.mount, '-o', 'remount,bind,rw,nosuid,nodev', `${ROOT}/out`],
+        [
+          tools.mount,
+          '-t',
+          'tmpfs',
+          '-o',
+          'ro,nosuid,nodev,size=0,mode=000',
+          'none',
+          `${ROOT}/mcp-logs`,
+        ],
+      ]);
+      expect(fake.table.get(ROOT)?.options).toContain('ro');
+      expect(fake.table.get(`${ROOT}/out`)?.options).toContain('rw');
+      expect(fake.table.get(`${ROOT}/mcp-logs`)?.options).toContain('ro');
+    });
+
+    it('masks a path on an already read-only export', async () => {
+      const fake = mountTable();
+      const staged = tree(fake, plan([], 'cache', [{ destination: '/host/cache/mcp-logs' }]), cache);
+      await staged.stage();
+      expect(fake.table.get(`${ROOT}/mcp-logs`)?.options).toContain('ro');
+    });
+
+    it('rejects a masked path overlapping a writable overlay', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan(
+          [{ source: '/host/workspace/out', destination: '/host/workspace/out', kind: 'directory' }],
+          'workspace',
+          [{ destination: '/host/workspace/out' }],
+        ),
+      );
+      await expect(staged.stage()).rejects.toThrow(/overlaps a writable overlay/);
+      expect(fake.commands).toEqual([]);
+    });
+
+    it('rejects duplicate and overlapping masked path destinations', async () => {
+      const fake = mountTable();
+      const duplicate = tree(
+        fake,
+        plan([], 'workspace', [
+          { destination: '/host/workspace/mcp-logs' },
+          { destination: '/host/workspace/mcp-logs' },
+        ]),
+      );
+      await expect(duplicate.stage()).rejects.toThrow(/Duplicate .* destination/);
+
+      const overlapping = tree(
+        fake,
+        plan([], 'workspace', [
+          { destination: '/host/workspace/sandbox' },
+          { destination: '/host/workspace/sandbox/logs' },
+        ]),
+      );
+      await expect(overlapping.stage()).rejects.toThrow(/Overlapping .* destinations/);
+    });
+
+    it('rejects more masked paths than the supported maximum', async () => {
+      const fake = mountTable();
+      const maskedPaths = Array.from({ length: 17 }, (_value, index) => ({
+        destination: `/host/workspace/mask${index}`,
+      }));
+      const staged = tree(fake, plan([], 'workspace', maskedPaths));
+      await expect(staged.stage()).rejects.toThrow(/exceeds 16 masked paths/);
+      expect(fake.commands).toEqual([]);
+    });
+
+    it('rejects a masked path outside the export source', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/other/mcp-logs' }]),
+      );
+      await expect(staged.stage()).rejects.toThrow(/mask destination must stay inside/);
+      expect(fake.commands).toEqual([]);
+    });
+
+    it('requires the masked destination to already exist as a directory', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/workspace/mcp-logs' }]),
+        workspace,
+        { statPath: jest.fn(async () => stats('file')) },
+      );
+      await expect(staged.stage()).rejects.toThrow(/must be an existing directory/);
+    });
+
+    it('rejects a masked destination reached through a symlink', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/workspace/mcp-logs' }]),
+        workspace,
+        {
+          realpath: jest.fn(async (filePath: string) =>
+            filePath === `${ROOT}/mcp-logs` ? '/etc' : filePath,
+          ),
+        },
+      );
+      await expect(staged.stage()).rejects.toThrow(/destination must be canonical/);
+      expect(fake.commands.flat()).not.toContain('-t');
+    });
+
+    it('fails closed when a masked mount is not applied', async () => {
+      const fake = mountTable();
+      const staged = tree(
+        fake,
+        plan([], 'workspace', [{ destination: '/host/workspace/mcp-logs' }]),
+        workspace,
+        {
+          runTool: jest.fn(async (command: string, args: readonly string[]) => {
+            if (args[0] === '-t') return; // pretend the tmpfs mount silently no-ops
+            return fake.runTool(command, args);
+          }),
+        },
+      );
+      await expect(staged.stage()).rejects.toThrow(/Masked path was not applied/);
+    });
   });
 });

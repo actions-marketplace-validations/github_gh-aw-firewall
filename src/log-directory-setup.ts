@@ -4,6 +4,7 @@ import { logger } from './logger';
 import { getSafeHostUid, getSafeHostGid } from './host-env';
 import { LogPaths } from './log-paths';
 import { ensureDirectory } from './fs-utils';
+import { resolveRunnerVisibleHostPath } from './services/host-path-prefix';
 
 export const MCP_LOGS_MAX_AGE_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -33,7 +34,7 @@ export function pruneStaleMcpLogDirs(mcpLogsDir: string): void {
  * Creates all log and session-state directories required before container
  * startup, setting ownership and permissions for the respective service users.
  */
-export function prepareLogDirectories(logPaths: LogPaths): void {
+export function prepareLogDirectories(logPaths: LogPaths, dockerHostPathPrefix?: string): void {
   // Create agent logs directory for persistence
   // Chown to host user so Copilot CLI can write logs (AWF runs as root, agent runs as host user)
   ensureDirectory(logPaths.agentLogs, {
@@ -69,9 +70,12 @@ export function prepareLogDirectories(logPaths: LogPaths): void {
   // Layer 2 (squid-service.ts entrypoint): chown preflight inside the container.
   //   Repairs ownership when Docker daemon auto-creates the bind-mount source
   //   as root:root on split filesystems. Required for ARC/DinD.
-  // Layer 3 (container-stop.ts): chmod -R a+rX before compose down.
-  //   Ensures the runner user can read log files (owned by UID 13) after
-  //   the container is removed, for `awf logs summary` and artifact uploads.
+  // Layer 3 (container-stop.ts): chown to the runner UID + chmod -R a+rX inside
+  //   the still-running container, before reading access.log for post-run
+  //   diagnostics and before compose down.
+  //   Ensures the runner user can read log files (written by UID 13) both while
+  //   the container runs and after it is removed, for blocked-domain
+  //   diagnostics, `awf logs summary` and artifact uploads.
   //
   // Each layer compensates for the others' failure modes. Do not remove any
   // layer without understanding all deployment topologies (shared FS, DinD,
@@ -98,7 +102,7 @@ export function prepareLogDirectories(logPaths: LogPaths): void {
   // If proxyLogsDir is specified, write inside it as a subdirectory (timeout-safe,
   // and included in the firewall-audit-logs artifact upload automatically)
   // Otherwise, write to workDir/api-proxy-logs (will be moved to /tmp after cleanup)
-  // Note: API proxy runs as user 'apiproxy' (non-root)
+  // API proxy runs with the host UID/GID (non-root).
   ensureDirectory(logPaths.apiProxyLogs, {
     mode: 0o777,
     onCreate: () => {
@@ -108,8 +112,34 @@ export function prepareLogDirectories(logPaths: LogPaths): void {
   });
   logger.debug(`API proxy logs directory created at: ${logPaths.apiProxyLogs}`);
 
+  // A shared `/tmp` --docker-host-path-prefix rewrites a log directory outside
+  // /tmp (e.g. under ${RUNNER_TEMP}) to `/tmp<dir>`, which is where the daemon
+  // writes token-usage.jsonl and where the runner must read it. Pre-create that
+  // directory too, otherwise the daemon auto-creates it root-owned and the
+  // non-root api-proxy cannot write any token usage at all.
+  const runnerVisibleApiProxyLogs = resolveRunnerVisibleHostPath(logPaths.apiProxyLogs, dockerHostPathPrefix);
+  if (runnerVisibleApiProxyLogs !== logPaths.apiProxyLogs) {
+    ensureDirectory(runnerVisibleApiProxyLogs, {
+      mode: 0o777,
+      onCreate: () => fs.chmodSync(runnerVisibleApiProxyLogs, 0o777),
+    });
+    logger.warn(
+      `--docker-host-path-prefix ${dockerHostPathPrefix} translates the API proxy log directory; ` +
+        `token-usage.jsonl will be written to ${runnerVisibleApiProxyLogs} (not ${logPaths.apiProxyLogs}). ` +
+        'Place --proxy-logs-dir under the shared prefix to keep the path unchanged.',
+    );
+  }
+
+  const runnerVisibleCliProxyLogs = resolveRunnerVisibleHostPath(logPaths.cliProxyLogs, dockerHostPathPrefix);
+  if (runnerVisibleCliProxyLogs !== logPaths.cliProxyLogs) {
+    ensureDirectory(runnerVisibleCliProxyLogs, {
+      mode: 0o777,
+      onCreate: () => fs.chmodSync(runnerVisibleCliProxyLogs, 0o777),
+    });
+  }
+
   // Create CLI proxy logs directory for persistence
-  // Note: CLI proxy runs as user 'cliproxy' (non-root)
+  // CLI proxy runs with the host UID/GID (non-root).
   ensureDirectory(logPaths.cliProxyLogs, {
     mode: 0o777,
     onCreate: () => fs.chmodSync(logPaths.cliProxyLogs, 0o777),

@@ -5,10 +5,77 @@ import {
   ENCLAVES_DEFAULTS,
 } from '../types/enclave-options';
 import { normalizeEnclavesConfig } from './enclave-parser';
+import {
+  GH_AW_DYNAMIC_ENCLAVE_POLICY_FIXTURE,
+  dynamicEnclavePolicyFixture,
+  typedDynamicEnclavePolicyFixture,
+} from '../enclave/dynamic-policy.test-utils';
+
+/** The exact envelope the gh-aw compiler emits (see the fixture's provenance). */
+const dynamicPolicy = typedDynamicEnclavePolicyFixture;
 
 const repository = { repo: 'octo-org/private-service', sensitivity: 'confidential' as const };
 
 describe('normalizeEnclavesConfig', () => {
+  it.each(['gvisor', 'sbx', 'cloud-hypervisor'] as const)(
+    'inherits the selected %s backend for both executor kinds', primaryRuntime => {
+      const config = normalizeEnclavesConfig([
+        { script: {}, repos: [repository] },
+        { agent: { model: 'gpt-5' }, repos: [repository] },
+      ], { primaryRuntime });
+      expect(config?.executors.script.runtime).toBe(primaryRuntime);
+      expect(config?.executors.agent.runtime).toBe(primaryRuntime);
+    },
+  );
+
+  it('normalizes the default and aliased primary backends', () => {
+    for (const primaryRuntime of [undefined, 'docker', 'runc']) {
+      expect(normalizeEnclavesConfig([
+        { script: {}, repos: [repository] },
+      ], { primaryRuntime })?.executors.script.runtime).toBe('docker');
+    }
+    expect(normalizeEnclavesConfig([
+      { script: {}, repos: [repository] },
+    ], { primaryRuntime: 'runsc' })?.executors.script.runtime).toBe('gvisor');
+  });
+
+  it('rejects explicit mismatches instead of rewriting them', () => {
+    expect(() => normalizeEnclavesConfig([
+      { script: {}, runtime: 'docker', repos: [repository] },
+    ], { primaryRuntime: 'cloud-hypervisor' })).toThrow(/one sandbox backend/);
+    expect(() => normalizeEnclavesConfig([
+      { script: {}, runtime: 'cloud-hypervisor', repos: [repository] },
+    ], {})).toThrow(/primary backend "docker"/);
+  });
+
+  it('accepts an explicit matching runtime and ignores unselected executor defaults', () => {
+    const config = normalizeEnclavesConfig([
+      { script: {}, runtime: 'cloud-hypervisor', repos: [repository] },
+    ], { primaryRuntime: 'cloud-hypervisor' });
+    expect(config?.executors.script.runtime).toBe('cloud-hypervisor');
+    expect(config?.executors.agent.enabled).toBe(false);
+  });
+
+  it('preserves an explicitly selected VM agent under a Docker primary', () => {
+    const config = normalizeEnclavesConfig([{
+      agent: { model: 'gpt-5', tools: { github: {
+        allowed: ['issue_read'], allowedRepos: [repository.repo],
+      } } },
+      runtime: 'cloud-hypervisor', repos: [repository],
+    }], { primaryRuntime: 'docker' });
+    expect(config?.executors.agent.runtime).toBe('cloud-hypervisor');
+    expect(config?.executors.agent.tools?.github?.allowed).toEqual(['issue_read']);
+    expect(config?.executors.script.enabled).toBe(false);
+  });
+
+  it('keeps unsupported NVX enclave execution closed without affecting standalone NVX', () => {
+    expect(() => normalizeEnclavesConfig([
+      { script: {}, repos: [repository] },
+    ], { primaryRuntime: 'nvx' })).toThrow(/NVX enclaves are not implemented/);
+    expect(normalizeEnclavesConfig(undefined, { primaryRuntime: 'nvx' })).toBeUndefined();
+    expect(normalizeEnclavesConfig([], { primaryRuntime: 'nvx' })?.enabled).toBe(false);
+  });
+
   it('is absent unless the section is configured', () => {
     expect(normalizeEnclavesConfig(undefined)).toBeUndefined();
   });
@@ -69,6 +136,16 @@ describe('normalizeEnclavesConfig', () => {
     });
   });
 
+  it('preserves cloud-hypervisor independently for script and agent entries', () => {
+    const config = normalizeEnclavesConfig([
+      { script: {}, runtime: 'cloud-hypervisor', repos: [repository] },
+      { agent: { model: 'gpt-5' }, runtime: 'cloud-hypervisor', repos: [repository] },
+    ]);
+
+    expect(config?.executors.script.runtime).toBe('cloud-hypervisor');
+    expect(config?.executors.agent.runtime).toBe('cloud-hypervisor');
+  });
+
   it('preserves the closed enclave GitHub CLI profile', () => {
     expect(normalizeEnclavesConfig([
       {
@@ -79,6 +156,30 @@ describe('normalizeEnclavesConfig', () => {
         repos: [repository],
       },
     ])?.executors.agent.github).toEqual({ cli: 'issues-read-v1' });
+  });
+
+  it('preserves the tools.github shape', () => {
+    expect(normalizeEnclavesConfig([
+      {
+        agent: {
+          model: 'gpt-5',
+          tools: {
+            github: {
+              allowed: ['list_issues', 'issue_read'],
+              allowedRepos: ['octo-org/repo-b'],
+              minIntegrity: 'none',
+            },
+          },
+        },
+        repos: [repository],
+      },
+    ])?.executors.agent.tools).toEqual({
+      github: {
+        allowed: ['list_issues', 'issue_read'],
+        allowedRepos: ['octo-org/repo-b'],
+        minIntegrity: 'none',
+      },
+    });
   });
 
   it('keeps a repository shared by both entries as one budgeted catalog entry', () => {
@@ -112,6 +213,27 @@ describe('normalizeEnclavesConfig', () => {
       { agent: { model: 'gpt-5' }, repos: [repository] },
     ])).toThrow(/at most one "agent" entry/);
   });
+
+  it('rejects a "dynamic" policy declared on a "script" entry', () => {
+    expect(() => normalizeEnclavesConfig([
+      { script: {}, dynamic: dynamicPolicy() } as never,
+    ])).toThrow(/agent-only/);
+  });
+
+  it('rejects "dynamic" and "repos" declared together on the same entry', () => {
+    expect(() => normalizeEnclavesConfig([
+      { agent: { model: 'gpt-5' }, repos: [repository], dynamic: dynamicPolicy() },
+    ])).toThrow(/mutually exclusive/);
+  });
+
+  it('normalizes an agent entry with a dynamic policy and no static repos', () => {
+    const config = normalizeEnclavesConfig([
+      { agent: { model: 'gpt-5' }, dynamic: dynamicPolicy() },
+    ]);
+    expect(config?.privateRepos).toEqual([]);
+    expect(config?.executors.agent.repos).toEqual([]);
+    expect(config?.executors.agent.dynamic).toEqual(dynamicPolicy());
+  });
 });
 
 describe('enclaves JSON Schema', () => {
@@ -126,6 +248,35 @@ describe('enclaves JSON Schema', () => {
     expect(validateAwfFileConfig({
       enclaves: [{
         agent: { model: 'gpt-5', github: { cli: 'issues-read-v1' } },
+        repos: [repository],
+      }],
+    })).toEqual([]);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: {
+          model: 'gpt-5',
+          tools: {
+            github: {
+              allowed: ['list_issues', 'issue_read'],
+              allowedRepos: ['octo-org/repo-b'],
+              minIntegrity: 'none',
+            },
+          },
+        },
+        repos: [repository],
+      }],
+    })).toEqual([]);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        script: {},
+        runtime: 'cloud-hypervisor',
+        repos: [repository],
+      }],
+    })).toEqual([]);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        runtime: 'cloud-hypervisor',
         repos: [repository],
       }],
     })).toEqual([]);
@@ -192,6 +343,27 @@ describe('enclaves JSON Schema', () => {
     }).length).toBeGreaterThan(0);
     expect(validateAwfFileConfig({
       enclaves: [{
+        agent: { model: 'gpt-5', tools: { github: { allowed: ['delete_issue'], allowedRepos: ['o/r'] } } },
+        repos: [repository],
+      }],
+    }).length).toBeGreaterThan(0);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5', tools: { github: { allowed: ['list_issues'] } } },
+        repos: [repository],
+      }],
+    }).length).toBeGreaterThan(0);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: {
+          model: 'gpt-5',
+          tools: { github: { allowed: ['list_issues'], allowedRepos: ['o/r'], minIntegrity: 'bogus' } },
+        },
+        repos: [repository],
+      }],
+    }).length).toBeGreaterThan(0);
+    expect(validateAwfFileConfig({
+      enclaves: [{
         agent: { model: 'gpt-5', maxModelRequests: 3, maxModelTokens: 10_000 },
         runtime: 'gvisor',
         image: 'registry/agent@sha256:abc',
@@ -212,6 +384,120 @@ describe('enclaves JSON Schema', () => {
     }).length).toBeGreaterThan(0);
     expect(validateAwfFileConfig({
       enclaves: [{ agent: { model: 'gpt-5' }, repos: [repository], timeout: 4741 }],
+    }).length).toBeGreaterThan(0);
+  });
+
+  it('accepts the exact gh-aw compiler dynamic envelope verbatim', () => {
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: GH_AW_DYNAMIC_ENCLAVE_POLICY_FIXTURE,
+      }],
+    })).toEqual([]);
+  });
+
+  it('rejects the superseded pre-gh-aw#58880 field names', () => {
+    const legacyLimits = validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: dynamicEnclavePolicyFixture({
+          limits: {
+            timeout: 120,
+            memoryLimit: '1g',
+            cpuLimit: '1',
+            pidsLimit: 128,
+            tmpfsLimit: '256m',
+            maxOutputBytes: 8192,
+            maxTaskBytes: 4096,
+          },
+        }),
+      }],
+    });
+    expect(legacyLimits.length).toBeGreaterThan(0);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: dynamicEnclavePolicyFixture({
+          quotas: { totalInvocations: 10, totalBytes: 1_000_000, totalSeconds: 3600 },
+        }),
+      }],
+    }).length).toBeGreaterThan(0);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: dynamicEnclavePolicyFixture({ auditLabels: { run: 'test-run' } }),
+      }],
+    }).length).toBeGreaterThan(0);
+  });
+
+  it('accepts a dynamic-only agent entry and rejects malformed dynamic envelopes', () => {
+    expect(validateAwfFileConfig({
+      enclaves: [{ agent: { model: 'gpt-5' }, dynamic: dynamicPolicy() }],
+    })).toEqual([]);
+    // dynamic on a script entry is rejected
+    expect(validateAwfFileConfig({
+      enclaves: [{ script: {}, dynamic: dynamicPolicy() }],
+    }).length).toBeGreaterThan(0);
+    // dynamic and repos together on the same entry are rejected
+    expect(validateAwfFileConfig({
+      enclaves: [{ agent: { model: 'gpt-5' }, repos: [repository], dynamic: dynamicPolicy() }],
+    }).length).toBeGreaterThan(0);
+    // an entry with neither repos nor dynamic is rejected
+    expect(validateAwfFileConfig({
+      enclaves: [{ agent: { model: 'gpt-5' } }],
+    }).length).toBeGreaterThan(0);
+    // unknown policy version fails closed
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: {
+          ...dynamicPolicy(),
+          githubPolicy: { version: 'github-repository-read-v2', tools: ['list_issues', 'issue_read'] },
+        },
+      }],
+    }).length).toBeGreaterThan(0);
+    // a wider tool set than the closed v1 pair fails closed
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: {
+          ...dynamicPolicy(),
+          githubPolicy: { version: 'github-repository-read-v1', tools: ['list_issues'] },
+        },
+      }],
+    }).length).toBeGreaterThan(0);
+    // an unknown field on the envelope fails closed
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: { ...dynamicPolicy(), unknownField: true },
+      }],
+    }).length).toBeGreaterThan(0);
+    // a non-canonical (uppercase) selector fails closed
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: { ...dynamicPolicy(), allowedOwners: [], allowedRepositories: ['Octo-Org/Repo'] },
+      }],
+    }).length).toBeGreaterThan(0);
+    // an empty or duplicated audit-label array fails closed
+    expect(validateAwfFileConfig({
+      enclaves: [{ agent: { model: 'gpt-5' }, dynamic: dynamicEnclavePolicyFixture({ auditLabels: [] }) }],
+    }).length).toBeGreaterThan(0);
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: dynamicEnclavePolicyFixture({ auditLabels: ['dup', 'dup'] }),
+      }],
+    }).length).toBeGreaterThan(0);
+    // quotas beyond the compiler's own bounds fail closed
+    expect(validateAwfFileConfig({
+      enclaves: [{
+        agent: { model: 'gpt-5' },
+        dynamic: dynamicEnclavePolicyFixture({
+          quotas: { maxInvocations: 10_001, maxOutputBytes: 1, maxExecutionSeconds: 1 },
+        }),
+      }],
     }).length).toBeGreaterThan(0);
   });
 });

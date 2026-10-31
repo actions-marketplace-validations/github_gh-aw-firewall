@@ -2,8 +2,9 @@
 
 const { randomUUID } = require('crypto');
 const { logRequest } = require('./logging');
-const { shouldStripHeader, sanitizeAcceptEncoding } = require('./proxy-utils');
+const { shouldStripHeader, sanitizeAcceptEncoding, getTargetHostname } = require('./proxy-utils');
 const { maybeStripLearnedHeaderValues } = require('./deprecated-header-tracker');
+const { recordCopilotInjectedHeaders } = require('./copilot-auth-diagnostics');
 
 /** Integration ID used when the caller did not configure one. */
 const DEFAULT_COPILOT_INTEGRATION_ID = 'agentic-workflows';
@@ -81,15 +82,26 @@ function ensureHeader(headers, name, value) {
 }
 
 function isCopilotHost(targetHost) {
+  targetHost = getTargetHostname(targetHost);
   return targetHost === 'githubcopilot.com' ||
     (typeof targetHost === 'string' && targetHost.endsWith('.githubcopilot.com'));
 }
 
+function isCopilotIntegrationHost(targetHost) {
+  targetHost = getTargetHostname(targetHost);
+  return isCopilotHost(targetHost)
+    || (typeof targetHost === 'string' && /^copilot-api\.[^.]+\.ghe\.com$/.test(targetHost));
+}
+
 function mergeInjectedHeaders(headers, injectHeaders, targetHost) {
-  const copilotHost = isCopilotHost(targetHost);
+  const copilotHost = isCopilotIntegrationHost(targetHost);
   for (const [name, value] of Object.entries(injectHeaders)) {
     if (!copilotHost && name.toLowerCase() === 'copilot-integration-id') continue;
-    headers[name] = value;
+    if (copilotHost && name.toLowerCase() === 'copilot-integration-id') {
+      ensureHeader(headers, name, value);
+    } else {
+      headers[name] = value;
+    }
   }
 }
 
@@ -122,10 +134,10 @@ function applyCopilotHostHeaders(headers, targetHost) {
  * @param {Buffer} body - Final (possibly transformed) request body
  * @param {number} inboundBytes - Original body size before transforms
  * @param {import('http').IncomingMessage} req
- * @param {{ injectHeaders: object, provider: string, targetHost: string, requestId: string }} opts
+ * @param {{ injectHeaders: object, provider: string, targetHost: string, requestId: string, codexCompatibility?: object|null, wireApiCompatibility?: object|null }} opts
  * @returns {object} Headers object for the upstream request
  */
-function buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider, targetHost, requestId }) {
+function buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider, targetHost, requestId, codexCompatibility = null, wireApiCompatibility = null }) {
   const headers = {};
   for (const [name, value] of Object.entries(req.headers)) {
     if (!shouldStripHeader(name)) headers[name] = value;
@@ -151,6 +163,15 @@ function buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider,
     headers['accept-encoding'] = sanitizeAcceptEncoding(headers['accept-encoding']);
   }
 
+  // The Codex compatibility adapter rewrites the raw JSON/SSE response body
+  // (translating Copilot `function_call` events back into Codex
+  // `custom_tool_call` events). It operates on plain text, so a compressed
+  // response would leave the translated payload silently unrewritten. Force
+  // identity encoding whenever the request was translated for compatibility.
+  if (codexCompatibility || (wireApiCompatibility && !wireApiCompatibility.passthrough)) {
+    headers['accept-encoding'] = 'identity';
+  }
+
   const injectedKey = Object.entries(injectHeaders).find(([k]) =>
     ['x-api-key', 'authorization', 'x-goog-api-key'].includes(k.toLowerCase())
   )?.[1];
@@ -165,6 +186,7 @@ function buildRequestHeaders(body, inboundBytes, req, { injectHeaders, provider,
     });
   }
 
+  if (provider === 'copilot') recordCopilotInjectedHeaders(req, injectHeaders);
   return headers;
 }
 

@@ -1,6 +1,11 @@
 import fs from 'fs';
 import path from 'path';
 
+import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
+import {
+  expectNoHostGitHubTokens,
+  githubTokenEnvNames,
+} from '../test-helpers/github-token-env.test-utils';
 import { generateDockerCompose, WrapperConfig, baseConfig, mockNetworkConfig, useTempWorkDir } from './service-test-setup.test-utils';
 
 // Create mock functions (must remain per-file — jest.mock() is hoisted before imports)
@@ -10,6 +15,31 @@ import { generateDockerCompose, WrapperConfig, baseConfig, mockNetworkConfig, us
 jest.mock('execa', () => require('../test-helpers/mock-execa.test-utils').execaMockFactory());
 
 let mockConfig: WrapperConfig;
+
+function expectOidcCredentialsScrubbed(config: WrapperConfig): void {
+  const origUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+  const origToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+  process.env.ACTIONS_ID_TOKEN_REQUEST_URL = 'https://token.actions.githubusercontent.com/abc';
+  process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'test-oidc-token-value';
+
+  try {
+    const result = generateDockerCompose(config, mockNetworkConfig);
+    const env = result.services.agent.environment as Record<string, string>;
+    expect(env.ACTIONS_ID_TOKEN_REQUEST_URL).toBeUndefined();
+    expect(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN).toBeUndefined();
+  } finally {
+    if (origUrl !== undefined) {
+      process.env.ACTIONS_ID_TOKEN_REQUEST_URL = origUrl;
+    } else {
+      delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
+    }
+    if (origToken !== undefined) {
+      process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = origToken;
+    } else {
+      delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
+    }
+  }
+}
 
 describe('agent environment: credentials', () => {
   useTempWorkDir(
@@ -151,53 +181,11 @@ describe('agent environment: credentials', () => {
   });
 
   it('should never pass Actions OIDC minting variables to the agent', () => {
-    const origUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-    const origToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-    process.env.ACTIONS_ID_TOKEN_REQUEST_URL = 'https://token.actions.githubusercontent.com/abc';
-    process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'test-oidc-token-value';
-
-    try {
-      const result = generateDockerCompose(mockConfig, mockNetworkConfig);
-      const env = result.services.agent.environment as Record<string, string>;
-      expect(env.ACTIONS_ID_TOKEN_REQUEST_URL).toBeUndefined();
-      expect(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN).toBeUndefined();
-    } finally {
-      if (origUrl !== undefined) {
-        process.env.ACTIONS_ID_TOKEN_REQUEST_URL = origUrl;
-      } else {
-        delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-      }
-      if (origToken !== undefined) {
-        process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = origToken;
-      } else {
-        delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-      }
-    }
+    expectOidcCredentialsScrubbed(mockConfig);
   });
 
   it('should exclude Actions OIDC minting variables from --env-all', () => {
-    const origUrl = process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-    const origToken = process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-    process.env.ACTIONS_ID_TOKEN_REQUEST_URL = 'https://token.actions.githubusercontent.com/abc';
-    process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'test-oidc-token-value';
-
-    try {
-      const result = generateDockerCompose({ ...mockConfig, envAll: true }, mockNetworkConfig);
-      const env = result.services.agent.environment as Record<string, string>;
-      expect(env.ACTIONS_ID_TOKEN_REQUEST_URL).toBeUndefined();
-      expect(env.ACTIONS_ID_TOKEN_REQUEST_TOKEN).toBeUndefined();
-    } finally {
-      if (origUrl !== undefined) {
-        process.env.ACTIONS_ID_TOKEN_REQUEST_URL = origUrl;
-      } else {
-        delete process.env.ACTIONS_ID_TOKEN_REQUEST_URL;
-      }
-      if (origToken !== undefined) {
-        process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = origToken;
-      } else {
-        delete process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN;
-      }
-    }
+    expectOidcCredentialsScrubbed({ ...mockConfig, envAll: true });
   });
 
   it('should reject explicit Actions OIDC minting variables in additionalEnv', () => {
@@ -312,6 +300,58 @@ describe('agent environment: credentials', () => {
     } finally {
       if (prevToken !== undefined) process.env.GITHUB_TOKEN = prevToken;
       else delete process.env.GITHUB_TOKEN;
+    }
+  });
+
+  it('should keep host GitHub tokens out of the primary container when enclaves are enabled', () => {
+    const names = githubTokenEnvNames();
+    const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+    Object.assign(process.env, {
+      GH_TOKEN: 'host-gh-token',
+      GITHUB_TOKEN: 'host-github-token',
+      GITHUB_PERSONAL_ACCESS_TOKEN: 'host-pat',
+    });
+
+    try {
+      const configWithEnclaves = {
+        ...mockConfig,
+        enableApiProxy: false,
+        envAll: true,
+        enclaves: normalizeEnclavesConfig([
+          { script: {}, repos: [{ repo: 'github/gh-aw-firewall', sensitivity: 'public' }] },
+        ]),
+      };
+      const result = generateDockerCompose(configWithEnclaves, mockNetworkConfig);
+      const env = result.services.agent.environment as Record<string, string>;
+
+      expectNoHostGitHubTokens(env, names);
+    } finally {
+      for (const name of names) {
+        if (previous[name] === undefined) delete process.env[name];
+        else process.env[name] = previous[name];
+      }
+    }
+  });
+
+  it('should fail closed when a host GitHub token is copied to another environment variable', () => {
+    const originalToken = process.env.GITHUB_PAT;
+    process.env.GITHUB_PAT = 'host-gh-token-value';
+
+    try {
+      const configWithTokenAlias = {
+        ...mockConfig,
+        enableApiProxy: false,
+        additionalEnv: { STAGING_TOKEN_COPY: 'host-gh-token-value' },
+        enclaves: normalizeEnclavesConfig([
+          { script: {}, repos: [{ repo: 'github/gh-aw-firewall', sensitivity: 'public' }] },
+        ]),
+      };
+
+      expect(() => generateDockerCompose(configWithTokenAlias, mockNetworkConfig))
+        .toThrow(/host GitHub token through agent sandbox variable STAGING_TOKEN_COPY/);
+    } finally {
+      if (originalToken === undefined) delete process.env.GITHUB_PAT;
+      else process.env.GITHUB_PAT = originalToken;
     }
   });
 

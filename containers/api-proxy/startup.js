@@ -13,7 +13,10 @@ function bootPrimary({
   otelShutdown,
   logRequest,
   HTTPS_PROXY,
+  routing,
+  catalogue,
 }) {
+  const catalogueReady = catalogue?.start();
   logRequest('info', 'startup', {
     message: 'Starting AWF API proxy sidecar',
     squid_proxy: HTTPS_PROXY || 'not configured',
@@ -70,7 +73,7 @@ function bootPrimary({
       });
 
       Promise.all(oidcInitPromises).then(() => {
-        validateApiKeys(adaptersToStart).catch((err) => {
+        const validation = validateApiKeys(adaptersToStart).catch((err) => {
           logRequest('error', 'key_validation_error', { message: 'Unexpected error during key validation', error: String(err) });
           setKeyValidationComplete(true);
         });
@@ -81,19 +84,35 @@ function bootPrimary({
           logRequest('error', 'model_fetch_error', { message: 'Unexpected error fetching startup models', error: String(err) });
           setModelFetchComplete(true);
           writeModelsJson();
+        }).then(async () => {
+          // Routing needs a validated key to reach /models and the fetched
+          // catalogue to build candidates, so it waits on both.
+          if (routing) {
+            await validation;
+            await routing.start();
+          }
+        }).catch(() => {
+          logRequest('error', 'model_routing_bootstrap_error', { message: 'Private model routing bootstrap failed' });
         });
       });
     }
   }
 
   for (const adapter of adaptersToStart) {
-    const server = createProviderServer(adapter);
+    const server = createProviderServer(adapter, catalogueReady);
     startedServers.push(server);
     server.listen(adapter.port, '0.0.0.0', () => {
       logRequest('info', 'server_start', {
         message: `${adapter.name} proxy listening on port ${adapter.port}`,
         target: adapter.isEnabled() ? adapter.getTargetHost() : '(not configured)',
       });
+      if (adapter.isEnabled() && adapter.getTargetScheme && adapter.getTargetScheme() === 'http') {
+        logRequest('warn', 'insecure_api_target', {
+          message: `${adapter.name} target is configured with an explicit http:// scheme; ` +
+            'the provider credential injected by this sidecar will be sent in cleartext to that host.',
+          target: adapter.getTargetHost(),
+        });
+      }
       if (adapter.participatesInValidation) {
         onListenerReady();
       }
@@ -113,6 +132,10 @@ function bootPrimary({
       process.exit(0);
     }, Number.isFinite(forceExitMs) && forceExitMs > 0 ? forceExitMs : 8000);
     forceExitTimer.unref();
+    await catalogue?.stop();
+    await routing?.shutdown().catch(() => {
+      logRequest('error', 'model_routing_shutdown_error', { message: 'Model routing shutdown failed' });
+    });
     await Promise.all(startedServers.map((server) => {
       if (typeof server.shutdownConnections === 'function') {
         return server.shutdownConnections();
@@ -137,6 +160,13 @@ function bootPrimary({
     await closeLogStream();
     await otelShutdown();
     clearTimeout(forceExitTimer);
+    try {
+      routing?.completeShutdown?.();
+    } catch {
+      // 78 is the routing-failure code the CLI reports to the caller.
+      process.exit(78);
+      return;
+    }
     process.exit(0);
   }
 

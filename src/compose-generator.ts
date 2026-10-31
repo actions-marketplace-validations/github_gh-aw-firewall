@@ -10,7 +10,7 @@ import { resolveLogPaths } from './log-paths';
 import { redactSensitiveValues } from './redact-secrets';
 import { buildSquidService } from './services/squid-service';
 import { buildAgentEnvironment, buildAgentVolumes, buildAgentService } from './services/agent-service';
-import { assembleOptionalServices } from './services/optional-services';
+import { assembleOptionalServices, filterAgentVolumesForSysroot } from './services/optional-services';
 import { buildComposeNetworks } from './compose-network';
 import { runtimeNeedsStaticDns, runtimeUsesComposeAgent } from './container-runtime';
 import { API_PROXY_PORTS } from './types/ports';
@@ -19,12 +19,21 @@ import {
   ENCLAVE_AGENT_EGRESS_NETWORK,
   ENCLAVE_AGENT_NETWORK,
   ENCLAVE_AGENT_SUBNET,
-  ENCLAVE_GITHUB_CONTROL_SUBNET,
-  ENCLAVE_GITHUB_CONTROL_NETWORK,
   ENCLAVE_MCP_CONTROL_NETWORK,
 } from './enclave/network';
 import { buildInternalServiceHosts } from './services/internal-service-hosts';
 import { filterComposeCapDrop } from './capability-filter';
+import { ROUTING_NETWORK_NAME } from './services/router-service';
+import { redactOtlpEnvValue } from './services/router-otel-env';
+import {
+  GEMINI_SETTINGS_MOUNT,
+  GEMINI_SETTINGS_VOLUME,
+} from './services/gemini-settings-service';
+import {
+  isGeminiProxyRoutingEnabled,
+  shouldPinGeminiAuthType,
+  GEMINI_CLI_SYSTEM_SETTINGS_DIRECTORY,
+} from './services/credentials/gemini-cli-settings';
 
 /**
  * Generates Docker Compose configuration
@@ -34,7 +43,17 @@ export function generateDockerCompose(
   config: WrapperConfig,
   networkConfig: { subnet: string; squidIp: string; agentIp: string; proxyIp?: string; dohProxyIp?: string; cliProxyIp?: string },
   sslConfig?: SslConfig,
-  squidConfigContent?: string
+  squidConfigContent?: string,
+  options: {
+    effectiveHome?: string;
+    pathExists?: (candidate: string) => boolean;
+    prepareNestedMountpoints?: (
+      volumes: string[],
+      uid: number,
+      gid: number,
+      localSourceResolver: (source: string) => string | undefined,
+    ) => string[];
+  } = {},
 ): DockerComposeConfig {
   validateCustomImageManifest(config);
   const projectRoot = path.join(__dirname, '..');
@@ -103,8 +122,9 @@ export function generateDockerCompose(
     sslConfig,
   });
 
-  const effectiveHome = getRealUserHome();
+  const effectiveHome = options.effectiveHome ?? getRealUserHome();
   const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd();
+  const stageGeminiSettings = isGeminiProxyRoutingEnabled(config) && shouldPinGeminiAuthType(config);
 
   const agentVolumes = buildAgentVolumes({
     config,
@@ -122,6 +142,16 @@ export function generateDockerCompose(
     agentLogsPath: logPaths.agentLogs,
     sessionStatePath: logPaths.sessionState,
     initSignalDir,
+    pathExists: options.pathExists,
+    prepareNestedMountpoints: options.prepareNestedMountpoints,
+    additionalMounts: stageGeminiSettings ? [GEMINI_SETTINGS_MOUNT] : [],
+    nestedMountpointOptions: stageGeminiSettings ? {
+      directoryVolumeSources: [GEMINI_SETTINGS_VOLUME],
+      rootOwnedTargets: [`/host${GEMINI_CLI_SYSTEM_SETTINGS_DIRECTORY}`],
+    } : undefined,
+    filterVolumes: config.runnerTopology === 'arc-dind'
+      ? volumes => filterAgentVolumesForSysroot(volumes, config, effectiveHome)
+      : undefined,
   });
 
   const agentService = buildAgentService({
@@ -217,20 +247,17 @@ export function generateDockerCompose(
       name: ENCLAVE_AGENT_EGRESS_NETWORK,
       driver: 'bridge',
     };
-    if (config.enclaves.executors.agent.github?.cli === 'issues-read-v1') {
-      compose.networks[ENCLAVE_GITHUB_CONTROL_NETWORK] = {
-        name: ENCLAVE_GITHUB_CONTROL_NETWORK,
-        driver: 'bridge',
-        internal: true,
-        ipam: {
-          config: [{ subnet: ENCLAVE_GITHUB_CONTROL_SUBNET }],
-        },
-      };
-    }
   }
   if (config.enclaves?.enabled) {
     compose.networks[ENCLAVE_MCP_CONTROL_NETWORK] = {
       name: ENCLAVE_MCP_CONTROL_NETWORK,
+      driver: 'bridge',
+      internal: true,
+    };
+  }
+  if (config.experimentalModelRouting === true && config.modelRouting && config.modelRoutingBootstrap) {
+    compose.networks[ROUTING_NETWORK_NAME] = {
+      name: ROUTING_NETWORK_NAME,
       driver: 'bridge',
       internal: true,
     };
@@ -263,7 +290,8 @@ export function redactDockerComposeSecrets(
           (service.environment as Record<string, string>)[key] = '[REDACTED]';
           continue;
         }
-        const value = (service.environment as Record<string, string>)[key];
+        const value = redactOtlpEnvValue(key, (service.environment as Record<string, unknown>)[key]);
+        (service.environment as Record<string, unknown>)[key] = value;
         if (typeof value === 'string' && sensitiveValues.length > 0) {
           (service.environment as Record<string, string>)[key] = redactSensitiveValues(value, sensitiveValues);
         }

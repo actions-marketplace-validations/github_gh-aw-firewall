@@ -29,7 +29,8 @@ function invocationLayout(workDir, invocationId) {
     schemaPath: path.join(root, 'schema.json'),
     outPath: path.join(root, 'out'),
     sessionLogPath: path.join(root, 'session.jsonl'),
-    githubCapabilityPath: path.join(root, 'github-capability'),
+    githubAgentIdPath: path.join(root, 'github-agent-id'),
+    githubBearerPath: path.join(root, 'github-bearer'),
     agentPath: path.join(root, 'agent'),
   };
 }
@@ -42,7 +43,7 @@ function invocationLayout(workDir, invocationId) {
  * it through its `rw` bind mount.
  */
 function createInvocationWorkspace(params) {
-  const { config, invocationId, task, schema, githubCapability } = params;
+  const { config, invocationId, task, schema, githubAgentId, executorBearer } = params;
   const layout = invocationLayout(config.workDir, invocationId);
 
   fs.mkdirSync(layout.root, { recursive: true, mode: 0o700 });
@@ -61,12 +62,25 @@ function createInvocationWorkspace(params) {
   fs.chownSync(layout.agentPath, config.enclaveUid, config.enclaveGid);
   fs.chmodSync(layout.agentPath, 0o700);
   if (config.githubEnabled) {
-    if (typeof githubCapability !== 'string' || githubCapability.length > 4096) {
-      throw new Error('invalid invocation GitHub capability');
+    if (typeof githubAgentId !== 'string' || !/^[A-Za-z0-9_-]{32,128}$/.test(githubAgentId)) {
+      throw new Error('invalid enclave GitHub MCP agent identity');
     }
-    fs.writeFileSync(layout.githubCapabilityPath, `${githubCapability}\n`, { mode: 0o600 });
-    fs.chownSync(layout.githubCapabilityPath, config.enclaveUid, config.enclaveGid);
-    fs.chmodSync(layout.githubCapabilityPath, 0o400);
+    fs.writeFileSync(layout.githubAgentIdPath, `${githubAgentId}\n`, { mode: 0o600 });
+    fs.chownSync(layout.githubAgentIdPath, config.enclaveUid, config.enclaveGid);
+    fs.chmodSync(layout.githubAgentIdPath, 0o400);
+  }
+  if (config.dynamicEnabled) {
+    // The single-use executor receives exactly one short-lived, repository
+    // scoped bearer — never the job token, the delegation-control capability,
+    // the identity handle, the compiler envelope, mcpg's state path, or its
+    // policy generation. The file is invocation-private and destroyed with the
+    // workspace.
+    if (typeof executorBearer !== 'string' || !/^[\x21-\x7e]{16,512}$/.test(executorBearer)) {
+      throw new Error('invalid delegated executor bearer');
+    }
+    fs.writeFileSync(layout.githubBearerPath, `${executorBearer}\n`, { mode: 0o600 });
+    fs.chownSync(layout.githubBearerPath, config.enclaveUid, config.enclaveGid);
+    fs.chmodSync(layout.githubBearerPath, 0o400);
   }
 
   return layout;
@@ -81,11 +95,22 @@ function preserveInvocationSession(sessionLogPath, auditDir, invocationId) {
     );
     const stat = fs.fstatSync(sourceFd);
     if (!stat.isFile() || stat.size > 1024 * 1024) return false;
-    const sessionsDir = path.join(auditDir, 'sessions');
-    fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
-    const destination = path.join(sessionsDir, `${invocationId}.jsonl`);
     const data = Buffer.alloc(stat.size);
     const bytesRead = fs.readSync(sourceFd, data, 0, stat.size, 0);
+    if (bytesRead !== stat.size) return false;
+    const transcript = data.toString('utf8');
+    const rawDebug = transcript.split('\n').some((line) => {
+      if (!line) return false;
+      try {
+        const event = JSON.parse(line);
+        return event.event === 'session' && event.sensitivity === 'raw-debug';
+      } catch {
+        return false;
+      }
+    });
+    const sessionsDir = path.join(auditDir, rawDebug ? 'raw-debug-sessions' : 'sessions');
+    fs.mkdirSync(sessionsDir, { recursive: true, mode: 0o700 });
+    const destination = path.join(sessionsDir, `${invocationId}.jsonl`);
     fs.writeFileSync(destination, data.subarray(0, bytesRead), { mode: 0o600 });
     fs.chmodSync(destination, 0o600);
     return true;

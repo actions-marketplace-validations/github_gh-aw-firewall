@@ -12,6 +12,28 @@ import {
  * binaries source path.  Calls `process.exit(1)` on any failure.
  */
 export function validateInfrastructureOptions(config: WrapperConfig): void {
+  for (const { key, flag } of [
+    { key: 'maxGithubApiPointsRest', flag: 'max-github-api-points-rest' },
+    { key: 'maxGithubApiPointsGraphql', flag: 'max-github-api-points-graphql' },
+    { key: 'maxNumToolCalls', flag: 'max-num-tool-calls' },
+  ] as const) {
+    const rawValue = config[key];
+    if (rawValue === undefined) continue;
+    const value = Number(rawValue);
+    if (!Number.isInteger(value) || value <= 0) {
+      logger.error(`❌ --${flag} must be a positive integer`);
+      process.exit(1);
+    }
+    config[key] = value;
+  }
+  if ((config.maxGithubApiPointsRest !== undefined || config.maxGithubApiPointsGraphql !== undefined) && !config.difcProxyHost) {
+    logger.error('❌ GitHub API point limits require --difc-proxy-host.');
+    process.exit(1);
+  }
+  if (config.maxNumToolCalls !== undefined && !config.enclaves?.enabled) {
+    logger.error('❌ --max-num-tool-calls requires at least one configured enclave.');
+    process.exit(1);
+  }
   if (config.awfDockerHost &&
       !config.awfDockerHost.startsWith('unix://') &&
       !isLoopbackTcpDockerHostUri(config.awfDockerHost)) {
@@ -44,6 +66,18 @@ export function validateInfrastructureOptions(config: WrapperConfig): void {
       `❌ chroot.binariesSourcePath must not contain ":" or newline characters, got: ${config.chrootBinariesSourcePath}`,
     );
     logger.error('   Example (stdin config): {"chroot":{"binariesSourcePath":"/tmp/gh-aw/runner-bin"}}');
+    process.exit(1);
+  }
+  // The microVM backends (sbx, cloud-hypervisor) derive their guest network
+  // plans from the fixed policy subnet, so a relocated awf-net would silently
+  // disagree with the guest addressing. Reject the combination loudly.
+  if (
+    config.networkSubnet &&
+    (config.containerRuntime === 'sbx' || config.containerRuntime === 'cloud-hypervisor')
+  ) {
+    logger.error(
+      `❌ --network-subnet is not supported with --container-runtime ${config.containerRuntime}`,
+    );
     process.exit(1);
   }
 }
@@ -86,6 +120,11 @@ export function validateFeatureFlagCompatibility(config: WrapperConfig): void {
   );
   if (!enableTokenSteeringValidation.valid) {
     logger.error(enableTokenSteeringValidation.error!);
+    process.exit(1);
+  }
+
+  if (config.verifySbxEgress && config.containerRuntime !== 'sbx') {
+    logger.error('❌ --verify-sbx-egress requires --container-runtime sbx.');
     process.exit(1);
   }
 

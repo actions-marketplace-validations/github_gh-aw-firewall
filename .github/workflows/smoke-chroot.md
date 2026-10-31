@@ -17,6 +17,8 @@ permissions:
 name: Smoke Chroot
 engine:
   id: copilot
+  version: 1.0.101
+  checksums-sha256: 018625eac68670d66ede904b9b82cdcd6ab8f87ba20e6e1fbdf0b62c8295d5be
 sandbox:
   agent:
     id: awf
@@ -60,7 +62,20 @@ steps:
       } > /tmp/gh-aw/chroot-test/host-versions.env
       cat /tmp/gh-aw/chroot-test/host-versions.env
   - name: Install awf dependencies
-    run: npm ci
+    run: |
+      max_attempts=3
+      for attempt in $(seq 1 "$max_attempts"); do
+        if npm ci; then
+          break
+        fi
+        if [ "$attempt" -eq "$max_attempts" ]; then
+          echo "npm ci failed after $max_attempts attempts"
+          exit 1
+        fi
+        delay=$((attempt * 10))
+        echo "npm ci failed (attempt $attempt/$max_attempts); retrying in ${delay}s"
+        sleep "$delay"
+      done
   - name: Build awf
     run: npm run build
   - name: Install awf binary (local)
@@ -160,8 +175,9 @@ steps:
       sudo chown -R runner:runner /home/runner/.copilot
 post-steps:
   - name: Validate safe outputs were invoked
+    env:
+      OUTPUTS_FILE: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}
     run: |
-      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-${RUNNER_TEMP}/gh-aw/safeoutputs/outputs.jsonl}"
       if [ ! -s "$OUTPUTS_FILE" ]; then
         echo "::error::No safe outputs were invoked. Smoke tests require the agent to call safe output tools."
         exit 1

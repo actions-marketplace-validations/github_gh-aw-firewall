@@ -3,11 +3,17 @@ import * as os from 'os';
 import * as path from 'path';
 import type { WrapperConfig } from '../types';
 import {
+  assertPersistentDebugArtifactsIsolated,
   assertEnclavePrivateRootIsolated,
+  assertCloudHypervisorEnclaveExportsIsolated,
   findDockerSocketExposingMount,
   resolvePathThroughExistingAncestor,
 } from './mount-policy';
 import { resolveEnclavePaths } from './paths';
+import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
+import { HOST_EXECUTOR_STORAGE_ROOT } from './host-executor-journal';
+import { ENCLAVE_DEBUG_ARTIFACT_ROOT } from './public-debug';
+import { RESOLVED_CONFIG_PUBLICATION_ROOT } from '../resolved-config-artifact';
 
 function config(workDir: string, volumeMounts?: string[]): WrapperConfig {
   return { workDir, volumeMounts } as WrapperConfig;
@@ -59,6 +65,41 @@ describe('enclave private-root mount policy', () => {
     )).toThrow(/custom volume/);
   });
 
+  it.each([
+    ENCLAVE_DEBUG_ARTIFACT_ROOT,
+    path.dirname(ENCLAVE_DEBUG_ARTIFACT_ROOT),
+    path.join(ENCLAVE_DEBUG_ARTIFACT_ROOT, 'retained-run'),
+  ])('rejects retained debug artifacts exposed by a later primary mount: %s', (source) => {
+    const primary = config(workDir, [`${source}:/debug:ro`]);
+    expect(() => assertPersistentDebugArtifactsIsolated(primary, {}, process.cwd())).toThrow(/overlaps/);
+    expect(() => assertCloudHypervisorEnclaveExportsIsolated(primary, [{
+      tag: 'debug', source, target: '/debug', mode: 'ro',
+    }])).toThrow(/private or recovery state/);
+  });
+
+  it.each([
+    RESOLVED_CONFIG_PUBLICATION_ROOT,
+    '/run',
+    `${RESOLVED_CONFIG_PUBLICATION_ROOT}/run-example`,
+  ])('rejects caller-owned config publications exposed by a guest export: %s', (source) => {
+    const primary = config(workDir, [`${source}:/config:ro`]);
+    expect(() => assertPersistentDebugArtifactsIsolated(primary, {}, process.cwd())).toThrow(/overlaps/);
+    expect(() => assertCloudHypervisorEnclaveExportsIsolated(primary, [{
+      tag: 'config', source, target: '/config', mode: 'ro',
+    }])).toThrow(/private or recovery state/);
+  });
+
+  it('checks persistent debug artifacts for a Docker primary with no enclave configuration', () => {
+    const primary = {
+      ...config(workDir, [`${path.dirname(ENCLAVE_DEBUG_ARTIFACT_ROOT)}:/debug:ro`]),
+      containerRuntime: 'docker',
+    } as WrapperConfig;
+    expect(() => assertPersistentDebugArtifactsIsolated(primary, {}, process.cwd())).toThrow(/overlaps/);
+    expect(() => assertCloudHypervisorEnclaveExportsIsolated(primary, [{
+      tag: 'debug', source: ENCLAVE_DEBUG_ARTIFACT_ROOT, target: '/debug', mode: 'ro',
+    }])).toThrow(/private or recovery state/);
+  });
+
   it('rejects the agent Docker socket inside private state', () => {
     const paths = resolveEnclavePaths(workDir, privateBase);
     expect(() => assertEnclavePrivateRootIsolated({
@@ -74,9 +115,9 @@ describe('enclave private-root mount policy', () => {
     fs.writeFileSync(socket, '');
     fs.symlinkSync(socket, alias);
     expect(findDockerSocketExposingMount({
-      ...config(workDir, [`${alias}:/run/docker.sock`]),
+      ...config(workDir, [`${alias}:/data/docker.sock`]),
       awfDockerHost: `unix://${socket}`,
-    })).toBe(`${alias}:/run/docker.sock`);
+    })).toBe(`${alias}:/data/docker.sock`);
   });
 
   it('resolves a missing suffix through a symlinked ancestor', () => {
@@ -86,5 +127,43 @@ describe('enclave private-root mount policy', () => {
     fs.symlinkSync(target, alias);
     expect(resolvePathThroughExistingAncestor(path.join(alias, 'missing', 'leaf')))
       .toBe(path.join(fs.realpathSync.native(target), 'missing', 'leaf'));
+  });
+
+  it('checks all actual primary exports against private, broker and recovery roots', () => {
+    const wrapper = {
+      ...config(workDir),
+      enclaves: normalizeEnclavesConfig([{
+        script: {}, runtime: 'cloud-hypervisor',
+        repos: [{ repo: 'octo/private', sensitivity: 'internal' }],
+      }]),
+    };
+    const paths = resolveEnclavePaths(workDir);
+    for (const root of [
+      paths.root, paths.ingressRoot, paths.hostExecutorJournalDir,
+      path.join(path.dirname(paths.hostExecutorJournalDir), 'host-invocations'),
+      HOST_EXECUTOR_STORAGE_ROOT,
+    ]) {
+      for (const source of [root, path.dirname(root), path.join(root, 'child')]) {
+        for (const mode of ['ro', 'rw'] as const) {
+          expect(() => assertCloudHypervisorEnclaveExportsIsolated(wrapper, [{
+            tag: 'runner-temp-gh-aw', source, target: '/data', mode,
+          }])).toThrow(/private or recovery state/);
+        }
+      }
+    }
+    expect(() => assertCloudHypervisorEnclaveExportsIsolated(wrapper, [{
+      tag: 'workspace', source: workDir, target: '/workspace', mode: 'rw',
+    }])).not.toThrow();
+
+    const alias = path.join(testRoot, 'private-state-alias');
+    fs.symlinkSync(path.dirname(paths.root), alias);
+    expect(() => assertCloudHypervisorEnclaveExportsIsolated(wrapper, [{
+      tag: 'runner-tool-cache', source: path.join(alias, path.basename(paths.root)),
+      target: '/tools', mode: 'ro',
+    }])).toThrow(/private or recovery state/);
+    expect(() => assertCloudHypervisorEnclaveExportsIsolated({
+      ...wrapper, enclaves: { ...wrapper.enclaves!, enabled: false },
+    }, [{ tag: 'workspace', source: paths.root, target: '/workspace', mode: 'rw' }]))
+      .not.toThrow();
   });
 });

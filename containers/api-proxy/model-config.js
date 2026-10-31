@@ -5,12 +5,22 @@ const {
   filterResolvableAliases,
   filterAvailableModelsToConfiguredProviders,
 } = require('./model-resolver');
-const { rewriteModelInBody } = require('./model-body-rewriter');
+const {
+  rewriteModelInBody,
+  isCopilotAutoResponsesRequest,
+  rewriteCopilotAutoResponsesModelInBody,
+} = require('./model-body-rewriter');
 const { sanitizeForLog, logRequest } = require('./logging');
 const { diag } = require('./token-persistence');
 const { getCopilotModelFallbackPolicy } = require('./providers/copilot-auth');
-const { ALLOWED_MODELS, DISALLOWED_MODELS } = require('./guards/model-policy-guard');
-const { isModelPriceable } = require('./guards/ai-credits-guard');
+const {
+  ALLOWED_MODELS,
+  DISALLOWED_MODELS,
+} = require('./guards/model-policy-guard');
+const { parseScopedAutoRequest, rewriteScopedAutoRequest, pickerError } = require('./scoped-auto-model');
+const { parseBodyAsObject } = require('./body-utils');
+const { resolveModelSelector } = require('./model-selector');
+const { captureRuntimePricing } = require('./runtime-model-catalog');
 
 const MODEL_ALIASES_RAW = (process.env.AWF_MODEL_ALIASES || '').trim() || undefined;
 const MODEL_ALIASES = parseModelAliases(MODEL_ALIASES_RAW);
@@ -72,23 +82,6 @@ logRequest('info', 'startup', {
   model_fallback: MODEL_FALLBACK,
 });
 
-/**
- * Build a predicate that reports whether the AI-credits guard can price a model.
- *
- * Used to keep the middle-power fallback from synthesizing a model that the
- * guard would immediately reject. Returns null (no filtering) unless the guard
- * is actually active — i.e. a credit cap is set with no configured default
- * pricing — so pricing coverage never constrains resolution otherwise.
- *
- * @param {string} provider
- * @returns {((model: string) => boolean)|null}
- */
-function makeIsModelPriceable(provider) {
-  if (!process.env.AWF_MAX_AI_CREDITS) return null;
-  if (process.env.AWF_DEFAULT_AI_CREDITS_PRICING) return null;
-  return (model) => isModelPriceable(model, provider);
-}
-
 function getModelFallbackPolicyForProvider(provider) {
   if (MODEL_FALLBACK.excludeEngines && MODEL_FALLBACK.excludeEngines.includes(provider.toLowerCase())) {
     return {
@@ -104,8 +97,7 @@ function getModelFallbackPolicyForProvider(provider) {
 }
 
 function getModelFallbackForProvider(provider) {
-  const effective = getModelFallbackPolicyForProvider(provider).effective;
-  return { ...effective, isModelPriceable: makeIsModelPriceable(provider) };
+  return getModelFallbackPolicyForProvider(provider).effective;
 }
 
 function getEffectiveModelFallbackForReflect(adapters) {
@@ -121,8 +113,15 @@ function getEffectiveModelFallbackForReflect(adapters) {
   return effectiveByProvider;
 }
 
-function makeModelBodyTransform(provider, cachedModels, refreshProviderModelsForResolution, getConfiguredModelCacheKeys) {
-  if (!MODEL_ALIASES) return null;
+function makeModelBodyTransform(
+  provider,
+  cachedModels,
+  refreshProviderModelsForResolution,
+  getConfiguredModelCacheKeys,
+  getRuntimeModels = () => [],
+  isNativeCopilot = false,
+) {
+  const canRouteCopilotAutoResponses = provider === 'copilot' && isNativeCopilot === true;
   const providerModelFallback = getModelFallbackForProvider(provider);
   const resolvableModels = () => (
     getConfiguredModelCacheKeys
@@ -130,10 +129,108 @@ function makeModelBodyTransform(provider, cachedModels, refreshProviderModelsFor
       : cachedModels
   );
   return async (body, req) => {
-    let result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
-    if (!result || (result.fallback && result.fallback.activated)) {
-      await refreshProviderModelsForResolution(provider);
+    let result = null;
+    const scopedAuto = parseScopedAutoRequest(body, req, provider);
+    if (scopedAuto) {
+      const resolveScopedAuto = () => rewriteScopedAutoRequest(
+        scopedAuto, provider, resolvableModels()[provider], getRuntimeModels(provider), MODEL_POLICY_CONFIG,
+      );
+      result = resolveScopedAuto();
+      if (!result) {
+        await refreshProviderModelsForResolution(provider);
+        result = resolveScopedAuto();
+      }
+      if (!result) {
+        throw pickerError(
+          `No available ${scopedAuto.modelProvider} model on the configured ${provider} backend advertises support for /${scopedAuto.endpoint} and satisfies model policy. Check /reflect, endpoint model metadata, and allowed/disallowed models.`,
+          'scoped_auto_model_unavailable',
+          503,
+        );
+      }
+      req.awfScopedAuto = true;
+    }
+    if (
+      !result &&
+      canRouteCopilotAutoResponses &&
+      isCopilotAutoResponsesRequest(body, req)
+    ) {
+      const getAutoResolution = () => rewriteCopilotAutoResponsesModelInBody(
+        body,
+        cachedModels.copilot,
+        getRuntimeModels('copilot'),
+        MODEL_POLICY_CONFIG,
+      );
+      result = getAutoResolution();
+      if (!result) {
+        await refreshProviderModelsForResolution(provider);
+        result = getAutoResolution();
+      }
+      if (!result) {
+        const error = new Error('No available GitHub Copilot model supports Responses and Codex tools');
+        error.statusCode = 503;
+        error.code = 'copilot_auto_responses_model_unavailable';
+        error.type = 'service_unavailable';
+        throw error;
+      }
+    }
+    if (!result) {
+      const parsed = parseBodyAsObject(body);
+      const selectModel = () => resolveModelSelector(
+        parsed?.model, provider, resolvableModels()[provider], getRuntimeModels(provider),
+        MODEL_ALIASES?.models, MODEL_POLICY_CONFIG,
+      );
+      let selectedModel;
+      try {
+        selectedModel = selectModel();
+      } catch (error) {
+        if (error.code !== 'unsupported_model_selector' || error.catalogRefreshable === false ||
+          Array.isArray(parsed?.model)) throw error;
+        await refreshProviderModelsForResolution(provider);
+        selectedModel = selectModel();
+      }
+      if (selectedModel) {
+        const originalModel = req?.awfRequestedModelSelector ?? parsed.model;
+        parsed.model = selectedModel.resolvedModel;
+        result = {
+          ...selectedModel,
+          body: Buffer.from(JSON.stringify(parsed), 'utf8'),
+          originalModel,
+        };
+        req?.awfRouting?.onModelSelectorResolution?.(result.body);
+        logRequest('info', 'model_selector_resolution', {
+          requested_selector: sanitizeForLog(originalModel),
+          selected_provider: provider,
+          resolved_model: sanitizeForLog(selectedModel.resolvedModel),
+        });
+        diag('model_selector_resolution', {
+          requested_selector: sanitizeForLog(originalModel),
+          selected_provider: provider,
+          resolved_model: sanitizeForLog(selectedModel.resolvedModel),
+        });
+      }
+    }
+    if (!result && MODEL_ALIASES) {
       result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
+      if (!result || (result.fallback && result.fallback.activated)) {
+        await refreshProviderModelsForResolution(provider);
+        result = rewriteModelInBody(body, provider, MODEL_ALIASES.models, resolvableModels(), providerModelFallback, MODEL_POLICY_CONFIG);
+      }
+    }
+    if (req && result?.aliasKeys?.some(aliasKey => {
+      const key = Object.keys(MODEL_ALIASES?.models || {})
+        .find(name => name.toLowerCase() === aliasKey.toLowerCase());
+      return key !== undefined && MODEL_ALIASES.models[key]?.fallback === false;
+    })) {
+      req.awfModelRecoveryDisabled = true;
+    }
+    if (req) {
+      const currentRuntimePricing = captureRuntimePricing();
+      if (Object.hasOwn(currentRuntimePricing, provider)) {
+        req.awfRuntimePricing = {
+          ...(req.awfRuntimePricing || {}),
+          [provider]: currentRuntimePricing[provider],
+        };
+      }
     }
     if (!result) return null;
     // Store ranked candidates on the request object so endpoint-blocked retry
@@ -141,6 +238,7 @@ function makeModelBodyTransform(provider, cachedModels, refreshProviderModelsFor
     if (req && Array.isArray(result.candidates)) {
       req.awfModelCandidates = result.candidates;
     }
+    if (req && result.identity) req.awfModelIdentity = result.identity;
     const originalModel = sanitizeForLog(result.originalModel) || '(none)';
     const resolvedModel = sanitizeForLog(result.resolvedModel);
     if (providerModelFallback.enabled && result.fallback) {

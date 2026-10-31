@@ -16,7 +16,10 @@ permissions:
   issues: read
   actions: read
 name: Smoke Services
-engine: copilot
+engine:
+  id: copilot
+  version: 1.0.101
+  checksums-sha256: 018625eac68670d66ede904b9b82cdcd6ab8f87ba20e6e1fbdf0b62c8295d5be
 services:
   redis:
     image: redis:7-alpine
@@ -45,9 +48,9 @@ network:
     - defaults
     - github
 tools:
+  github: false
   bash:
     - "*"
-  github:
 safe-outputs:
     threat-detection:
       enabled: false
@@ -67,6 +70,9 @@ sandbox:
     runtime: docker-sudo-iptables
 strict: true
 steps:
+  - name: Build local AWF smoke images
+    timeout-minutes: 35
+    run: bash "${RUNNER_TEMP}/awf-smoke/build-smoke-images.sh"
   - name: Pre-install service client tools
     run: |
       sudo apt-get update -qq && sudo apt-get install -y -qq redis-tools postgresql-client
@@ -74,8 +80,9 @@ steps:
       echo "psql: $(psql --version)"
 post-steps:
   - name: Validate safe outputs were invoked
+    env:
+      OUTPUTS_FILE: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}
     run: |
-      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-${RUNNER_TEMP}/gh-aw/safeoutputs/outputs.jsonl}"
       if [ ! -s "$OUTPUTS_FILE" ]; then
         echo "::error::No safe outputs were invoked. Smoke tests require the agent to call safe output tools."
         exit 1
@@ -115,4 +122,7 @@ Interpret results:
 
 ## Output
 
-Post a brief comment (max 5-10 lines) summarizing which checks succeeded (✅) and which failed (❌), plus overall PASS or FAIL. If every check succeeded, also apply the `smoke-services` label.
+Use the `item_number` from the triggering event: `${{ github.event.pull_request.number || inputs.item_number }}` (the PR number or the optional manual dispatch input); never guess a target from schedule or workflow metadata.
+
+- If a target is present, call `add_comment` exactly once with a brief comment (max 5-10 lines) summarizing which checks succeeded (✅) and which failed (❌), plus overall PASS or FAIL. If every check succeeded, call `add_labels` after `add_comment` to apply the `smoke-services` label. Do not call `noop` after these outputs.
+- If no target is present (scheduled runs or manual dispatches without `item_number`), call `noop` exactly once with a brief check summary and overall PASS or FAIL. Do not call `add_comment` or `add_labels`.

@@ -1,3 +1,6 @@
+import * as fs from 'fs';
+import * as path from 'path';
+import { PassThrough } from 'stream';
 import { fastKillAgentContainer } from './container-lifecycle';
 import { containerLifecycleTestHelpers } from './container-lifecycle.test-utils';
 import { stopContainers } from './container-stop';
@@ -20,8 +23,8 @@ describe('stopContainers', () => {
     expect(mockExecaFn).not.toHaveBeenCalled();
   });
 
-  it('should run pre-shutdown chmod and docker compose down when keepContainers is false', async () => {
-    // 1. docker exec --user root awf-squid chmod (pre-shutdown)
+  it('should run pre-shutdown permission repair and docker compose down when keepContainers is false', async () => {
+    // 1. docker exec --user root awf-squid chown/chmod (pre-shutdown)
     mockExecaFn.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as any);
     // 2. docker compose down
     mockExecaFn.mockResolvedValueOnce({ stdout: '', stderr: '', exitCode: 0 } as any);
@@ -31,7 +34,19 @@ describe('stopContainers', () => {
     expect(mockExecaFn).toHaveBeenNthCalledWith(
       1,
       'docker',
-      ['exec', '--user', 'root', SQUID_CONTAINER_NAME, 'chmod', '-R', 'a+rX', '/var/log/squid'],
+      [
+        'exec',
+        '--user',
+        'root',
+        '-e',
+        expect.stringMatching(/^TUID=\d+$/),
+        '-e',
+        expect.stringMatching(/^TGID=\d+$/),
+        SQUID_CONTAINER_NAME,
+        'sh',
+        '-c',
+        'chown "$TUID:$TGID" /var/log/squid 2>/dev/null; chmod a+rX /var/log/squid 2>/dev/null; find /var/log/squid -maxdepth 1 -type f -exec chown "$TUID:$TGID" {} \\; -exec chmod a+rX {} \\; 2>/dev/null',
+      ],
       expect.objectContaining({ reject: false }),
     );
     expect(mockExecaFn).toHaveBeenNthCalledWith(
@@ -42,7 +57,7 @@ describe('stopContainers', () => {
     );
   });
 
-  it('should still run docker compose down when pre-shutdown chmod fails', async () => {
+  it('should still run docker compose down when the permission repair fails', async () => {
     // chmod fails (e.g. container not running)
     mockExecaFn.mockRejectedValueOnce(new Error('container not found'));
     // compose down succeeds
@@ -64,6 +79,79 @@ describe('stopContainers', () => {
     mockExecaFn.mockRejectedValueOnce(new Error('Docker compose down failed'));
 
     await expect(stopContainers(getDir(), false)).rejects.toThrow('Docker compose down failed');
+  });
+});
+
+describe('stopContainers with model routing', () => {
+  const { getDir } = useTempDir();
+  const linuxIt = process.platform === 'linux' ? it : it.skip;
+  const routerId = 'c'.repeat(64);
+  const record = '{"level":"INFO","msg":"stopped"}\n';
+  const routerLogsDir = () => path.join(getDir(), 'router-logs');
+
+  function scriptDocker({ lookupFails = false, composeDownError }: { lookupFails?: boolean; composeDownError?: Error } = {}) {
+    mockExecaFn.mockImplementation((_command: string, args: string[]) => {
+      const ok = { stdout: '', stderr: '', exitCode: 0, failed: false, timedOut: false };
+      if (args[0] === 'compose' && args[1] === 'ps') {
+        return Promise.resolve(lookupFails ? { ...ok, exitCode: 1, failed: true } : { ...ok, stdout: `${routerId}\n` });
+      }
+      if (args[0] === 'logs') {
+        // `docker logs` output arrives through its stderr pipe.
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        const done = new Promise(resolve => setImmediate(() => {
+          stderr.end(record);
+          stdout.end();
+          setImmediate(() => resolve(ok));
+        }));
+        return Object.assign(done, { stdout, stderr, kill: jest.fn() });
+      }
+      if (args[0] === 'compose' && args[1] === 'down' && composeDownError) return Promise.reject(composeDownError);
+      return Promise.resolve(ok);
+    });
+  }
+  const dockerCommands = () => mockExecaFn.mock.calls.map(([, args]) => args.slice(0, 2).join(' '));
+
+  beforeEach(() => jest.clearAllMocks());
+  afterEach(() => mockExecaFn.mockReset());
+
+  linuxIt('stops the router and saves its logs before compose down', async () => {
+    scriptDocker();
+
+    await stopContainers(getDir(), false, { routerLogsDir: routerLogsDir() });
+
+    expect(dockerCommands()).toEqual(['exec --user', 'compose ps', 'stop -t', `logs ${routerId}`, 'compose down']);
+    expect(fs.readFileSync(path.join(routerLogsDir(), 'router.jsonl'), 'utf8')).toBe(record);
+  });
+
+  it('leaves the router to compose down without a router log directory', async () => {
+    scriptDocker();
+
+    await stopContainers(getDir(), false, {});
+
+    expect(dockerCommands()).toEqual(['exec --user', 'compose down']);
+  });
+
+  it('runs compose down when the router logs cannot be saved', async () => {
+    scriptDocker({ lookupFails: true });
+
+    await stopContainers(getDir(), false, { routerLogsDir: routerLogsDir() });
+
+    expect(dockerCommands()).toEqual(['exec --user', 'compose ps', 'compose down']);
+    expect(fs.existsSync(routerLogsDir())).toBe(false);
+  });
+
+  it('still reports a compose down failure after a failed capture', async () => {
+    scriptDocker({ lookupFails: true, composeDownError: new Error('Docker compose down failed') });
+
+    await expect(stopContainers(getDir(), false, { routerLogsDir: routerLogsDir() }))
+      .rejects.toThrow('Docker compose down failed');
+  });
+
+  it('touches nothing when containers are kept', async () => {
+    await stopContainers(getDir(), true, { routerLogsDir: routerLogsDir() });
+
+    expect(mockExecaFn).not.toHaveBeenCalled();
   });
 });
 

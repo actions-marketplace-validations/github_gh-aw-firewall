@@ -14,6 +14,15 @@ FAIL=0
 pass() { echo "✓ $1"; PASS=$((PASS + 1)); }
 fail() { echo "❌ FAIL: $1"; FAIL=$((FAIL + 1)); }
 
+write_entrypoint_fixture() {
+  local fixture_entrypoint="$1"
+  awk '
+    $0 == "if [[ \"${BASH_SOURCE[0]}\" == \"$0\" ]]; then" { skip=1; next }
+    skip && $0 == "fi" { skip=0; next }
+    !skip { print }
+  ' "${ENTRYPOINT}" | sed 's#/host#${AWF_TEST_HOST_ROOT}#g; s#/opt/awf/trust#${AWF_TEST_TRUST_POLICY}#g' > "${fixture_entrypoint}"
+}
+
 required_functions=(
   print_banner
   setup_user_identity
@@ -30,6 +39,7 @@ required_functions=(
   mount_host_procfs
   mount_host_cgroupfs
   copy_preload_libs
+  copy_browser_libs
   copy_agent_helper_scripts
   copy_dind_runner_binary
   resolve_chroot_binary_path
@@ -44,6 +54,8 @@ required_functions=(
   build_path_script
   run_chroot_command
   run_non_chroot_command
+  relax_gh_aw_shared_permissions
+  relax_gh_aw_handoff_dir
   main
 )
 
@@ -113,7 +125,7 @@ CHROOT_BLOCK="$(awk '
 
 COPY_SYSTEM_CA_BUNDLE_BLOCK="$(awk '
   /^[[:space:]]*copy_system_ca_bundle\(\)[[:space:]]*\{[[:space:]]*$/ { in_fn=1; next }
-  in_fn && /^[[:space:]]*}[[:space:]]*$/ { in_fn=0; exit }
+  in_fn && /^}[[:space:]]*$/ { in_fn=0; exit }
   in_fn { print }
 ' "${ENTRYPOINT}")"
 
@@ -122,6 +134,7 @@ chroot_helpers=(
   'mount_host_cgroupfs'
   'check_chroot_prereqs'
   'copy_preload_libs'
+  'copy_browser_libs'
   'copy_agent_helper_scripts'
   'copy_dind_runner_binary'
   'ensure_usr_local_bin_shims'
@@ -153,23 +166,24 @@ else
   fail "mount_host_cgroupfs() may leave a writable cgroup mount behind"
 fi
 
-if printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq 'if [ "${AWF_SSL_BUMP_ENABLED}" = "true" ]'; then
-  pass "copy_system_ca_bundle() keys SSL Bump handling off AWF_SSL_BUMP_ENABLED"
+if printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq 'sh /opt/awf/trust/filter-ca-store.sh'; then
+  pass "copy_system_ca_bundle() filters host trust before exposing it"
 else
-  fail "copy_system_ca_bundle() does not key SSL Bump handling off AWF_SSL_BUMP_ENABLED"
+  fail "copy_system_ca_bundle() does not filter host trust"
 fi
 
-if printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq "printf '\\n'" && \
+if printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq 'inputs+=(' && \
    printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq '"/host${AWF_CA_CHROOT}"'; then
-  pass "copy_system_ca_bundle() appends system roots to the staged AWF CA bundle safely"
+  pass "copy_system_ca_bundle() preserves staged AWF trust through the shared filter"
 else
-  fail "copy_system_ca_bundle() does not safely append system roots to the staged AWF CA bundle"
+  fail "copy_system_ca_bundle() does not preserve staged AWF trust"
 fi
 
-if printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq '/etc/pki/ca-trust/extracted/*|/etc/pki/tls/certs/*)'; then
-  pass "copy_system_ca_bundle() treats mounted RHEL/Amazon Linux CA paths as chroot-accessible"
+if printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq '/host/etc/pki/ca-trust/extracted/pem' && \
+   printf '%s\n' "${COPY_SYSTEM_CA_BUNDLE_BLOCK}" | grep -Fq 'mount -o remount,ro,bind'; then
+  pass "copy_system_ca_bundle() overlays RHEL and hashed CA directories read-only"
 else
-  fail "copy_system_ca_bundle() does not recognize mounted RHEL/Amazon Linux CA paths as chroot-accessible"
+  fail "copy_system_ca_bundle() does not protect mounted trust directories"
 fi
 
 run_copy_system_ca_bundle_fixture() {
@@ -177,12 +191,24 @@ run_copy_system_ca_bundle_fixture() {
   tmp_dir="$(mktemp -d)"
   local host_root="${tmp_dir}/host-root"
   local fixture_entrypoint="${tmp_dir}/entrypoint-fixture.sh"
-  mkdir -p "${host_root}/etc/pki/tls/certs" "${host_root}/etc/ssl/certs"
-  printf '%s\n' "fixture-ca-cert" > "${host_root}/etc/pki/tls/certs/ca-bundle.crt"
+  local java_store="${host_root}/etc/ssl/certs/java/cacerts"
+  local java_link="${host_root}/usr/lib/jvm/fixture/lib/security/cacerts"
+  mkdir -p "${host_root}/etc/pki/tls/certs" "${host_root}/etc/ssl/certs/java" \
+    "${host_root}/etc/pki/ca-trust/extracted/pem" "$(dirname "${java_link}")"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=private-fixture \
+    -keyout "${tmp_dir}/fixture.key" -out "${host_root}/etc/pki/tls/certs/ca-bundle.crt" >/dev/null 2>&1
+  cp "${host_root}/etc/pki/tls/certs/ca-bundle.crt" "${tmp_dir}/original.crt"
+  ln -s ../../pki/tls/certs/ca-bundle.crt "${host_root}/etc/ssl/certs/ca-certificates.crt"
+  printf 'fixture-java-keystore' > "${java_store}"
+  ln -s /etc/ssl/certs/java/cacerts "${java_link}"
+  cp "${host_root}/etc/pki/tls/certs/ca-bundle.crt" \
+    "${host_root}/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem"
+  printf 'email-only-anchor\n' > "${host_root}/etc/pki/ca-trust/extracted/pem/email-ca-bundle.pem"
+  printf 'code-signing-only-anchor\n' > "${host_root}/etc/pki/ca-trust/extracted/pem/objsign-ca-bundle.pem"
 
-  awk '$0 != "main \"$@\""' "${ENTRYPOINT}" > "${fixture_entrypoint}"
-  sed -i "s#/host#\${AWF_TEST_HOST_ROOT}#g" "${fixture_entrypoint}"
+  write_entrypoint_fixture "${fixture_entrypoint}"
 
+  local result
   (
     set -e
     # shellcheck disable=SC1090
@@ -191,35 +217,155 @@ run_copy_system_ca_bundle_fixture() {
     AWF_SSL_BUMP_ENABLED="false"
     AWF_CA_CHROOT=""
     AWF_TEST_HOST_ROOT="${host_root}"
+    AWF_TEST_TRUST_POLICY="$(cd "$(dirname "${ENTRYPOINT}")/../trust" && pwd)"
+    # macOS cannot perform Linux bind mounts. Record mount intent while the
+    # real shared filter processes the fixture store.
+    mount() { printf '%s\n' "$*" >> "${tmp_dir}/mounts"; }
 
     unset SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO SYSTEM_CA_CHROOT
     copy_system_ca_bundle
-    [ "${SSL_CERT_FILE}" = "/etc/pki/tls/certs/ca-bundle.crt" ]
-    [ -r "${AWF_TEST_HOST_ROOT}${SSL_CERT_FILE}" ]
-    [ "${NODE_EXTRA_CA_CERTS}" = "${SSL_CERT_FILE}" ]
+    [ "${SSL_CERT_FILE}" = "/run/awf-lib/trust/ca-certificates.crt" ] || exit 1
+    [ -r "${AWF_TEST_HOST_ROOT}${SSL_CERT_FILE}" ] || exit 1
+    [ "${NODE_EXTRA_CA_CERTS}" = "${SSL_CERT_FILE}" ] || exit 1
+    [ "$(readlink "${java_link}")" = "/etc/ssl/certs/java/cacerts" ] || exit 1
+    cmp "${java_store}" "${host_root}/run/awf-lib/trust/certs/java/cacerts" || exit 1
+    ! grep -q 'email-only-anchor\|code-signing-only-anchor' \
+      "${host_root}/run/awf-lib/trust/ca-certificates.crt" || exit 1
 
-    ln -sf ../../pki/tls/certs/ca-bundle.crt "${host_root}/etc/ssl/certs/ca-certificates.crt"
-    unset SSL_CERT_FILE NODE_EXTRA_CA_CERTS REQUESTS_CA_BUNDLE CURL_CA_BUNDLE GIT_SSL_CAINFO SYSTEM_CA_CHROOT
-    copy_system_ca_bundle
-    [ "${SSL_CERT_FILE}" = "/etc/ssl/certs/ca-certificates.crt" ]
-    [ -r "${AWF_TEST_HOST_ROOT}${SSL_CERT_FILE}" ]
-    [ "${NODE_EXTRA_CA_CERTS}" = "${SSL_CERT_FILE}" ]
+    cmp "${host_root}/etc/pki/tls/certs/ca-bundle.crt" "${tmp_dir}/original.crt" || exit 1
+    grep -q 'remount,ro,bind' "${tmp_dir}/mounts" || exit 1
+    grep -q '/etc/pki/tls/certs' "${tmp_dir}/mounts" || exit 1
+    grep -q '/etc/pki/ca-trust/extracted/pem' "${tmp_dir}/mounts" || exit 1
+    [ "${SSL_CERT_DIR}" = "/run/awf-lib/trust/certs" ] || exit 1
+    case "${NODE_OPTIONS}" in *--require=/run/awf-lib/trust/node-trust.cjs*) ;; *) exit 1 ;; esac
   )
-  local result=$?
+  result=$?
+  chmod -R u+w "${tmp_dir}"
   rm -rf "${tmp_dir}"
   return "${result}"
 }
 
 if run_copy_system_ca_bundle_fixture; then
-  pass "copy_system_ca_bundle() exports chroot-readable CA paths for direct RHEL bundles and /etc/ssl symlink targets"
+  pass "copy_system_ca_bundle() stages filtered RHEL/symlink trust without changing host inputs"
 else
-  fail "copy_system_ca_bundle() does not export chroot-readable CA paths for RHEL bundle fixtures"
+  fail "copy_system_ca_bundle() does not safely stage RHEL bundle fixtures"
 fi
 
 if grep -Eq '\[ -n "\$\{SYSTEM_CA_CHROOT\}" \]' "${ENTRYPOINT}"; then
   pass "run_chroot_command() cleans up copied system CA bundles"
 else
   fail "run_chroot_command() does not clean up copied system CA bundles"
+fi
+
+# copy_browser_libs() must stage the Chromium/Playwright runtime libraries
+# recorded in the Dockerfile's manifest (containers/agent/Dockerfile:
+# /usr/local/share/awf/browser-libs.manifest) under /run/awf-lib/browser-libs
+# -- on the container's own writable rootfs, not the /host bind mount -- and
+# export their directories via BROWSER_LD_LIBRARY_PATH. This directly
+# exercises the staging mechanism that makes the packages installed by
+# BROWSER_PKGS visible inside the chroot, where buildSystemMounts() otherwise
+# shadows the image's /usr, /lib, etc. with the runner's own.
+run_copy_browser_libs_fixture() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local host_root="${tmp_dir}/host-root"
+  local fixture_entrypoint="${tmp_dir}/entrypoint-fixture.sh"
+  local fake_lib_dir="${tmp_dir}/image-rootfs/usr/lib/x86_64-linux-gnu"
+  local fake_lib="${fake_lib_dir}/libnspr4.so.0"
+  local manifest="${tmp_dir}/browser-libs.manifest"
+  local payload="${tmp_dir}/browser-libs"
+
+  mkdir -p "${host_root}" "${fake_lib_dir}" "${payload}${fake_lib_dir}"
+  printf 'incompatible-image-library' > "${fake_lib}"
+  printf 'real-libnspr4-bytes' > "${payload}${fake_lib}"
+  printf '%s\n' "${fake_lib}" > "${manifest}"
+
+  write_entrypoint_fixture "${fixture_entrypoint}"
+  sed -i "s#/usr/local/share/awf/browser-libs.manifest#\${AWF_TEST_MANIFEST}#g" "${fixture_entrypoint}"
+  sed -i 's#SOURCE_ROOT="/usr/local/share/awf/browser-libs"#SOURCE_ROOT="${AWF_TEST_PAYLOAD}"#' "${fixture_entrypoint}"
+
+  local result
+  (
+    set -e
+    # shellcheck disable=SC1090
+    . "${fixture_entrypoint}"
+
+    AWF_TEST_HOST_ROOT="${host_root}"
+    AWF_TEST_MANIFEST="${manifest}"
+    AWF_TEST_PAYLOAD="${payload}"
+    AWF_TEST_CHROOT_CALLS="${tmp_dir}/chroot-calls"
+
+    chroot() {
+      [ "$1" = "${AWF_TEST_HOST_ROOT}" ] && [ "$2" = "/bin/sh" ] || exit 1
+      printf 'called\n' >> "${AWF_TEST_CHROOT_CALLS}"
+      printf '%s\n' "${AWF_TEST_RUNNER_LIBS}"
+    }
+
+    unset BROWSER_LD_LIBRARY_PATH
+    AWF_TEST_RUNNER_LIBS=""
+    copy_browser_libs
+
+    staged_lib="${host_root}/run/awf-lib/browser-libs${fake_lib}"
+    [ -f "${staged_lib}" ] || exit 1
+    [ "$(cat "${staged_lib}")" = "real-libnspr4-bytes" ] || exit 1
+
+    [ "${BROWSER_LD_LIBRARY_PATH}" = "/run/awf-lib/browser-libs${fake_lib_dir}" ] || exit 1
+    [ "$(wc -l < "${AWF_TEST_CHROOT_CALLS}")" -eq 1 ] || exit 1
+
+    # Simulate buildSystemMounts() shadowing the image's own /usr/lib with the
+    # runner's: overwrite the original library path with different content
+    # (as if the host's own libnspr4.so.0 had been bind-mounted over it).
+    printf 'shadowed-by-host-bind-mount' > "${fake_lib}"
+
+    # The staged copy under /run/awf-lib must be unaffected by the shadowing,
+    # proving Chromium resolves the image-provided library via
+    # LD_LIBRARY_PATH rather than being silently broken by the chroot bind mount.
+    [ "$(cat "${staged_lib}")" = "real-libnspr4-bytes" ] || exit 1
+
+    # An exact-path runner library must not be overridden by the fallback.
+    rm -rf "${host_root}/run/awf-lib/browser-libs"
+    mkdir -p "${host_root}${fake_lib_dir}"
+    printf 'newer-runner-library' > "${host_root}${fake_lib}"
+    AWF_TEST_RUNNER_LIBS="path:${fake_lib}"
+    copy_browser_libs
+    [ -z "${BROWSER_LD_LIBRARY_PATH}" ] || exit 1
+    [ ! -e "${staged_lib}" ] || exit 1
+    [ "$(cat "${host_root}${fake_lib}")" = "newer-runner-library" ] || exit 1
+
+    # A same-soname runner library under /usr/lib64 must also prevent staging.
+    rm -rf "${host_root}/run/awf-lib/browser-libs"
+    mkdir -p "${host_root}/usr/lib64"
+    printf 'runner-libnspr4-bytes' > "${host_root}/usr/lib64/libnspr4.so.0"
+    AWF_TEST_RUNNER_LIBS="name:libnspr4.so.0"
+    : > "${AWF_TEST_CHROOT_CALLS}"
+    copy_browser_libs
+    [ -z "${BROWSER_LD_LIBRARY_PATH}" ] || exit 1
+    [ ! -e "${staged_lib}" ] || exit 1
+    [ "$(cat "${host_root}/usr/lib64/libnspr4.so.0")" = "runner-libnspr4-bytes" ] || exit 1
+    [ "$(wc -l < "${AWF_TEST_CHROOT_CALLS}")" -eq 1 ] || exit 1
+  )
+  result=$?
+  rm -rf "${tmp_dir}"
+  return "${result}"
+}
+
+if run_copy_browser_libs_fixture; then
+  pass "copy_browser_libs() stages manifest libraries under /run/awf-lib and survives /usr shadowing"
+else
+  fail "copy_browser_libs() does not stage Chromium/Playwright runtime libraries correctly"
+fi
+
+if grep -Eq '\[ -n "\$\{BROWSER_LD_LIBRARY_PATH\}" \]' "${ENTRYPOINT}"; then
+  pass "run_chroot_command() cleans up staged browser runtime libraries"
+else
+  fail "run_chroot_command() does not clean up staged browser runtime libraries"
+fi
+
+if grep -Fq 'LD_LIBRARY_PATH_CMD' "${ENTRYPOINT}" && \
+   grep -Fq 'export LD_LIBRARY_PATH=${BROWSER_LD_LIBRARY_PATH}' "${ENTRYPOINT}"; then
+  pass "run_chroot_command() exports LD_LIBRARY_PATH from BROWSER_LD_LIBRARY_PATH before exec"
+else
+  fail "run_chroot_command() does not export LD_LIBRARY_PATH from BROWSER_LD_LIBRARY_PATH"
 fi
 
 # configure_jvm_proxy must not abort the entrypoint (set -e) when $HOME is
@@ -233,6 +379,7 @@ run_configure_jvm_proxy_readonly_home_fixture() {
 
   # Run in a separate bash process: `set -e` is ignored inside a subshell that
   # is part of an `if` condition, which would mask the abort this test guards.
+  local result
   env -u JAVA_TOOL_OPTIONS \
     HOME="${fake_home}" \
     AWF_CHROOT_ENABLED="false" \
@@ -251,7 +398,7 @@ run_configure_jvm_proxy_readonly_home_fixture() {
         *) exit 1 ;;
       esac
     ' _ "${ENTRYPOINT}" 2>/dev/null
-  local result=$?
+  result=$?
   chmod -R u+w "${fake_home}" 2>/dev/null || true
   rm -rf "${tmp_dir}"
   return "${result}"
@@ -316,6 +463,201 @@ if run_warn_codex_auto_model_fixture; then
   pass "warn_codex_auto_model() warns only for codex model auto under api-proxy"
 else
   fail "warn_codex_auto_model() did not warn correctly for codex model auto under api-proxy"
+fi
+
+# relax_gh_aw_shared_permissions() must add the group-write bit only to the
+# host-shared /tmp/gh-aw handoff root and specific post-agent handoff
+# directories (found via /host/tmp/gh-aw in chroot mode, or /tmp/gh-aw directly
+# otherwise), so a later host-side step running under a
+# different-but-same-group identity (e.g. gh-aw's post-agent
+# validateMemoryStep) can still write into directories the agent created,
+# without making unrelated payload-bearing files/directories or the tree
+# world-writable.
+run_relax_gh_aw_shared_permissions_fixture() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local host_root="${tmp_dir}/host-root"
+  local fixture_entrypoint="${tmp_dir}/entrypoint-fixture.sh"
+  mkdir -p "${host_root}/tmp/gh-aw/memory-validation"
+  mkdir -p "${host_root}/tmp/gh-aw/token-audit"
+  touch "${host_root}/tmp/gh-aw/token-audit/audit.json"
+  chmod 700 "${host_root}/tmp/gh-aw" "${host_root}/tmp/gh-aw/memory-validation"
+  chmod 700 "${host_root}/tmp/gh-aw/token-audit"
+  chmod 600 "${host_root}/tmp/gh-aw/token-audit/audit.json"
+
+  write_entrypoint_fixture "${fixture_entrypoint}"
+
+  local result
+  (
+    set -e
+    # shellcheck disable=SC1090
+    . "${fixture_entrypoint}"
+
+    AWF_TEST_HOST_ROOT="${host_root}"
+    relax_gh_aw_shared_permissions
+
+    mode="$(stat -c '%a' "${host_root}/tmp/gh-aw")"
+    [ "${mode}" = "770" ]
+    mode="$(stat -c '%a' "${host_root}/tmp/gh-aw/memory-validation")"
+    [ "${mode}" = "770" ]
+    mode="$(stat -c '%a' "${host_root}/tmp/gh-aw/token-audit")"
+    [ "${mode}" = "700" ]
+    mode="$(stat -c '%a' "${host_root}/tmp/gh-aw/token-audit/audit.json")"
+    [ "${mode}" = "600" ]
+  )
+  result=$?
+  rm -rf "${tmp_dir}"
+  return "${result}"
+}
+
+if run_relax_gh_aw_shared_permissions_fixture; then
+  pass "relax_gh_aw_shared_permissions() only relaxes known /tmp/gh-aw handoff directories"
+else
+  fail "relax_gh_aw_shared_permissions() does not correctly limit /tmp/gh-aw group permission repair"
+fi
+
+run_relax_gh_aw_shared_permissions_symlink_fixture() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local host_root="${tmp_dir}/host-root"
+  local sensitive_dir="${tmp_dir}/sensitive"
+  local fixture_entrypoint="${tmp_dir}/entrypoint-fixture.sh"
+  mkdir -p "${host_root}/tmp/gh-aw" "${sensitive_dir}"
+  chmod 700 "${host_root}/tmp/gh-aw" "${sensitive_dir}"
+  ln -s "${sensitive_dir}" "${host_root}/tmp/gh-aw/memory-validation"
+
+  write_entrypoint_fixture "${fixture_entrypoint}"
+
+  local result
+  (
+    set -e
+    # shellcheck disable=SC1090
+    . "${fixture_entrypoint}"
+
+    AWF_TEST_HOST_ROOT="${host_root}"
+    relax_gh_aw_shared_permissions
+
+    mode="$(stat -c '%a' "${host_root}/tmp/gh-aw")"
+    [ "${mode}" = "770" ]
+    mode="$(stat -c '%a' "${sensitive_dir}")"
+    [ "${mode}" = "700" ]
+  )
+  result=$?
+  rm -rf "${tmp_dir}"
+  return "${result}"
+}
+
+if run_relax_gh_aw_shared_permissions_symlink_fixture; then
+  pass "relax_gh_aw_shared_permissions() skips symlinked gh-aw handoff paths"
+else
+  fail "relax_gh_aw_shared_permissions() follows a symlinked gh-aw handoff path"
+fi
+
+run_relax_gh_aw_shared_permissions_root_symlink_fixture() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local host_root="${tmp_dir}/host-root"
+  local sensitive_dir="${tmp_dir}/sensitive"
+  local fixture_entrypoint="${tmp_dir}/entrypoint-fixture.sh"
+  mkdir -p "${host_root}/tmp" "${sensitive_dir}/memory-validation"
+  chmod 700 "${sensitive_dir}" "${sensitive_dir}/memory-validation"
+  ln -s "${sensitive_dir}" "${host_root}/tmp/gh-aw"
+
+  write_entrypoint_fixture "${fixture_entrypoint}"
+
+  local result
+  (
+    set -e
+    # shellcheck disable=SC1090
+    . "${fixture_entrypoint}"
+
+    AWF_TEST_HOST_ROOT="${host_root}"
+    relax_gh_aw_shared_permissions
+
+    mode="$(stat -c '%a' "${sensitive_dir}")"
+    [ "${mode}" = "700" ]
+    mode="$(stat -c '%a' "${sensitive_dir}/memory-validation")"
+    [ "${mode}" = "700" ]
+  )
+  result=$?
+  rm -rf "${tmp_dir}"
+  return "${result}"
+}
+
+if run_relax_gh_aw_shared_permissions_root_symlink_fixture; then
+  pass "relax_gh_aw_shared_permissions() skips child repairs when the gh-aw root is a symlink"
+else
+  fail "relax_gh_aw_shared_permissions() follows a symlinked gh-aw root"
+fi
+
+run_agent_with_token_protection_cleanup_fixture() {
+  local tmp_dir
+  tmp_dir="$(mktemp -d)"
+  local host_root="${tmp_dir}/host-root"
+  local fixture_entrypoint="${tmp_dir}/entrypoint-fixture.sh"
+  mkdir -p "${host_root}/tmp/gh-aw/memory-validation"
+  chmod 700 "${host_root}/tmp/gh-aw" "${host_root}/tmp/gh-aw/memory-validation"
+
+  write_entrypoint_fixture "${fixture_entrypoint}"
+
+  set +e
+  AWF_TEST_HOST_ROOT="${host_root}" bash -c '
+    set -e
+    # shellcheck disable=SC1090
+    . "$1"
+    AWF_TEST_HOST_ROOT="$2"
+    run_agent_with_token_protection bash -c "exit 42"
+  ' _ "${fixture_entrypoint}" "${host_root}" >/dev/null 2>&1
+  local failed_exit=$?
+  set -e
+  local failed_root_mode
+  failed_root_mode="$(stat -c '%a' "${host_root}/tmp/gh-aw")"
+  local failed_handoff_mode
+  failed_handoff_mode="$(stat -c '%a' "${host_root}/tmp/gh-aw/memory-validation")"
+
+  chmod 700 "${host_root}/tmp/gh-aw" "${host_root}/tmp/gh-aw/memory-validation"
+  set +e
+  AWF_TEST_HOST_ROOT="${host_root}" bash -c '
+    set -e
+    # shellcheck disable=SC1090
+    . "$1"
+    AWF_TEST_HOST_ROOT="$2"
+    run_agent_with_token_protection bash -c "touch \"\$1/tmp/gh-aw/agent-ready\"; sleep 30" _ "$2"
+  ' _ "${fixture_entrypoint}" "${host_root}" >/dev/null 2>&1 &
+  local runner_pid=$!
+  for _i in 1 2 3 4 5 6 7 8 9 10; do
+    [ -e "${host_root}/tmp/gh-aw/agent-ready" ] && break
+    sleep 0.1
+  done
+  if [ ! -e "${host_root}/tmp/gh-aw/agent-ready" ]; then
+    kill -TERM "${runner_pid}" 2>/dev/null || true
+    wait "${runner_pid}" 2>/dev/null || true
+    set -e
+    rm -rf "${tmp_dir}"
+    return 1
+  fi
+  kill -TERM "${runner_pid}" 2>/dev/null || true
+  wait "${runner_pid}"
+  local signaled_exit=$?
+  set -e
+  local signaled_root_mode
+  signaled_root_mode="$(stat -c '%a' "${host_root}/tmp/gh-aw")"
+  local signaled_handoff_mode
+  signaled_handoff_mode="$(stat -c '%a' "${host_root}/tmp/gh-aw/memory-validation")"
+
+  rm -rf "${tmp_dir}"
+  [ "${failed_exit}" -eq 42 ] &&
+    [ "${failed_root_mode}" = "770" ] &&
+    [ "${failed_handoff_mode}" = "770" ] &&
+    [ "${signaled_exit}" -eq 143 ] &&
+    [ "${signaled_root_mode}" = "770" ] &&
+    [ "${signaled_handoff_mode}" = "770" ]
+}
+
+if run_agent_with_token_protection_cleanup_fixture; then
+  pass "run_agent_with_token_protection() repairs gh-aw handoff permissions after failures and signals"
+else
+  fail "run_agent_with_token_protection() does not repair gh-aw handoff permissions after failures and signals"
 fi
 
 echo ""

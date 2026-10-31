@@ -1,6 +1,45 @@
 import { mapAwfFileConfigToCliOptions } from './config-mapper';
 
 describe('mapAwfFileConfigToCliOptions', () => {
+  it.each([-1, 0])('omits a disabled AI-credit budget of %s', (maxAiCredits) => {
+    expect(mapAwfFileConfigToCliOptions({ apiProxy: { maxAiCredits } }).maxAiCredits).toBeUndefined();
+  });
+
+  it.each([undefined, 0.5, 10000, 10001, -2])('preserves other AI-credit budget values (%s)', (maxAiCredits) => {
+    expect(mapAwfFileConfigToCliOptions({ apiProxy: { maxAiCredits } }).maxAiCredits).toBe(maxAiCredits);
+  });
+
+  it('maps explicit runtime catalogue controls without changing egress', () => {
+    const modelCatalogue = { enabled: true, offline: true, maxAgeSeconds: 60 };
+    const result = mapAwfFileConfigToCliOptions({ apiProxy: { modelCatalogue } });
+    expect(result.modelCatalogue).toEqual(modelCatalogue);
+    expect(result.allowDomains).toBeUndefined();
+  });
+  it('maps the versioned model pricing catalog to API proxy options', () => {
+    const catalog = {
+      schemaVersion: 1 as const,
+      unit: 'USD_PER_1M_TOKENS' as const,
+      catalogId: 'github/gh-aw/model-pricing',
+      version: 'sha256:catalog-v1',
+      providers: {
+        copilot: {
+          models: {
+            'gpt-6.1-sol': {
+              input: 10,
+              output: 50,
+              cachedInput: 1,
+              cacheWrite: null,
+              reasoning: 50,
+            },
+          },
+        },
+      },
+    };
+
+    expect(mapAwfFileConfigToCliOptions({ apiProxy: { modelPricingCatalog: catalog } })
+      .modelPricingCatalog).toEqual(catalog);
+  });
+
   it('maps nested config values to CLI option names', () => {
     const result = mapAwfFileConfigToCliOptions({
       network: { allowDomains: ['github.com', 'api.github.com'], dnsServers: ['1.1.1.1', '1.0.0.1'] },
@@ -21,12 +60,17 @@ describe('mapAwfFileConfigToCliOptions', () => {
     expect(result.rateLimitRpm).toBe('60');
   });
 
-  it('maps network-isolation and topology-attach', () => {
+  it('maps network-isolation, sbx egress verification, and topology-attach', () => {
     const result = mapAwfFileConfigToCliOptions({
-      network: { isolation: true, topologyAttach: ['mcp-gateway', 'difc-proxy'] },
+      network: {
+        isolation: true,
+        verifySbxEgress: true,
+        topologyAttach: ['mcp-gateway', 'difc-proxy'],
+      },
     });
 
     expect(result.networkIsolation).toBe(true);
+    expect(result.verifySbxEgress).toBe(true);
     expect(result.topologyAttach).toEqual(['mcp-gateway', 'difc-proxy']);
   });
 
@@ -47,6 +91,7 @@ describe('mapAwfFileConfigToCliOptions', () => {
     expect(result.dnsServers).toBeUndefined();
     expect(result.upstreamProxy).toBeUndefined();
     expect(result.networkIsolation).toBeUndefined();
+    expect(result.verifySbxEgress).toBeUndefined();
     expect(result.topologyAttach).toBeUndefined();
     expect(result.enableApiProxy).toBeUndefined();
     expect(result.sslBump).toBeUndefined();
@@ -88,6 +133,21 @@ describe('mapAwfFileConfigToCliOptions', () => {
     });
 
     expect(result.openaiBaseUrlEnv).toBe('CODEX_LB_BASE_URL');
+  });
+
+  it('preserves routing candidate models in the routed config', () => {
+    const candidateModels = ['gpt-5.6-luna'];
+    const result = mapAwfFileConfigToCliOptions({
+      apiProxy: {
+        routing: {
+          candidateModels,
+          objective: { goal: 'cost', mode: 'balanced' },
+          task: { conversationFile: '/tmp/conversation.json' },
+        },
+      },
+    });
+
+    expect(result.modelRouting).toMatchObject({ candidateModels });
   });
 
   it('maps authHeader fields for openai and anthropic targets', () => {
@@ -170,10 +230,27 @@ describe('mapAwfFileConfigToCliOptions', () => {
     expect(result.anthropicCacheTailTtl).toBe('1h');
   });
 
-  it('maps effective-token guard fields', () => {
+  it('maps task-level model routing fields', () => {
+    const routing = {
+      provider: 'anthropic' as const,
+      objective: { goal: 'cost-speed' as const, mode: 'robust' as const },
+      task: { conversationFile: '/tmp/gh-aw/conversation.json' },
+    };
+
+    const result = mapAwfFileConfigToCliOptions({
+      experimental: { modelRouting: true },
+      apiProxy: { routing },
+    });
+
+    expect(result.modelRouting).toEqual(routing);
+    expect(result.experimentalModelRouting).toBe(true);
+    expect(mapAwfFileConfigToCliOptions({ experimental: { modelRouting: false } }).experimentalModelRouting).toBe(false);
+    expect(mapAwfFileConfigToCliOptions({}).experimentalModelRouting).toBeUndefined();
+  });
+
+  it('maps AI-credit and model multiplier settings', () => {
     const result = mapAwfFileConfigToCliOptions({
       apiProxy: {
-        maxEffectiveTokens: 6000,
         maxAiCredits: 1.2,
         providers: {
           anthropic: {
@@ -190,7 +267,6 @@ describe('mapAwfFileConfigToCliOptions', () => {
         enableTokenSteering: true,
       },
     });
-    expect(result.maxEffectiveTokens).toBe(6000);
     expect(result.maxAiCredits).toBe(1.2);
     expect(result.apiProxyProviders).toEqual({
       anthropic: {
@@ -199,11 +275,11 @@ describe('mapAwfFileConfigToCliOptions', () => {
         },
       },
     });
-    expect(result.effectiveTokenModelMultipliers).toEqual({
+    expect(result.modelMultipliers).toEqual({
       'gpt-4o': 2,
       'claude-sonnet-4': 1.5,
     });
-    expect(result.effectiveTokenDefaultModelMultiplier).toBe(27);
+    expect(result.defaultModelMultiplier).toBe(27);
     expect(result.enableTokenSteering).toBe(true);
   });
 
@@ -232,6 +308,13 @@ describe('mapAwfFileConfigToCliOptions', () => {
       apiProxy: { modelFallback: { enabled: false, strategy: 'middle_power' } },
     });
     expect(result.modelFallback).toEqual({ enabled: false, strategy: 'middle_power' });
+  });
+
+  it('maps fallbackModels field', () => {
+    const result = mapAwfFileConfigToCliOptions({
+      apiProxy: { fallbackModels: ['gpt-5.4', 'claude-sonnet-4.6'] },
+    });
+    expect(result.fallbackModels).toEqual(['gpt-5.4', 'claude-sonnet-4.6']);
   });
 
   it('maps modelFallback.excludeEngines field', () => {
@@ -545,14 +628,25 @@ describe('mapAwfFileConfigToCliOptions', () => {
     expect(result.authAnthropicWorkspaceId).toBe('ws-uuid');
   });
 
-  it('maps rateLimiting fields including rph and bytesPm', () => {
+  it('maps rateLimiting fields including GitHub API point budgets', () => {
     const result = mapAwfFileConfigToCliOptions({
-      rateLimiting: { enabled: true, requestsPerHour: 3600, bytesPerMinute: 1048576 },
+      rateLimiting: {
+        enabled: true, requestsPerHour: 3600, bytesPerMinute: 1048576,
+        maxGithubApiPointsRest: 2000, maxGithubApiPointsGraphql: 1500,
+      },
     });
 
     expect(result.rateLimit).toBeUndefined(); // enabled: true → no negated flag
     expect(result.rateLimitRph).toBe('3600');
     expect(result.rateLimitBytesPm).toBe('1048576');
+    expect(result.maxGithubApiPointsRest).toBe(2000);
+    expect(result.maxGithubApiPointsGraphql).toBe(1500);
+  });
+
+  it('maps rateLimiting.maxNumToolCalls to the enclave tool-call cap', () => {
+    expect(mapAwfFileConfigToCliOptions({ rateLimiting: { maxNumToolCalls: 25 } }).maxNumToolCalls)
+      .toBe(25);
+    expect(mapAwfFileConfigToCliOptions({}).maxNumToolCalls).toBeUndefined();
   });
 
   it('returns undefined for empty allowDomains array', () => {

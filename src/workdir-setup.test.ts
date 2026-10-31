@@ -16,6 +16,7 @@ const actualFs = jest.requireActual<typeof import('fs')>('fs');
 import { prepareWorkDirectories, workdirSetupTestHelpers } from './workdir-setup';
 import { resolveLogPaths } from './log-paths';
 import { getRealUserHome } from './host-identity';
+import { getSafeHostGid } from './host-env';
 
 function setupWorkdirFixture({ cleanupChrootHome = true } = {}) {
   let tempDir = '';
@@ -112,6 +113,17 @@ describe('prepareWorkDirectories', () => {
 
       expect(fs.existsSync(logPaths.apiProxyLogs)).toBe(true);
       expect(fs.statSync(logPaths.apiProxyLogs).isDirectory()).toBe(true);
+    });
+
+    it('creates a private runtime marker directory only when timeout steering can be used', () => {
+      const config = buildConfig({ enableApiProxy: true, agentTimeout: 10 });
+      const logPaths = resolveLogPaths(config);
+      const runtimeDir = path.join(logPaths.apiProxyLogs, 'agent-runtime');
+
+      prepareWorkDirectories(config, logPaths);
+
+      expect(fs.statSync(runtimeDir).isDirectory()).toBe(true);
+      expect(fs.statSync(runtimeDir).mode & 0o777).toBe(0o700);
     });
 
     it('creates cli-proxy logs directory', () => {
@@ -352,6 +364,23 @@ describe('prepareWorkDirectories', () => {
       expect(fs.existsSync(geminiDir)).toBe(true);
     });
 
+    it('leaves a pre-existing legacy Gemini settings symlink and its target untouched', () => {
+      const emptyHomeDir = `${fixture.tempDir}-chroot-home`;
+      const settingsDir = path.join(emptyHomeDir, '.awf');
+      const target = path.join(fixture.tempDir, 'target');
+      const settingsPath = path.join(settingsDir, 'gemini-cli-system-settings.json');
+      fs.mkdirSync(settingsDir, { recursive: true });
+      fs.writeFileSync(target, 'unchanged');
+      fs.symlinkSync(target, settingsPath);
+
+      const config = buildConfig({ enableApiProxy: true, geminiApiKey: 'test-key' });
+      const logPaths = resolveLogPaths(config);
+
+      prepareWorkDirectories(config, logPaths);
+      expect(fs.lstatSync(settingsPath).isSymbolicLink()).toBe(true);
+      expect(fs.readFileSync(target, 'utf8')).toBe('unchanged');
+    });
+
     it('creates .gemini directory when googleApiKey is provided', () => {
       const geminiDir = path.join(fixture.tempDir, '.gemini');
       if (fs.existsSync(geminiDir)) {
@@ -471,6 +500,54 @@ describe('prepareLogDirectories (sub-function)', () => {
     // chroot home must NOT have been created
     expect(fs.existsSync(`${fixture.tempDir}-chroot-home`)).toBe(false);
   });
+
+  it('pre-creates the api-proxy log dir where a shared /tmp prefix redirects it', () => {
+    // --proxy-logs-dir outside /tmp (e.g. ${RUNNER_TEMP}) + shared /tmp prefix:
+    // the daemon writes token-usage.jsonl to /tmp<dir>, so that dir must exist
+    // and be writable by the non-root api-proxy before startup.
+    const outsideTmp = `/awf-workdir-setup-test-${path.basename(fixture.tempDir)}`;
+    const translatedRoot = path.join('/tmp', outsideTmp);
+    try {
+      const logPaths = {
+        ...resolveLogPaths(buildConfig()),
+        apiProxyLogs: path.join(outsideTmp, 'api-proxy-logs'),
+        cliProxyLogs: path.join(outsideTmp, 'cli-proxy-logs'),
+      };
+      // The runner-side source dir itself is outside /tmp and may not be creatable here.
+      (fs.mkdirSync as unknown as jest.Mock).mockImplementation(
+        (dir: fs.PathLike, opts?: fs.MakeDirectoryOptions) =>
+          String(dir).startsWith(outsideTmp) ? undefined : actualFs.mkdirSync(dir, opts),
+      );
+      (fs.chmodSync as unknown as jest.Mock).mockImplementation(
+        (p: fs.PathLike, mode: fs.Mode) => (String(p).startsWith(outsideTmp) ? undefined : actualFs.chmodSync(p, mode)),
+      );
+      const statAs = (real: typeof actualFs.statSync) => (p: fs.PathLike) =>
+        real(String(p).startsWith(outsideTmp) ? fixture.tempDir : p);
+      (fs.lstatSync as unknown as jest.Mock).mockImplementation(statAs(actualFs.lstatSync));
+      (fs.statSync as unknown as jest.Mock).mockImplementation(statAs(actualFs.statSync));
+
+      workdirSetupTestHelpers.prepareLogDirectories(logPaths, '/tmp');
+
+      const translated = path.join(translatedRoot, 'api-proxy-logs');
+      expect(actualFs.statSync(translated).isDirectory()).toBe(true);
+      expect(actualFs.statSync(translated).mode & 0o777).toBe(0o777);
+      const translatedCliProxy = path.join(translatedRoot, 'cli-proxy-logs');
+      expect(actualFs.statSync(translatedCliProxy).isDirectory()).toBe(true);
+      expect(actualFs.statSync(translatedCliProxy).mode & 0o777).toBe(0o777);
+    } finally {
+      (fs.lstatSync as unknown as jest.Mock).mockImplementation(actualFs.lstatSync);
+      (fs.statSync as unknown as jest.Mock).mockImplementation(actualFs.statSync);
+      actualFs.rmSync(translatedRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('does not create a translated api-proxy log dir for a daemon-only prefix', () => {
+    const logPaths = resolveLogPaths(buildConfig());
+    workdirSetupTestHelpers.prepareLogDirectories(logPaths, '/host');
+
+    expect(fs.existsSync(logPaths.apiProxyLogs)).toBe(true);
+    expect(fs.existsSync(path.join('/host', logPaths.apiProxyLogs))).toBe(false);
+  });
 });
 
 describe('prepareChrootHomeMounts (sub-function)', () => {
@@ -491,6 +568,71 @@ describe('prepareChrootHomeMounts (sub-function)', () => {
     expect(fs.existsSync(logPaths.cliProxyLogs)).toBe(false);
   });
 
+  it('uses the caller’s primary GID for chroot home and nested mountpoints', () => {
+    (getSafeHostGid as jest.Mock).mockReturnValue('986');
+    try {
+      workdirSetupTestHelpers.prepareChrootHomeMounts(buildConfig());
+
+      const chrootHome = `${fixture.tempDir}-chroot-home`;
+      expect(fs.chownSync).toHaveBeenCalledWith(chrootHome, 1000, 986);
+      expect(fs.chownSync).toHaveBeenCalledWith(path.join(chrootHome, '.cache'), 1000, 986);
+    } finally {
+      (getSafeHostGid as jest.Mock).mockReturnValue('1000');
+    }
+  });
+
+  it.each([false, true])('prepares runner-owned Copilot mount targets (existing .copilot: %s)', (existingCopilot) => {
+    const copilotDir = path.join(fixture.tempDir, '.copilot');
+    if (existingCopilot) {
+      fs.mkdirSync(copilotDir, { mode: 0o700 });
+    }
+
+    (getSafeHostGid as jest.Mock).mockReturnValue('986');
+    try {
+      workdirSetupTestHelpers.prepareChrootHomeMounts(buildConfig());
+
+      for (const name of ['session-state', 'logs']) {
+        const target = path.join(copilotDir, name);
+        expect(fs.statSync(target).isDirectory()).toBe(true);
+        expect(fs.chownSync).toHaveBeenCalledWith(target, 1000, 986);
+      }
+      if (existingCopilot) {
+        expect(fs.statSync(copilotDir).mode & 0o777).toBe(0o700);
+        expect(fs.chownSync).not.toHaveBeenCalledWith(copilotDir, expect.anything(), expect.anything());
+      }
+    } finally {
+      (getSafeHostGid as jest.Mock).mockReturnValue('1000');
+    }
+  });
+
+  it('leaves existing Copilot mount target ownership, permissions, and contents unchanged', () => {
+    const targets = ['session-state', 'logs'].map(name => path.join(fixture.tempDir, '.copilot', name));
+    for (const target of targets) {
+      fs.mkdirSync(target, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(target, 'existing'), 'unchanged');
+    }
+
+    workdirSetupTestHelpers.prepareChrootHomeMounts(buildConfig());
+
+    for (const target of targets) {
+      expect(fs.statSync(target).mode & 0o777).toBe(0o700);
+      expect(fs.readFileSync(path.join(target, 'existing'), 'utf8')).toBe('unchanged');
+      expect(fs.chownSync).not.toHaveBeenCalledWith(target, expect.anything(), expect.anything());
+      expect(fs.chmodSync).not.toHaveBeenCalledWith(target, expect.anything());
+    }
+  });
+
+  it.each(['session-state', 'logs'])('refuses a non-directory Copilot %s mount target', (name) => {
+    const copilotDir = path.join(fixture.tempDir, '.copilot');
+    const target = path.join(copilotDir, name);
+    fs.mkdirSync(copilotDir);
+    fs.writeFileSync(target, 'unchanged');
+
+    expect(() => workdirSetupTestHelpers.prepareChrootHomeMounts(buildConfig()))
+      .toThrow(`Expected directory but found non-directory path: ${target}`);
+    expect(fs.readFileSync(target, 'utf8')).toBe('unchanged');
+  });
+
   it('creates .gemini directory only when geminiApiKey is provided', () => {
     const geminiDir = path.join(fixture.tempDir, '.gemini');
 
@@ -503,7 +645,15 @@ describe('prepareChrootHomeMounts (sub-function)', () => {
     expect(fs.existsSync(geminiDir)).toBe(false);
   });
 
-  it('refuses existing symlinked nested home tool paths', () => {    const sandboxState = path.join(fixture.tempDir, '.local', 'state', 'sandboxes');
+  it('does not stage Gemini system settings beneath the writable home', () => {
+    workdirSetupTestHelpers.prepareChrootHomeMounts(
+      buildConfig({ enableApiProxy: true, geminiApiKey: 'key' }),
+    );
+    expect(fs.existsSync(path.join(`${fixture.tempDir}-chroot-home`, '.awf'))).toBe(false);
+  });
+
+  it('refuses existing symlinked nested home tool paths', () => {
+    const sandboxState = path.join(fixture.tempDir, '.local', 'state', 'sandboxes');
     const localBin = path.join(fixture.tempDir, '.local', 'bin');
     fs.mkdirSync(sandboxState, { recursive: true });
     fs.symlinkSync(sandboxState, localBin);

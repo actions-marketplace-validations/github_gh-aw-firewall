@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+umask 077
 
 # Live GitHub-hosted Ubuntu x86_64 KVM smoke/security suite for the Cloud
 # Hypervisor preview backend.
@@ -7,8 +8,9 @@ set -euo pipefail
 # This covers allowed/blocked domains, direct
 # egress, arbitrary TCP, DNS, metadata IP, mandatory API-proxy reflect with
 # secret-sentinel absence, live workspace sharing incl. symlinks/permissions,
-# exit-code propagation, timeout, SIGTERM cancellation, partial-start
-# rollback, keep/preserve diagnostics, plus backend-specific live checks:
+# exit-code propagation, timeout, SIGTERM cancellation, abrupt process-death
+# recovery, partial-start rollback, keep/preserve diagnostics, plus
+# backend-specific live checks:
 #
 #   - device-assumptions: confirms eth0, the sole /dev/vda block disk, and
 #     virtio-fs workspace layout documented in Part 6.
@@ -17,7 +19,7 @@ set -euo pipefail
 #   - security-assertions: while a run is live, inspects the host-visible
 #     Cloud Hypervisor process and its own vm.info response to confirm the
 #     launcher's jailer-replacement boundary (netns join, non-root identity,
-#     capability set limited to CAP_NET_ADMIN alone, no_new_privs, active
+#     empty capability sets, no_new_privs, active
 #     seccomp filter, per-run cgroup membership/limits, landlock_enable
 #     reflected in vm.create, and an exactly-minimal disk/fs/net/vsock device
 #     set with no path to the host-only API socket) — see
@@ -47,9 +49,14 @@ digest() {
   awk -v file="$1" '$2 == file { print $1; exit }' "$ARTIFACT_DIR/SHA256SUMS"
 }
 
+# These are same-run CI artifacts rather than release assets. The bypass is
+# deliberately dual-opt-in so it cannot be enabled by an omitted manifest.
+export AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1
+
 COMMON=(
   --container-runtime cloud-hypervisor
   --cloud-hypervisor-preview
+  --cloud-hypervisor-development-allow-unattested-artifacts
   # Explicit, even though --network-isolation is documented as "enabled by
   # default": the paired --network-isolation/--no-network-isolation
   # commander.js options resolve to `undefined` (not `true`) when neither
@@ -95,6 +102,11 @@ assert_no_residue() {
     echo "Cloud Hypervisor veth/TAP residue detected" >&2
     return 1
   fi
+  if sudo iptables -S DOCKER-USER | grep -q -- '--comment awf:awf_vm_'; then
+    sudo iptables -S DOCKER-USER >&2
+    echo "Cloud Hypervisor per-run bridge rule residue detected" >&2
+    return 1
+  fi
   # $CGROUP_ROOT (.../awf-cloud-hypervisor) is a *parent* cgroup that
   # persists across runs; only per-run sub-cgroups live one level
   # inside it (see cgroupPath in src/cloud-hypervisor/manager.ts). Any
@@ -109,13 +121,13 @@ assert_no_residue() {
     echo "Cloud Hypervisor cgroup residue detected" >&2
     return 1
   fi
-  if pgrep -f 'cloud-hypervisor --api-socket' >/dev/null 2>&1; then
-    pgrep -af 'cloud-hypervisor --api-socket' >&2
+  if sudo pgrep -f '/var/lib/awf-cloud-hypervisor/trusted-artifacts/run-[^/]*/[c]loud-hypervisor --api-socket' >/dev/null 2>&1; then
+    sudo pgrep -af '/var/lib/awf-cloud-hypervisor/trusted-artifacts/run-[^/]*/[c]loud-hypervisor --api-socket' >&2
     echo "Cloud Hypervisor process residue detected" >&2
     return 1
   fi
-  if pgrep -f "$ARTIFACT_DIR/virtiofsd.*--shared-dir=" >/dev/null 2>&1; then
-    pgrep -af "$ARTIFACT_DIR/virtiofsd.*--shared-dir=" >&2
+  if sudo pgrep -f '/var/lib/awf-cloud-hypervisor/trusted-artifacts/run-[^/]*/[v]irtiofsd.*--shared-dir=' >/dev/null 2>&1; then
+    sudo pgrep -af '/var/lib/awf-cloud-hypervisor/trusted-artifacts/run-[^/]*/[v]irtiofsd.*--shared-dir=' >&2
     echo "Cloud Hypervisor virtiofsd process residue detected" >&2
     return 1
   fi
@@ -125,7 +137,114 @@ assert_no_residue() {
     echo "Cloud Hypervisor run-directory residue detected" >&2
     return 1
   fi
+  if sudo find /var/lib/awf-cloud-hypervisor/trusted-artifacts -mindepth 1 -maxdepth 1 -type d -name 'run-*' -print -quit \
+    2>/dev/null | grep -q .; then
+    sudo find /var/lib/awf-cloud-hypervisor/trusted-artifacts -mindepth 1 -maxdepth 1 -type d -name 'run-*' >&2
+    echo "Cloud Hypervisor trusted-artifact snapshot residue detected" >&2
+    return 1
+  fi
+  if sudo find /run/awf-microvm-network/reservations -name '*.json' -print -quit \
+    2>/dev/null | grep -q .; then
+    sudo find /run/awf-microvm-network/reservations -name '*.json' -print >&2
+    echo "Cloud Hypervisor network reservation residue detected" >&2
+    return 1
+  fi
 }
+
+# Exercise the real root-owned registry and kernel-held flock from independent
+# processes before booting a VM. Using the same run ID deliberately gives both
+# allocators the same first-choice subnet; the second must select another one.
+reservation_probe() {
+  local output=$1
+  exec env AWF_ROOT="$ROOT" sudo -E node -e '
+    const path = require("path");
+    const { reserveMicrovmNetworkPlan } = require(
+      path.join(process.env.AWF_ROOT, "dist/microvm/network.js")
+    );
+    (async () => {
+      const reservation = await reserveMicrovmNetworkPlan(
+        "live-concurrent-reservation",
+        {
+          infrastructureBridge: "awfbr0",
+          enableApiProxy: true,
+          tapOwnerUid: 1000,
+          tapOwnerGid: 1000,
+        },
+        { ip: "ip", nft: "nft", sysctl: "sysctl", flock: "flock" },
+      );
+      const stop = async () => {
+        await reservation.release();
+        process.exit(0);
+      };
+      process.on("SIGTERM", () => {
+        void stop().catch((error) => {
+          console.error(error);
+          process.exit(1);
+        });
+      });
+      process.stdout.write(JSON.stringify(reservation.plan) + "\n");
+      setInterval(() => {}, 1000);
+    })().catch((error) => {
+      console.error(error);
+      process.exit(1);
+    });
+  ' >"$output" 2>"$output.stderr"
+}
+
+reservation_first_pid=
+reservation_second_pid=
+cleanup_reservation_probes() {
+  for pid in "$reservation_first_pid" "$reservation_second_pid"; do
+    if [ -n "$pid" ]; then
+      kill -TERM "$pid" 2>/dev/null || true
+      wait "$pid" 2>/dev/null || true
+    fi
+  done
+}
+trap cleanup_reservation_probes EXIT
+reservation_probe "$RUN_ROOT/reservation-first.json" &
+reservation_first_pid=$!
+reservation_probe "$RUN_ROOT/reservation-second.json" &
+reservation_second_pid=$!
+for _ in $(seq 1 100); do
+  [ -s "$RUN_ROOT/reservation-first.json" ] \
+    && [ -s "$RUN_ROOT/reservation-second.json" ] && break
+  sleep 0.1
+done
+[ -s "$RUN_ROOT/reservation-first.json" ] || {
+  cat "$RUN_ROOT/reservation-first.json.stderr" >&2
+  exit 1
+}
+[ -s "$RUN_ROOT/reservation-second.json" ] || {
+  cat "$RUN_ROOT/reservation-second.json.stderr" >&2
+  exit 1
+}
+node -e '
+  const fs = require("fs");
+  const first = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const second = JSON.parse(fs.readFileSync(process.argv[2], "utf8"));
+  if (first.guestSubnet === second.guestSubnet) throw new Error("concurrent subnet collision");
+  if (first.infrastructureIp === second.infrastructureIp) {
+    throw new Error("concurrent infrastructure address collision");
+  }
+  if (first.resourceToken === second.resourceToken) throw new Error("concurrent token collision");
+' "$RUN_ROOT/reservation-first.json" "$RUN_ROOT/reservation-second.json"
+second_reservation=$(node -e '
+  const fs = require("fs");
+  process.stdout.write(JSON.parse(fs.readFileSync(process.argv[1], "utf8")).reservationPath);
+' "$RUN_ROOT/reservation-second.json")
+kill -TERM "$reservation_first_pid"
+wait "$reservation_first_pid"
+reservation_first_pid=
+sudo test -f "$second_reservation" || {
+  echo "first allocator removed the second allocator reservation" >&2
+  exit 1
+}
+kill -TERM "$reservation_second_pid"
+wait "$reservation_second_pid"
+reservation_second_pid=
+trap - EXIT
+assert_no_residue
 
 run_case() {
   local name=$1
@@ -289,10 +408,43 @@ run_case api-proxy-reflect 0 \
   'wget -qO /tmp/reflect http://172.30.0.30:10000/reflect && grep -q "providers" /tmp/reflect && ! env | grep -F "awf-cloud-hypervisor-real-secret-do-not-expose"'
 
 run_case workspace-live-share 0 \
-  'printf changed > .hidden && mkdir -p bin && printf "#!/bin/sh\necho ok\n" > bin/run && chmod 755 bin/run && ln -s bin/run run-link'
+  'id && test "$(id -u)" -ge 1000 && test "$(id -g)" -ge 1000 && test -w /workspace && ! test -e /host/etc/shadow && ! test -e /host/etc/gshadow && ! test -e /root/.ssh && ! test -e /var/lib/awf-cloud-hypervisor/trusted-artifacts && printf changed > .hidden && mkdir -p bin && printf "#!/bin/sh\necho ok\n" > bin/run && chmod 755 bin/run && ln -s bin/run run-link'
 test "$(cat "$RUN_ROOT/workspace-live-share/workspace/.hidden")" = changed
 test -x "$RUN_ROOT/workspace-live-share/workspace/bin/run"
 test "$(readlink "$RUN_ROOT/workspace-live-share/workspace/run-link")" = bin/run
+
+# virtiofsd squashes every guest uid/gid to the workspace identity
+# (--translate-uid/--translate-gid squash-guest:0:<id>:4294967295), so guest
+# creates, renames, chmods, and symlinks in a writable export must land on the
+# host owned by that identity and stay deletable by the unprivileged runner
+# user. The guest supervisor refuses uid 0 commands, so guest-root create/chown
+# squashing is covered by the virtiofsd argument-builder unit tests; here the
+# guest's own chown attempts to root or a foreign id must still leave the host
+# owner unchanged.
+expected_owner_id() {
+  local id=$1
+  if [ "$id" -lt 1000 ]; then id=1000; fi
+  printf '%s' "$id"
+}
+expected_owner="$(expected_owner_id "$(id -u)"):$(expected_owner_id "$(id -g)")"
+run_case virtiofs-ownership 0 \
+  'printf owned > owned.txt && mkdir -p owned-dir/nested && printf nested > owned-dir/nested/x && ln -s owned.txt owned-link && mv owned.txt owned-renamed.txt && chmod 600 owned-renamed.txt && echo AWF-OWNERSHIP-CREATE-OK && ! ( chown 0:0 owned-renamed.txt ) && echo AWF-OWNERSHIP-CHOWN-ROOT-DENIED && ! ( chown 12345:12345 owned-renamed.txt ) && echo AWF-OWNERSHIP-CHOWN-FOREIGN-DENIED'
+assert_sentinels virtiofs-ownership \
+  AWF-OWNERSHIP-CREATE-OK \
+  AWF-OWNERSHIP-CHOWN-ROOT-DENIED \
+  AWF-OWNERSHIP-CHOWN-FOREIGN-DENIED
+ownership_workspace="$RUN_ROOT/virtiofs-ownership/workspace"
+for owned_path in owned-renamed.txt owned-dir owned-dir/nested owned-dir/nested/x owned-link; do
+  actual_owner=$(stat -c '%u:%g' "$ownership_workspace/$owned_path")
+  if [ "$actual_owner" != "$expected_owner" ]; then
+    echo "case virtiofs-ownership: $owned_path is owned by $actual_owner, expected $expected_owner" >&2
+    exit 1
+  fi
+done
+test "$(stat -c '%a' "$ownership_workspace/owned-renamed.txt")" = 600
+test "$(readlink "$ownership_workspace/owned-link")" = owned.txt
+rm -rf "$ownership_workspace/owned-dir"
+test ! -e "$ownership_workspace/owned-dir"
 
 mkdir -p "$RUNNER_TEMP/gh-aw"
 printf 'cache-readable\n' >"$RUNNER_TEMP/gh-aw/awf-virtiofs-ro-probe"
@@ -427,6 +579,65 @@ if [ "$cleanup_ms" -gt "$CLEANUP_CEILING_MS" ]; then
   exit 1
 fi
 
+# SIGKILL cannot run in-process finally/signal cleanup. Kill the root AWF Node
+# process itself, prove its VMM/netns/cgroup survive, then let the next ordinary
+# invocation recover them through the durable identity-validated registry.
+crash_work="$RUN_ROOT/process-death/work"
+crash_workspace="$RUN_ROOT/process-death/workspace"
+crash_audit="$RUN_ROOT/process-death/audit"
+mkdir -p "$crash_work" "$crash_workspace" "$crash_audit"
+(
+  export GITHUB_WORKSPACE="$crash_workspace"
+  export OPENAI_API_KEY="$SECRET_SENTINEL"
+  exec sudo -E node "$ROOT/dist/cli.js" \
+    "${COMMON[@]}" \
+    --work-dir "$crash_work" \
+    --audit-dir "$crash_audit" \
+    -- 'sleep 300'
+) >"$RUN_ROOT/process-death/stdout.log" 2>"$RUN_ROOT/process-death/stderr.log" &
+crash_wrapper_pid=$!
+crash_node_pid=
+for _ in $(seq 1 90); do
+  for candidate in $(pgrep -f "node $ROOT/dist/cli.js.*--work-dir $crash_work" || true); do
+    [ "$candidate" = "$crash_wrapper_pid" ] && continue
+    candidate_exe=$(sudo readlink "/proc/$candidate/exe" 2>/dev/null || true)
+    case "$candidate_exe" in
+      */node) crash_node_pid=$candidate; break ;;
+    esac
+  done
+  if [ -n "$crash_node_pid" ] &&
+     sudo ip netns list | grep -q '^awfvm-' &&
+     sudo find /run/awf-cloud-hypervisor/pending-cleanup -maxdepth 1 -name '*.json' | grep -q . &&
+     sudo find "$CGROUP_ROOT" -mindepth 1 -maxdepth 1 -type d | grep -q . &&
+     sudo pgrep -f '/var/lib/awf-cloud-hypervisor/trusted-artifacts/run-[^/]*/[c]loud-hypervisor --api-socket' >/dev/null; then
+    break
+  fi
+  sleep 1
+done
+[ -n "$crash_node_pid" ] || {
+  echo "process-death: AWF process did not become live" >&2
+  exit 1
+}
+sudo kill -KILL "$crash_node_pid"
+set +e
+wait "$crash_wrapper_pid"
+crash_status=$?
+set -e
+[ "$crash_status" -ne 0 ] || {
+  echo "process-death: SIGKILL unexpectedly returned success" >&2
+  exit 1
+}
+sudo ip netns list | grep -q '^awfvm-' || {
+  echo "process-death: abrupt exit did not leave the expected recovery fixture" >&2
+  exit 1
+}
+sudo pgrep -f '/var/lib/awf-cloud-hypervisor/trusted-artifacts/run-[^/]*/[c]loud-hypervisor --api-socket' >/dev/null || {
+  echo "process-death: VMM did not survive abrupt owner death" >&2
+  exit 1
+}
+run_case process-death-reaper 0 'true'
+assert_no_residue
+
 keep_work="$RUN_ROOT/keep/work"
 keep_workspace="$RUN_ROOT/keep/workspace"
 keep_audit="$RUN_ROOT/keep/audit"
@@ -480,12 +691,68 @@ sudo find "$keep_audit/cloud-hypervisor" -type f -size +1048576c -print -quit \
     exit 1
   }
 
+readarray -t keep_forward_rule < <(
+  sudo node -e '
+    const plan = require(process.argv[1]);
+    console.log(plan.infrastructureBridge);
+    console.log(plan.hostForwardRuleComment);
+  ' "$keep_audit/cloud-hypervisor/network-plan.json"
+)
+sudo iptables -t filter -D DOCKER-USER \
+  -i "${keep_forward_rule[0]}" -o "${keep_forward_rule[0]}" \
+  -m comment --comment "${keep_forward_rule[1]}" -j ACCEPT
 while read -r namespace _; do
   case "$namespace" in
     awfvm-*) sudo ip netns delete "$namespace" ;;
   esac
 done < <(sudo ip netns list)
+# The preserved CLI process has exited, so these owner identities are stale.
+# This is explicit test-harness teardown, analogous to the forced run-directory
+# cleanup below; normal runtime cleanup uses the lease-checked release path.
+sudo find /run/awf-microvm-network/reservations -name '*.json' -delete 2>/dev/null || true
 sudo docker compose -f "$keep_work/docker-compose.yml" down --volumes --remove-orphans
+# Keep mode completes its recovery record, so remove only the snapshot named
+# by this VM's confinement evidence, using the runtime's identity/mount guards.
+sudo node - "$ROOT" "$keep_audit/cloud-hypervisor/confinement.json" <<'KEEP_SNAPSHOT_CLEANUP'
+const { promises: fs } = require("fs");
+const path = require("path");
+const [root, evidencePath] = process.argv.slice(2);
+const { CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT } = require(
+  path.join(root, "dist/cloud-hypervisor/manager-types")
+);
+const { resolveCleanupDependencies } = require(
+  path.join(root, "dist/cloud-hypervisor/cleanup-dependencies")
+);
+const { captureFileIdentity } = require(
+  path.join(root, "dist/cloud-hypervisor/cleanup-process")
+);
+const { assertNoMountsUnder, removeExactDirectory } = require(
+  path.join(root, "dist/cloud-hypervisor/cleanup-record-store")
+);
+(async () => {
+  const evidence = JSON.parse(await fs.readFile(evidencePath, "utf8"));
+  const executable = evidence.process.executable;
+  if (typeof executable !== "string") throw new Error("Missing preserved VMM executable");
+  const directory = path.dirname(executable);
+  if (path.basename(executable) !== "cloud-hypervisor" ||
+      path.dirname(directory) !== CLOUD_HYPERVISOR_ARTIFACT_SNAPSHOT_ROOT ||
+      !/^run-[A-Za-z0-9]{6}$/.test(path.basename(directory)) ||
+      await fs.realpath(directory) !== directory) {
+    throw new Error("Unsafe preserved trusted-artifact snapshot path");
+  }
+  const stat = await fs.lstat(directory);
+  if (!stat.isDirectory() || stat.uid !== 0) {
+    throw new Error("Preserved trusted-artifact snapshot must be a root-owned directory");
+  }
+  const dependencies = resolveCleanupDependencies();
+  const identity = await captureFileIdentity(dependencies.lstat, directory);
+  await assertNoMountsUnder(dependencies, directory);
+  await removeExactDirectory(directory, identity, dependencies, true);
+})().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
+KEEP_SNAPSHOT_CLEANUP
 # --keep-containers intentionally preserves the private run directory (see
 # CLOUD_HYPERVISOR_RUN_ROOT in src/cloud-hypervisor/manager.ts); clean it up
 # here so assert_no_residue below reflects steady-state, not this case's
@@ -496,8 +763,8 @@ assert_no_residue
 # --- Cloud Hypervisor-specific live security assertions -------------------
 #
 # Reproduces the launcher's jailer-replacement boundary live, while a run is
-# in flight: netns-join + non-root privilege drop + capability set limited
-# to CAP_NET_ADMIN alone + no_new_privs + active seccomp filter + per-run
+# in flight: netns-join + non-root privilege drop + empty capability sets +
+# no_new_privs + active seccomp filter + per-run
 # cgroup membership/limits + landlock_enable reflected in vm.create + an
 # exactly-minimal disk/net/vsock device set (see
 # src/cloud-hypervisor/launcher.ts and manager.ts).
@@ -555,14 +822,40 @@ done
 proc_uid=$(sudo stat -c %u "/proc/$vmm_pid" 2>/dev/null || echo "")
 [ -n "$proc_uid" ] || fail_security "could not stat /proc/$vmm_pid"
 [ "$proc_uid" != "0" ] || fail_security "Cloud Hypervisor process is running as root"
+operator_uid=$(id -u)
+[ "$proc_uid" != "$operator_uid" ] \
+  || fail_security "Cloud Hypervisor process reused the invoking operator uid $operator_uid"
+vmm_passwd=$(getent passwd "$proc_uid" || true)
+[ -n "$vmm_passwd" ] || fail_security "no passwd entry for Cloud Hypervisor uid $proc_uid"
+vmm_name=$(printf '%s' "$vmm_passwd" | cut -d: -f1)
+vmm_gid=$(printf '%s' "$vmm_passwd" | cut -d: -f4)
+[ "$(printf '%s' "$vmm_passwd" | cut -d: -f6)" = "/nonexistent" ] \
+  || fail_security "Cloud Hypervisor account has an unexpected home directory"
+[ "$(printf '%s' "$vmm_passwd" | cut -d: -f7)" = "/usr/sbin/nologin" ] \
+  || fail_security "Cloud Hypervisor account has an interactive shell"
+printf '%s' "$vmm_name" | grep -Eq '^awfvmm-[0-9a-f]{20}$' \
+  || fail_security "Cloud Hypervisor account name is not a random per-run name: $vmm_name"
+[ "$(id -G "$vmm_name")" = "$vmm_gid" ] \
+  || fail_security "Cloud Hypervisor account inherited supplementary groups"
+kvm_acl=$(sudo getfacl --absolute-names --numeric /dev/kvm 2>/dev/null)
+if grep -q "^user:$proc_uid:" <<<"$kvm_acl"; then
+  printf '%s\n' "$kvm_acl" >&2
+  fail_security "Cloud Hypervisor uid retains /dev/kvm access after VM creation"
+fi
+tun_acl=$(sudo getfacl --absolute-names --numeric /dev/net/tun 2>/dev/null)
+if grep -q "^user:$proc_uid:" <<<"$tun_acl"; then
+  printf '%s\n' "$tun_acl" >&2
+  fail_security "Cloud Hypervisor uid retains /dev/net/tun access after VM creation"
+fi
 
-# Capability set limited to CAP_NET_ADMIN alone (setpriv --inh-caps=-all,
-# +net_admin --bounding-set=-all,+net_admin --ambient-caps=+net_admin).
-# CAP_NET_ADMIN's bit is 12, so the expected 64-bit CapEff bitmask is
-# exactly 0x1000: 0000000000001000.
-cap_eff=$(sudo awk '/^CapEff:/{print $2}' "/proc/$vmm_pid/status" 2>/dev/null || echo "")
-[ "$cap_eff" = "0000000000001000" ] \
-  || fail_security "process capability set is not exactly CAP_NET_ADMIN: ${cap_eff:-unknown}"
+# Every capability set is empty. In particular, a zero CapBnd prevents the
+# non-root VMM from regaining CAP_NET_ADMIN after exec.
+for cap_field in CapInh CapPrm CapEff CapBnd CapAmb; do
+  cap_value=$(sudo awk -v field="$cap_field:" '$1 == field { print $2 }' \
+    "/proc/$vmm_pid/status" 2>/dev/null || echo "")
+  [ "$cap_value" = "0000000000000000" ] \
+    || fail_security "$cap_field is not empty: ${cap_value:-unknown}"
+done
 
 # no_new_privs set (setpriv --no-new-privs).
 no_new_privs=$(sudo awk '/^NoNewPrivs:/{print $2}' "/proc/$vmm_pid/status" 2>/dev/null || echo "")
@@ -612,16 +905,9 @@ esac
 # startup and could fail on a valid but slower runner; polling for "Running"
 # also proves these assertions inspect a live VM, not merely a launched VMM.
 #
-# The expected TAP name is derived exactly like
-# createMicrovmNetworkPlan() (src/microvm/network.ts): `vmt` + the first 12
-# hex characters of sha256(runId). The per-run network namespace shares
-# the same token (`awfvm-` + token) and is where the TAP device actually
-# lives -- checking for it in the root/default namespace, which is what
-# actually hosts this script, would never find a namespace-scoped
-# interface regardless of whether it truly exists.
-run_token=$(printf '%s' "$run_id" | sha256sum | cut -c1-12)
-expected_tap="vmt$run_token"
-expected_namespace="awfvm-$run_token"
+# Resource tokens are reservation-selected rather than deterministically
+# derived from runId. Read the selected TAP from the live VMM config below,
+# validate its shape, then derive the namespace sharing that token.
 expected_rootfs_path="$run_directory/rootfs.ext4"
 expected_vsock_socket="$run_directory/awf-vsock.socket"
 
@@ -636,6 +922,22 @@ for _ in $(seq 1 30); do
   sleep 1
 done
 [ -n "$vm_info" ] || fail_security "vm.info never reported state \"Running\" within the poll window"
+expected_tap=$(node -e '
+  const info = JSON.parse(process.argv[1]);
+  process.stdout.write(info.config?.net?.[0]?.tap || "");
+' "$vm_info")
+case "$expected_tap" in
+  vmt[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+  *) fail_security "reservation-selected TAP has unsafe shape: $expected_tap" ;;
+esac
+run_token=${expected_tap#vmt}
+expected_namespace="awfvm-$run_token"
+reservation_path="/run/awf-microvm-network/reservations/$run_token.json"
+sudo test -f "$reservation_path" \
+  || fail_security "live network reservation is missing: $reservation_path"
+reservation_owner=$(sudo stat -c '%u:%a' "$reservation_path")
+[ "$reservation_owner" = "0:600" ] \
+  || fail_security "network reservation ownership/mode is not root:600: $reservation_owner"
 
 node -e '
   const [
@@ -673,6 +975,17 @@ node -e '
 
   if (config.landlock_enable !== true) {
     throw new Error("landlock_enable is not true in vm.info: " + JSON.stringify(config.landlock_enable));
+  }
+  const tapSysfsPath = "/sys/class/net/" + expectedTap + "/tun_flags";
+  const tapSysfsRules = (config.landlock_rules || [])
+    .filter(rule => rule.path === tapSysfsPath);
+  if (tapSysfsRules.length !== 1 || tapSysfsRules[0].access !== "r") {
+    throw new Error("TAP tun_flags Landlock rule is not exactly read-only: " +
+      JSON.stringify(tapSysfsRules));
+  }
+  if ((config.landlock_rules || []).some(rule =>
+    rule.path === "/sys/class/net/" + expectedTap)) {
+    throw new Error("Landlock grants the VMM the broader TAP sysfs directory");
   }
 
   const disks = config.disks || [];
@@ -727,6 +1040,14 @@ node -e '
 # `ip netns exec`, not a bare `ip link show`.
 sudo ip netns exec "$expected_namespace" ip link show "$expected_tap" >/dev/null 2>&1 \
   || fail_security "expected TAP interface $expected_tap not found in namespace $expected_namespace"
+tap_details=$(sudo ip netns exec "$expected_namespace" \
+  ip -details tuntap show dev "$expected_tap" 2>/dev/null || true)
+tap_line=$(printf '%s\n' "$tap_details" | grep "^${expected_tap}: " || true)
+[ -n "$tap_line" ] || fail_security "expected TAP details were not found: $tap_details"
+printf '%s' "$tap_line" | grep -Eq "(^|[[:space:]])user[[:space:]]+$proc_uid([[:space:]]|$)" \
+  || fail_security "TAP is not owned by the per-run VMM uid $proc_uid: $tap_details"
+printf '%s' "$tap_line" | grep -Eq "(^|[[:space:]])group[[:space:]]+$vmm_gid([[:space:]]|$)" \
+  || fail_security "TAP is not owned by the per-run VMM gid $vmm_gid: $tap_details"
 
 kill -TERM "$sec_pid"
 set +e
@@ -738,5 +1059,16 @@ set -e
   exit 1
 }
 assert_no_residue
+if getent passwd "$vmm_name" >/dev/null; then
+  fail_security "per-run Cloud Hypervisor account remains after cancellation: $vmm_name"
+fi
+kvm_acl=$(sudo getfacl --absolute-names --numeric /dev/kvm 2>/dev/null)
+if grep -q "^user:$proc_uid:" <<<"$kvm_acl"; then
+  fail_security "per-run /dev/kvm ACL remains after cancellation for uid $proc_uid"
+fi
+tun_acl=$(sudo getfacl --absolute-names --numeric /dev/net/tun 2>/dev/null)
+if grep -q "^user:$proc_uid:" <<<"$tun_acl"; then
+  fail_security "per-run /dev/net/tun ACL remains after cancellation for uid $proc_uid"
+fi
 
 echo "Cloud Hypervisor live smoke/security suite passed."

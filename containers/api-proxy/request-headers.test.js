@@ -12,6 +12,18 @@ describe('request-headers', () => {
     delete process.env.COPILOT_INTEGRATION_ID;
   });
 
+  test.each([
+    ['api.githubcopilot.com:8443', true],
+    ['copilot-api.tenant.ghe.com:8443', true],
+    ['gateway.example.com:8443', false],
+  ])('retains Copilot integration-header scoping with port on %s', (targetHost, expected) => {
+    const headers = buildRequestHeaders(Buffer.from('{}'), 2, { headers: {} }, {
+      injectHeaders: { 'Copilot-Integration-Id': 'test-integration' },
+      provider: 'copilot', targetHost, requestId: 'port-test',
+    });
+    expect(headers['Copilot-Integration-Id'] === 'test-integration').toBe(expected);
+  });
+
   test('isValidRequestId enforces expected constraints', () => {
     expect(isValidRequestId('req-123.ABC')).toBe(true);
     expect(isValidRequestId('')).toBe(false);
@@ -42,6 +54,32 @@ describe('request-headers', () => {
     expect(headers['x-request-id']).toBe('req-1');
   });
 
+  test('buildRequestHeaders strips x-awf-caller before forwarding upstream', () => {
+    const headers = buildRequestHeaders(Buffer.from('{}'), 2, {
+      headers: { 'x-awf-caller': 'subagent/file-summarizer', 'X-AWF-Caller': 'main', 'x-custom': 'keep-me' },
+    }, {
+      injectHeaders: {},
+      provider: 'openai',
+      targetHost: 'api.openai.com',
+      requestId: 'req-caller',
+    });
+
+    expect(Object.keys(headers).map(name => name.toLowerCase())).not.toContain('x-awf-caller');
+    expect(headers['x-custom']).toBe('keep-me');
+  });
+
+  test('buildRequestHeaders strips an invalid x-awf-caller', () => {
+    for (const value of ['x'.repeat(129), 'subagent/file summarizer', 'subagent/', 'admin', 'main, main']) {
+      const headers = buildRequestHeaders(Buffer.from('{}'), 2, { headers: { 'x-awf-caller': value } }, {
+        injectHeaders: {},
+        provider: 'openai',
+        targetHost: 'api.openai.com',
+        requestId: 'req-invalid-caller',
+      });
+      expect(headers).not.toHaveProperty('x-awf-caller');
+    }
+  });
+
   test('buildRequestHeaders applies copilot initiator and content length rewrite', () => {
     const req = {
       headers: {
@@ -64,6 +102,33 @@ describe('request-headers', () => {
     expect(headers['x-github-tenant']).toBe('tenant-id');
     expect(headers['content-length']).toBe(String(body.length));
     expect(headers['transfer-encoding']).toBeUndefined();
+  });
+
+  test('buildRequestHeaders forces identity accept-encoding for Codex-compatibility-translated requests', () => {
+    const req = { headers: { 'accept-encoding': 'gzip, br' } };
+    const headers = buildRequestHeaders(Buffer.from('{}'), 2, req, {
+      injectHeaders: {},
+      provider: 'copilot',
+      targetHost: 'api.githubcopilot.com',
+      requestId: 'req-3',
+      codexCompatibility: { customTools: new Set(['apply_patch']) },
+    });
+
+    // The compatibility adapter rewrites the plaintext response body; a
+    // compressed response would otherwise leave the rewrite unapplied.
+    expect(headers['accept-encoding']).toBe('identity');
+  });
+
+  test('buildRequestHeaders leaves accept-encoding sanitization untouched when not Codex-translated', () => {
+    const req = { headers: { 'accept-encoding': 'gzip, br, zstd' } };
+    const headers = buildRequestHeaders(Buffer.from('{}'), 2, req, {
+      injectHeaders: {},
+      provider: 'copilot',
+      targetHost: 'api.githubcopilot.com',
+      requestId: 'req-4',
+    });
+
+    expect(headers['accept-encoding']).toBe('gzip, br');
   });
 });
 
@@ -148,6 +213,22 @@ describe('copilot interaction/integration headers', () => {
     expect(headers['x-interaction-id']).toBeUndefined();
     expect(headers['Copilot-Integration-Id']).toBeUndefined();
     expect(headers['copilot-integration-id']).toBeUndefined();
+  });
+
+  test('preserves the integration id without adding interaction headers on canonical GHEC hosts', () => {
+    const headers = buildCopilotHeaders({}, { targetHost: 'copilot-api.myorg.ghe.com' });
+    expect(headers['Copilot-Integration-Id']).toBe('agentic-workflows');
+    expect(headers['x-interaction-id']).toBeUndefined();
+    expect(headers['x-initiator']).toBeUndefined();
+  });
+
+  test('preserves a case-variant caller integration id on canonical GHEC hosts', () => {
+    const headers = buildCopilotHeaders(
+      { 'copilot-integration-id': 'from-caller' },
+      { targetHost: 'copilot-api.myorg.ghe.com' }
+    );
+    expect(Object.entries(headers).filter(([name]) => name.toLowerCase() === 'copilot-integration-id'))
+      .toEqual([['copilot-integration-id', 'from-caller']]);
   });
 
   test('does not inject on other providers', () => {

@@ -8,9 +8,17 @@ import {
   SQUID_PORT,
   apiProxyPorts,
 } from '../config/network-policy';
+import {
+  ENCLAVE_AGENT_API_PROXY_IP,
+  ENCLAVE_AGENT_GITHUB_MCP_IP,
+  ENCLAVE_AGENT_SUBNET,
+  ENCLAVE_GITHUB_MCP_PORT,
+} from '../enclave/network';
+import { API_PROXY_PORTS } from '../types/ports';
 import type {
   MicrovmAllowedEndpoint,
   MicrovmControlPeer,
+  MicrovmNetworkPlanAllocation,
   MicrovmNetworkPlan,
   MicrovmNetworkPlanOptions,
 } from './network-types';
@@ -25,15 +33,38 @@ const BLOCKED_MULTICAST_CIDR = '224.0.0.0/4';
 export function createMicrovmNetworkPlan(
   runId: string,
   options: MicrovmNetworkPlanOptions,
+  allocation?: MicrovmNetworkPlanAllocation,
 ): MicrovmNetworkPlan {
   assertSafeMicrovmRunId(runId);
   assertInterfaceName(options.infrastructureBridge, 'infrastructure bridge');
   assertPositiveIdentity(options.tapOwnerUid, 'tap owner uid');
   assertPositiveIdentity(options.tapOwnerGid, 'tap owner gid');
+  if (options.enclaveAgent) {
+    if (
+      options.enableApiProxy ||
+      options.controlPeer ||
+      options.controlPeers?.length ||
+      ![
+        API_PROXY_PORTS.OPENAI,
+        API_PROXY_PORTS.ANTHROPIC,
+        API_PROXY_PORTS.COPILOT,
+      ].includes(options.enclaveAgent.apiProxyPort) ||
+      typeof options.enclaveAgent.githubDataPlane !== 'boolean'
+    ) {
+      throw new Error('Invalid closed microVM agent-enclave network options');
+    }
+  }
 
   const digest = createHash('sha256').update(runId).digest();
-  const token = digest.toString('hex').slice(0, 12);
-  const subnetIndex = digest.readUInt32BE(0) & (GUEST_SUBNET_COUNT - 1);
+  const token = allocation?.resourceToken ?? digest.toString('hex').slice(0, 12);
+  if (!/^[0-9a-f]{12}$/.test(token)) {
+    throw new Error(`Unsafe microVM resource token: ${token}`);
+  }
+  const subnetIndex = allocation?.subnetIndex
+    ?? (digest.readUInt32BE(0) & (GUEST_SUBNET_COUNT - 1));
+  if (!Number.isInteger(subnetIndex) || subnetIndex < 0 || subnetIndex >= GUEST_SUBNET_COUNT) {
+    throw new Error(`Invalid microVM subnet index: ${subnetIndex}`);
+  }
   const subnetBase = GUEST_NETWORK_BASE + subnetIndex * 4;
   const guestGatewayIp = integerToIpv4(subnetBase + 1);
   const guestIp = integerToIpv4(subnetBase + 2);
@@ -59,25 +90,36 @@ export function createMicrovmNetworkPlan(
     assertInterfaceName(name, label);
   }
 
-  const allowedEndpoints = createAllowedEndpoints(
-    options.enableApiProxy,
-    [
-      ...(options.controlPeer ? [options.controlPeer] : []),
-      ...(options.controlPeers ?? []),
-    ],
-  );
+  const allowedEndpoints = options.enclaveAgent
+    ? [
+        { name: 'enclave-api-proxy', ip: ENCLAVE_AGENT_API_PROXY_IP, port: options.enclaveAgent.apiProxyPort },
+        ...(options.enclaveAgent.githubDataPlane
+          ? [{ name: 'github-data-plane', ip: ENCLAVE_AGENT_GITHUB_MCP_IP, port: ENCLAVE_GITHUB_MCP_PORT }]
+          : []),
+      ]
+    : createAllowedEndpoints(
+        options.enableApiProxy,
+        [
+          ...(options.controlPeer ? [options.controlPeer] : []),
+          ...(options.controlPeers ?? []),
+        ],
+      );
   const plan: MicrovmNetworkPlan = {
+    ...(options.enclaveAgent ? { mode: 'enclave-agent' as const } : {}),
     runId,
+    resourceToken: token,
+    ...(allocation?.reservationPath ? { reservationPath: allocation.reservationPath } : {}),
     namespaceName,
     netnsPath: `${NETNS_DIRECTORY}/${namespaceName}`,
     nftTableName,
+    hostForwardRuleComment: `awf-microvm-${token}`,
     infrastructureBridge: options.infrastructureBridge,
     hostVethName,
     namespaceVethName,
     tapName,
-    infrastructureIp: AGENT_IP,
-    infrastructureCidr: NETWORK_SUBNET,
-    hostGatewayIp: HOST_GATEWAY,
+    infrastructureIp: allocation?.infrastructureIp ?? (options.enclaveAgent ? '172.31.0.20' : AGENT_IP),
+    infrastructureCidr: options.enclaveAgent ? ENCLAVE_AGENT_SUBNET : NETWORK_SUBNET,
+    hostGatewayIp: options.enclaveAgent ? '172.31.0.1' : HOST_GATEWAY,
     guestSubnet: `${integerToIpv4(subnetBase)}/${GUEST_PREFIX_LENGTH}`,
     guestIp,
     guestGatewayIp,
@@ -86,6 +128,7 @@ export function createMicrovmNetworkPlan(
     tapOwnerUid: options.tapOwnerUid,
     tapOwnerGid: options.tapOwnerGid,
     tapVnetHdr: options.tapVnetHdr ?? false,
+    tapEnabled: options.createTap ?? true,
     allowedEndpoints,
     networkInterface: {
       iface_id: 'eth0',
@@ -99,6 +142,37 @@ export function createMicrovmNetworkPlan(
 
 export function generateMicrovmNftRuleset(plan: MicrovmNetworkPlan): string {
   validatePlan(plan);
+  if (plan.tapEnabled === false) {
+    const outputAllowRules = plan.allowedEndpoints.map((endpoint) =>
+      `    oifname "${plan.namespaceVethName}" ip daddr ${endpoint.ip} ` +
+      `tcp dport ${endpoint.port} ct state new,established counter accept`,
+    );
+    return [
+      `table inet ${plan.nftTableName} {`,
+      '  chain input {',
+      '    type filter hook input priority filter; policy drop;',
+      '    iifname "lo" accept',
+      '    ct state established,related accept',
+      '  }',
+      '  chain output {',
+      '    type filter hook output priority filter; policy drop;',
+      '    oifname "lo" accept',
+      '    ct state established,related accept',
+      `    oifname "${plan.namespaceVethName}" ip daddr ${BLOCKED_LINK_LOCAL_CIDR} counter drop`,
+      `    oifname "${plan.namespaceVethName}" ip daddr ${BLOCKED_MULTICAST_CIDR} counter drop`,
+      `    oifname "${plan.namespaceVethName}" ip daddr ${plan.hostGatewayIp} counter drop`,
+      `    oifname "${plan.namespaceVethName}" ip daddr ${plan.infrastructureIp} counter drop`,
+      `    oifname "${plan.namespaceVethName}" udp dport 53 counter drop`,
+      `    oifname "${plan.namespaceVethName}" tcp dport 53 counter drop`,
+      ...outputAllowRules,
+      '  }',
+      '  chain forward {',
+      '    type filter hook forward priority filter; policy drop;',
+      '  }',
+      '}',
+      '',
+    ].join('\n');
+  }
   const allowRules = plan.allowedEndpoints.flatMap((endpoint) => [
     `    iifname "${plan.tapName}" oifname "${plan.namespaceVethName}" ` +
       `ether saddr ${plan.guestMac} ip saddr ${plan.guestIp} ` +
@@ -248,6 +322,12 @@ function validatePlan(plan: MicrovmNetworkPlan): void {
   assertIpv4(plan.infrastructureIp, 'infrastructure IP');
   assertCidr(plan.infrastructureCidr, 'infrastructure CIDR');
   assertIpv4(plan.hostGatewayIp, 'host gateway IP');
+  if (!isInCidr(plan.infrastructureIp, plan.infrastructureCidr)) {
+    throw new Error(
+      `microVM infrastructure IP ${plan.infrastructureIp} is outside ` +
+      plan.infrastructureCidr,
+    );
+  }
   assertCidr(plan.guestSubnet, 'guest subnet');
   assertIpv4(plan.guestIp, 'guest IP');
   assertIpv4(plan.guestGatewayIp, 'guest gateway IP');

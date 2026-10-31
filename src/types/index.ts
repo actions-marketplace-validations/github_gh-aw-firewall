@@ -9,17 +9,25 @@ export {
 } from './ports';
 
 export type * from './wrapper-config';
+export type { ModelRoutingBootstrapState } from './api-proxy-routing-options';
 
 export { type UpstreamProxyConfig } from './upstream-proxy';
 export { type LogLevel } from './log-level';
 export {
   type CloudHypervisorArtifactDigests,
+  type CloudHypervisorMountPolicy,
   type CloudHypervisorOptions,
   CLOUD_HYPERVISOR_RELEASE_VERSION,
   CLOUD_HYPERVISOR_DEFAULT_BINARY,
   CLOUD_HYPERVISOR_DEFAULT_VCPU_COUNT,
   CLOUD_HYPERVISOR_DEFAULT_MEMORY_MIB,
   CLOUD_HYPERVISOR_DEFAULT_API_TIMEOUT_MS,
+  CLOUD_HYPERVISOR_DEFAULT_MOUNT_POLICY,
+  CLOUD_HYPERVISOR_MOUNT_POLICIES,
+  type NvxOptions,
+  NVX_DEFAULT_MEMORY_MIB,
+  NVX_DEFAULT_MEMORY_MAX_BYTES,
+  NVX_DEFAULT_PIDS_MAX,
 } from './runtime-options';
 export { type RateLimitConfig } from './rate-limit';
 export { type FlagValidationResult } from './validation';
@@ -43,6 +51,7 @@ export {
   type OutputFormat,
   type LogStatsFormat,
   type LogSource,
+  type StartupDiagnostic,
   type EnhancedLogEntry,
 } from './logging';
 

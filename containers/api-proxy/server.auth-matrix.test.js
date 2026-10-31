@@ -13,8 +13,8 @@
 const { createOpenAIAdapter } = require('./providers/openai');
 const { createAnthropicAdapter } = require('./providers/anthropic');
 const { createCopilotAdapter } = require('./providers/copilot');
-const { createGeminiAdapter } = require('./providers/gemini');
-const { createVertexAdapter } = require('./providers/vertex');
+const { GOOGLE_PROVIDER_ADAPTER_FACTORIES } = require('./providers/google-adapter');
+const { gemini: createGeminiAdapter, vertex: createVertexAdapter } = GOOGLE_PROVIDER_ADAPTER_FACTORIES;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -277,13 +277,13 @@ describe('Auth Matrix — Copilot', () => {
   });
 
   describe('GitHub OAuth token — GHEC (*.ghe.com)', () => {
-    it('sends Authorization: token for GHEC data-residency targets', () => {
+    it('sends Authorization: ****** GHEC data-residency targets', () => {
       const adapter = createCopilotAdapter({
         COPILOT_GITHUB_TOKEN: 'ghu_ghec_token',
         GITHUB_SERVER_URL: 'https://mycompany.ghe.com',
       });
       const headers = adapter.getAuthHeaders(fakeReq());
-      expect(headers.Authorization).toBe('token ghu_ghec_token');
+      expect(headers.Authorization).toBe(['Bearer', 'ghu_ghec_token'].join(' '));
     });
 
     it('derives correct copilot-api target for GHEC', () => {

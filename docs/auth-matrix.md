@@ -40,7 +40,7 @@ Auth evaluation in the api-proxy is determined by the combination of these indep
 | 8 | Extra Injection | `AWF_BYOK_EXTRA_HEADERS`, `AWF_BYOK_EXTRA_BODY_FIELDS` | JSON objects |
 
 :::note
-The OIDC Provider dimension (`AWF_AUTH_PROVIDER`) only applies to the OpenAI, Anthropic, and Copilot adapters. The Gemini and Vertex adapters are static-API-key only in the current implementation — see [Provider: Google Vertex AI](#provider-google-vertex-ai) for how GCP workload identity federation reaches Vertex-compatible endpoints today.
+The OIDC Provider dimension (`AWF_AUTH_PROVIDER`) applies to OpenAI, Anthropic, Copilot, Gemini, and Vertex AI when the listed provider supports that cloud's token format. The Gemini and Vertex AI adapters support `AWF_AUTH_PROVIDER=gcp` through Google Workload Identity Federation; other OIDC providers do not apply to those Google adapters.
 :::
 
 ---
@@ -145,7 +145,7 @@ When `AWF_AUTH_TYPE=github-oidc` and `AWF_AUTH_PROVIDER=anthropic`:
 AWF follows Anthropic's SDK behavior: JWT-bearer `POST /v1/oauth/token` exchanges send `oauth-2025-04-20,oidc-federation-2026-04-01`, while API requests authenticated with the resulting bearer token send `oauth-2025-04-20`. The federation beta is never added to static `x-api-key` requests or forwarded refresh-token exchanges. Client-supplied `anthropic-beta` values are preserved and deduplicated with AWF-required values and the optional auto-cache beta.
 :::
 
-**Official references:** [Anthropic WIF documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation) · [Anthropic TypeScript SDK federation exchange](https://github.com/anthropics/anthropic-sdk-typescript/blob/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/oidc-federation.ts)
+**Official references:** [Anthropic WIF documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation) · [Anthropic TypeScript SDK federation exchange](https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/oidc-federation.ts)
 
 ### Custom Auth Header
 
@@ -163,15 +163,17 @@ AWF follows Anthropic's SDK behavior: JWT-bearer `POST /v1/oauth/token` exchange
 | Instance | Env var | Header | Target |
 |----------|---------|--------|--------|
 | github.com | `COPILOT_GITHUB_TOKEN` | `Authorization: Bearer <token>` | `api.githubcopilot.com` |
-| GHEC (`*.ghe.com`) | `COPILOT_GITHUB_TOKEN` | `Authorization: token <value>` ⚠️ | `copilot-api.<subdomain>.ghe.com` |
+| GHEC (`*.ghe.com`) | `COPILOT_GITHUB_TOKEN` | `Authorization: Bearer <value>` | `copilot-api.<subdomain>.ghe.com` |
 | GHES (on-prem) | `COPILOT_GITHUB_TOKEN` | `Authorization: token <value>` ⚠️ | `api.enterprise.githubcopilot.com` |
 | Business tier | `COPILOT_GITHUB_TOKEN` | `Authorization: token <value>` ⚠️ | `api.business.githubcopilot.com` (must be set explicitly via `COPILOT_API_TARGET`; never auto-derived) |
 
 :::note[Implementation vs. provider documentation]
-GitHub's [REST API authentication docs](https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api) state that both Bearer-prefixed and token-prefixed Authorization headers are generally accepted for PATs/OAuth tokens (only JWTs strictly require Bearer). The `token` prefix requirement documented here is **AWF-implementation-specific defensive behavior** for Copilot API requests, not a general GitHub REST API rule: the derived GHEC data-residency target (`copilot-api.<subdomain>.ghe.com`), the enterprise target (`api.enterprise.githubcopilot.com`), and the business target (`api.business.githubcopilot.com`) return `400 Bad Request: Authorization header is badly formatted` when sent the wrong prefix (see the regression fixed in [PR #6991](https://github.com/github/gh-aw-firewall/pull/6991) and covered by `copilot-adapter-enterprise.test.js`). AWF detects this via `copilotTargetRequiresGitHubTokenPrefix()` in `copilot-auth.js`, which matches on the specific target hostname (including an `isGhecCopilotApiTarget()` check for the `copilot-api.<subdomain>.ghe.com` shape) or GHES-detection heuristics (`AWF_PLATFORM_TYPE=ghes`, or a `GITHUB_SERVER_URL` that isn't `github.com`/`*.ghe.com`). BYOK keys always use the `Bearer` prefix regardless of target.
+GitHub's [REST API authentication docs](https://docs.github.com/en/rest/authentication/authenticating-to-the-rest-api) state that both Bearer-prefixed and token-prefixed Authorization headers are generally accepted for PATs/OAuth tokens (only JWTs strictly require Bearer). The `token` prefix requirement documented here is **AWF-implementation-specific defensive behavior** for Copilot API requests, not a general GitHub REST API rule: the enterprise target (`api.enterprise.githubcopilot.com`) and the business target (`api.business.githubcopilot.com`) return `400 Bad Request: Authorization header is badly formatted` when sent the wrong prefix. AWF detects this via `copilotTargetRequiresGitHubTokenPrefix()` in `copilot-auth.js`, which matches on the specific target hostname or GHES-detection heuristics (`AWF_PLATFORM_TYPE=ghes`, or a `GITHUB_SERVER_URL` that isn't `github.com`/`*.ghe.com`). GHEC data-residency targets (`copilot-api.<subdomain>.ghe.com`) use the standard `Bearer` prefix. BYOK keys always use the `Bearer` prefix regardless of target.
+
+**Fine-grained PAT override:** As of [PR #8038](https://github.com/github/gh-aw-firewall/pull/8038), `COPILOT_GITHUB_TOKEN` values that start with `github_pat_` (fine-grained PATs) always use the `Bearer` prefix, on every Copilot target including GHEC/GHES/Business — they never fall back to `token <value>`, even where classic PATs and OAuth tokens on those targets require it. This override lives in `getGitHubTokenAuthPrefix()` in `copilot-auth.js` and is covered by `copilot-adapter-enterprise.test.js` and `copilot-auth.test.js`.
 :::
 
-Copilot API host requests also include `Copilot-Integration-Id`. The default is `agentic-workflows`; set `COPILOT_INTEGRATION_ID` to override it.
+Copilot API host requests also include `Copilot-Integration-Id`. The default is `agentic-workflows`; set `COPILOT_INTEGRATION_ID` to override it, or set `GITHUB_COPILOT_INTEGRATION_ID` as a fallback (checked only when `COPILOT_INTEGRATION_ID` is unset) — added in [PR #8038](https://github.com/github/gh-aw-firewall/pull/8038).
 
 ### Prompt-cache and attribution headers (`*.githubcopilot.com` only)
 
@@ -180,7 +182,7 @@ When the resolved upstream host is a Copilot host (`githubcopilot.com` or a `*.g
 | Header | Value | Purpose |
 |--------|-------|---------|
 | `X-Interaction-Id` | `${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}`, else a UUID minted once per sidecar process | CAPI prompt-cache key — must be stable for a whole run and differ across runs |
-| `Copilot-Integration-Id` | `COPILOT_INTEGRATION_ID`, else `agentic-workflows` | Attribution, quota bucket, and model allowlist |
+| `Copilot-Integration-Id` | `COPILOT_INTEGRATION_ID`, else `GITHUB_COPILOT_INTEGRATION_ID`, else `agentic-workflows` | Attribution, quota bucket, and model allowlist |
 
 Non-empty inbound values are preserved; empty values and case-variant duplicates are replaced so exactly one instance of each header reaches CAPI. Harnesses that do not send a stable `X-Interaction-Id` themselves (aider, Pi, …) therefore still get prompt-cache hits, and a harness that owns its own session identity can override the value simply by sending the header. There is no AWF-specific override env var for `X-Interaction-Id`: outside GitHub Actions the sidecar mints one UUID per process. Neither header is injected on non-Copilot hosts, so BYOK targets (Azure OpenAI, OpenRouter, …) and the OpenAI/Anthropic/Gemini providers are unaffected.
 
@@ -193,16 +195,17 @@ For GitHub Copilot catalog targets, the sidecar auto-selects appropriate `x-gith
 | `/auto` | POST | `2026-08-01` | Copilot Auto inference endpoint |
 | `/models/session` | POST | `2025-07-16` | Model session initialization |
 | `/models/session/intent` | POST | `2025-07-16` | Model session intent parsing |
+| `/models` | GET | `2026-07-01` | Model catalog listing (see below); applied for GitHub Copilot catalog targets when `COPILOT_GITHUB_TOKEN` is available, via a path separate from the POST method check |
 
 **Key behaviors:**
 - Auto-injection applies only to GitHub Copilot targets (`*.githubcopilot.com`); BYOK and non-Copilot targets are unaffected.
-- If the request already includes an `x-github-api-version` header (case-insensitive), it is preserved and auto-injection is skipped.
+- If the request already includes an `x-github-api-version` header (case-insensitive), it is preserved and auto-injection is skipped — this applies to the POST endpoints above (`getDefaultAutoApiVersion()` in `copilot.js`).
 - POST requests to other endpoints do not receive auto-injected versions; callers must specify versions for other endpoints if needed.
-- Non-POST requests never receive auto-injected versions.
+- `/models` GET is handled by a separate, unconditional code path (`buildCopilotModelsRequest()` and the request-header hook in `copilot.js`), not by the POST-gated `getDefaultAutoApiVersion()` logic above — it always attaches `X-GitHub-Api-Version: 2026-07-01` for GitHub Copilot catalog targets.
 
 ### `/models` Endpoint (Special Case)
 
-The `/models` endpoint prefers `COPILOT_GITHUB_TOKEN` (GitHub OAuth) over BYOK keys when both are configured, because model listing is a GitHub platform feature. However, when no GitHub token is available (typical for direct-BYOK/custom targets), `/models` will use the BYOK credential.
+The `/models` endpoint prefers `COPILOT_GITHUB_TOKEN` (GitHub OAuth) over BYOK keys when both are configured, because model listing is a GitHub platform feature. However, when no GitHub token is available (typical for direct-BYOK/custom targets), `/models` will use the BYOK credential. For GitHub Copilot catalog targets, `/models` GET requests always receive `X-GitHub-Api-Version: 2026-07-01` (`COPILOT_MODELS_API_VERSION` in `copilot.js`), verified by `copilot-adapter-enterprise.test.js` and `copilot-byok.test.js`.
 
 ### BYOK (Bring Your Own Key)
 
@@ -231,7 +234,9 @@ When `AWF_AUTH_TYPE=github-oidc` with Copilot:
 | AWS | SigV4 `Authorization` plus `x-amz-*` signing headers | Via `aws-oidc-token-provider.js` and `aws-sigv4.js` |
 
 :::caution[Agent routing is credential-triggered]
-Cloud OIDC configuration can initialize credentials in the sidecar, but the agent's OpenAI and Copilot base URLs/placeholders are currently configured only when the corresponding static OpenAI/Copilot credential is present. Anthropic WIF is the exception: its credential environment explicitly recognizes Anthropic OIDC. Treat Azure, GCP, and AWS OIDC support as sidecar authentication capability rather than a complete keyless agent-routing path until OIDC-aware agent routing is implemented.
+Cloud OIDC configuration can initialize credentials in the sidecar, but the agent's OpenAI and Copilot base URLs/placeholders are currently configured only when the corresponding static OpenAI/Copilot credential is present. Treat Azure, GCP, and AWS OIDC support for OpenAI/Copilot as sidecar authentication capability rather than a complete keyless agent-routing path until OIDC-aware agent routing is implemented for those adapters.
+
+Three providers are exceptions with explicit OIDC-aware agent routing: Anthropic WIF (`shouldProxyAnthropic()` recognizes `AWF_AUTH_PROVIDER=anthropic`), and GCP WIF for the Gemini and Vertex AI adapters (`isGcpOidcConfigured()` in `gemini-credential-env.ts`/`vertex-credential-env.ts`, added in [PR #8888](https://github.com/github/gh-aw-firewall/pull/8888)) — all three set agent base-URL/placeholder env vars from OIDC config alone, without a static key. GCP OIDC routing for **Copilot** specifically remains credential-triggered only; `buildCopilotCredentialEnv()` does not check `isGcpOidcConfigured()`.
 :::
 
 :::note[AWS OIDC + Copilot]
@@ -247,7 +252,7 @@ Selecting `AWF_AUTH_PROVIDER=aws` signs Copilot-adapter HTTP requests at final d
 ## Provider: Google Gemini
 
 **Port:** 10003  
-**Implementation:** `containers/api-proxy/providers/gemini.js`
+**Implementation:** `containers/api-proxy/providers/google-adapter.js` (Gemini factory from the declarative `google-provider-specs.js` registry)
 
 ### Static API Key
 
@@ -260,11 +265,16 @@ Selecting `AWF_AUTH_PROVIDER=aws` signs Copilot-adapter HTTP requests at final d
 
 The proxy also strips `?key=`, `?apiKey=`, and `?api_key=` query parameters from requests to prevent duplicate-key errors.
 
-:::note
-The native Gemini API supports OAuth, but the AWF Gemini adapter does not — only a static `GEMINI_API_KEY` is supported. There are two distinct ways to reach Google infrastructure with GCP workload identity federation:
-1. **Native Vertex AI adapter** (port 10004, static key only) — see [Provider: Google Vertex AI](#provider-google-vertex-ai).
-2. **OpenAI adapter with GCP OIDC** — point `OPENAI_API_TARGET` at a Vertex AI OpenAI-compatible endpoint and set `AWF_AUTH_TYPE=github-oidc`, `AWF_AUTH_PROVIDER=gcp`. This is a separate code path (`openai.js`) from the native Vertex adapter and is the only way to use GCP OIDC/WIF with Vertex-hosted models today.
-:::
+### GCP Workload Identity Federation
+
+| Setting | Value |
+|---------|-------|
+| Env vars | `AWF_AUTH_TYPE=github-oidc`, `AWF_AUTH_PROVIDER=gcp`, `AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER` |
+| Header sent upstream | Bearer auth header |
+| Optional service account | `AWF_AUTH_GCP_SERVICE_ACCOUNT` |
+| Optional scope | `AWF_AUTH_GCP_SCOPE` (default: `https://www.googleapis.com/auth/cloud-platform`) — applies only to service-account impersonation; the STS exchange always requests `cloud-platform` |
+
+This path keeps the GitHub OIDC exchange and short-lived GCP access token inside the api-proxy sidecar. It is intended for Gemini API endpoints that accept Google OAuth bearer tokens; billing follows the Google Cloud project/service account authorized by the workload identity pool.
 
 :::caution[Gemini API key migration]
 Google says the Gemini API will reject standard API keys beginning in September 2026. Migrate `GEMINI_API_KEY` to Google's service-account-bound authorization key format before that deadline; AWF forwards either key type through the same `x-goog-api-key` header.
@@ -277,7 +287,7 @@ Google says the Gemini API will reject standard API keys beginning in September 
 ## Provider: Google Vertex AI
 
 **Port:** 10004
-**Implementation:** `containers/api-proxy/providers/vertex.js` (shares `createGoogleApiKeyAdapter` with the Gemini adapter via `google-adapter.js`)
+**Implementation:** `containers/api-proxy/providers/google-adapter.js` (Vertex factory from the declarative `google-provider-specs.js` registry)
 
 ### Static API Key
 
@@ -288,12 +298,19 @@ Google says the Gemini API will reject standard API keys beginning in September 
 | Default target | `aiplatform.googleapis.com` |
 | Default base path | (none) |
 
-:::caution
-Unlike the OpenAI, Anthropic, and Copilot adapters, the Vertex adapter does **not** call `createOidcAwareProviderAdapter` — it is always bound to port 10004 (returning `503` if `GOOGLE_API_KEY` is unconfigured) and supports only the static-key flow described above. There is no OIDC/WIF variant of this adapter. For GCP workload identity federation with Vertex-hosted models, use the OpenAI adapter pathway described in the [Google Gemini](#provider-google-gemini) section above instead.
-:::
+### GCP Workload Identity Federation
+
+| Setting | Value |
+|---------|-------|
+| Env vars | `AWF_AUTH_TYPE=github-oidc`, `AWF_AUTH_PROVIDER=gcp`, `AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER` |
+| Header sent upstream | Bearer auth header |
+| Optional service account | `AWF_AUTH_GCP_SERVICE_ACCOUNT` |
+| Optional scope | `AWF_AUTH_GCP_SCOPE` (default: `https://www.googleapis.com/auth/cloud-platform`) — applies only to service-account impersonation; the STS exchange always requests `cloud-platform` |
+
+This is the native Vertex/Gemini CLI path for `GOOGLE_GENAI_USE_VERTEXAI=true`: AWF sets `GOOGLE_VERTEX_BASE_URL` to port 10004, exchanges the GitHub Actions OIDC token for a short-lived GCP token in the sidecar, and forwards Vertex requests to `aiplatform.googleapis.com` (or `VERTEX_API_TARGET`). Billing and quota are charged to the Google Cloud project associated with the impersonated service account, or to the directly granted workload identity principal when no service account is configured.
 
 :::note[Implementation vs. provider documentation]
-This adapter exists to support the [Gemini CLI](https://geminicli.com/)'s `GOOGLE_GENAI_USE_VERTEXAI=true` mode: setting `GOOGLE_VERTEX_BASE_URL` to point at this sidecar lets AWF isolate whatever credential the CLI is configured to send. Google's general Vertex AI guidance recommends Application Default Credentials, a service account key, or workload identity federation for Vertex AI endpoints, and treats a bare API key as unsupported for most Vertex AI surfaces (API keys are the norm for the separate Gemini Developer API at `generativelanguage.googleapis.com`). AWF does not attempt to validate that `aiplatform.googleapis.com` accepts a given key for a given operation — it forwards `x-goog-api-key` unconditionally. Confirm your specific Vertex AI project/API supports API-key auth (for example, Vertex AI Express Mode) before relying on this adapter in production.
+This adapter exists to support the [Gemini CLI](https://geminicli.com/)'s `GOOGLE_GENAI_USE_VERTEXAI=true` mode: setting `GOOGLE_VERTEX_BASE_URL` to point at this sidecar routes Vertex AI traffic through AWF. Google's general Vertex AI guidance recommends Application Default Credentials, a service account key, or workload identity federation for Vertex AI endpoints, and treats a bare API key as unsupported for most Vertex AI surfaces (API keys are the norm for the separate Gemini Developer API at `generativelanguage.googleapis.com`). Prefer GCP WIF for Vertex AI. AWF still forwards `x-goog-api-key` when `GOOGLE_API_KEY` is configured for deployments that explicitly rely on API-key-compatible Vertex surfaces such as Vertex AI Express Mode.
 :::
 
 **Official docs:** https://geminicli.com/docs/get-started/authentication/
@@ -352,8 +369,12 @@ The request layer signs the HTTP method, canonical path and sorted query, final 
 |--------|---------|----------|
 | WIF Provider | `AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER` | ✅ |
 | Service Account | `AWF_AUTH_GCP_SERVICE_ACCOUNT` | ❌ (direct federation if omitted) |
-| Scope | `AWF_AUTH_GCP_SCOPE` | ❌ (default: `https://www.googleapis.com/auth/cloud-platform`) |
-| Audience | `AWF_AUTH_OIDC_AUDIENCE` | ❌ (default: derived from WIF provider) |
+| Scope | `AWF_AUTH_GCP_SCOPE` | ❌ (default: `https://www.googleapis.com/auth/cloud-platform`; used in step 2 only) |
+| Audience | `AWF_AUTH_OIDC_AUDIENCE` | ❌ (default: `https://iam.googleapis.com/` + WIF provider) |
+| Project | `AWF_AUTH_GCP_PROJECT` | ❌ (needed with location for native Vertex path scoping) |
+| Location | `AWF_AUTH_GCP_LOCATION` | ❌ (needed with project for native Vertex path scoping) |
+
+When both project and location are set, native `v1`/`v1beta1` Vertex model paths are rewritten to project-scoped paths; if either is absent, paths are left unchanged. See [api-proxy-sidecar.md](api-proxy-sidecar.md).
 
 **Token exchange (2-step):**
 1. `POST https://sts.googleapis.com/v1/token` — exchange GitHub JWT for federated token
@@ -379,7 +400,7 @@ The request layer signs the HTTP method, canonical path and sorted query, final 
 
 **Implementation:** `containers/api-proxy/anthropic-oidc-token-provider.js`
 
-**Official references:** [Anthropic WIF documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation) · [Anthropic TypeScript SDK credential constants](https://github.com/anthropics/anthropic-sdk-typescript/blob/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/types.ts)
+**Official references:** [Anthropic WIF documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation) · [Anthropic TypeScript SDK credential constants](https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/types.ts)
 
 ---
 
@@ -401,13 +422,14 @@ GITHUB_SERVER_URL → deriveCopilotApiTarget():
 | Target | Credential Type | Auth Header Format |
 |--------|----------------|-------------------|
 | `api.githubcopilot.com` | GitHub token | `Bearer <token>` |
-| `copilot-api.*.ghe.com` | GitHub token | `token <value>` |
-| `api.enterprise.githubcopilot.com` | GitHub token | `token <value>` |
-| `api.business.githubcopilot.com` | GitHub token | `token <value>` |
+| `copilot-api.*.ghe.com` | GitHub token (classic PAT/OAuth) | `Bearer <value>` |
+| `api.enterprise.githubcopilot.com` | GitHub token (classic PAT/OAuth) | `token <value>` |
+| `api.business.githubcopilot.com` | GitHub token (classic PAT/OAuth) | `token <value>` |
+| Any target | GitHub token (fine-grained PAT, `github_pat_*`) | `Bearer <value>` (always, since [PR #8038](https://github.com/github/gh-aw-firewall/pull/8038)) |
 | Any target | BYOK key | `Bearer <key>` (always) |
 | Any target | OIDC token | `Bearer <token>` (always) |
 
-The `token` prefix is used for GitHub OAuth tokens on the derived GHEC data-residency, enterprise, and business Copilot targets, or when GHES is otherwise detected (see `copilotTargetRequiresGitHubTokenPrefix()` in `copilot-auth.js`). BYOK and OIDC always use the standard prefix. As noted above, this is AWF-implementation-specific behavior driven by observed `400` errors from those targets — not a general GitHub REST API requirement.
+The `token` prefix is used for classic PAT/OAuth GitHub tokens on the enterprise and business Copilot targets, or when GHES is otherwise detected (see `copilotTargetRequiresGitHubTokenPrefix()` in `copilot-auth.js`). GHEC data-residency targets use the standard `Bearer` prefix. BYOK and OIDC always use the standard prefix. As noted above, this is AWF-implementation-specific behavior driven by observed `400` errors from those targets — not a general GitHub REST API requirement. Fine-grained PATs (`github_pat_*`) are detected via `getGitHubTokenAuthPrefix()` and always use `Bearer`, overriding the target-based rule above.
 
 ---
 
@@ -461,10 +483,10 @@ Adds `x-session-id` header automatically in BYOK mode unless already present.
 | Copilot | AWS Bedrock OIDC + SigV4 | — | ✅ | `aws-oidc-token-provider.js`, `server.auth-matrix.test.js` |
 | Copilot | GCP OIDC | — | ✅ | `gcp-oidc-token-provider.js`, `server.auth-matrix.test.js` |
 | Copilot | GHES + BYOK | GHES | ✅ | `server.auth-matrix.test.js` |
-| Gemini | Static key | — | ✅ | `gemini.js`, `google-adapter.js` |
-| Gemini | GCP WIF | — | ❌ not impl | Use the OpenAI adapter with GCP OIDC pointed at a Vertex endpoint instead (see [Google Gemini](#provider-google-gemini)) |
-| Vertex AI | Static key | — | ✅ | `vertex.js`, `google-adapter.js` |
-| Vertex AI | GCP WIF | — | ❌ not impl | No OIDC support in `vertex.js`; see [Provider: Google Vertex AI](#provider-google-vertex-ai) |
+| Gemini | Static key | — | ✅ | `google-adapter.js`, `google-provider-specs.js` |
+| Gemini | GCP WIF | — | ✅ | `google-adapter.js`, `gcp-oidc-token-provider.js`, `server.auth-matrix.test.js` |
+| Vertex AI | Static key | — | ✅ | `google-adapter.js`, `google-provider-specs.js` |
+| Vertex AI | GCP WIF | — | ✅ | `google-adapter.js`, `gcp-oidc-token-provider.js`, `server.auth-matrix.test.js` |
 
 :::note
 "Implementation" column lists source files, not line numbers — line references go stale quickly as the code evolves. Use your editor's search to locate the relevant logic within each file.

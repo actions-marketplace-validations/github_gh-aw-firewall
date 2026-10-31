@@ -2,7 +2,54 @@
  * API proxy upstream routing and target customization options.
  */
 
+export type ModelRoutingGoal = 'cost' | 'cost-speed';
+export type ModelRoutingMode = 'economy' | 'balanced' | 'robust' | 'auto';
+export type ModelRoutingProvider = 'copilot' | 'openai' | 'anthropic';
+
+export interface ModelRoutingConfig {
+  provider?: ModelRoutingProvider;
+  candidateModels?: string[];
+  objective: {
+    goal: ModelRoutingGoal;
+    mode: ModelRoutingMode;
+  };
+  task: {
+    conversationFile: string;
+  };
+}
+
+export interface ModelRoutingBootstrapState {
+  root: string;
+  inputDir: string;
+  outputDir: string;
+  inputFile: string;
+  containerInputFile: string;
+  containerOutputDir: string;
+}
+
 export interface ApiProxyRoutingOptions {
+  /** Explicit experimental opt-in required for task-level model routing. */
+  experimentalModelRouting?: boolean;
+
+  /**
+   * Optional task-level model routing configuration.
+   *
+   * Routing requires both this value and `experimentalModelRouting: true`.
+   * Set via config file paths `apiProxy.routing` and `experimental.modelRouting`.
+   */
+  modelRouting?: ModelRoutingConfig;
+
+  /**
+   * Host-side routing file-channel state created before Compose generation.
+   *
+   * This is intentionally not part of the user-facing config surface. It is set
+   * only by the trusted CLI bootstrap path after validating and staging the
+   * routing conversation.
+   *
+   * @internal
+   */
+  modelRoutingBootstrap?: ModelRoutingBootstrapState;
+
   /**
    * Host path to an additional CA certificate for api-proxy upstream TLS.
    *

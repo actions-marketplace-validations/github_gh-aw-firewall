@@ -1,9 +1,8 @@
-import { generateDockerCompose } from './compose-generator';
-import { getRealUserHome } from './host-identity';
+import { generateDockerCompose, redactDockerComposeSecrets } from './compose-generator';
 import { ACT_PRESET_BASE_IMAGE } from './host-identity';
-import { logger } from './logger';
 import { WrapperConfig } from './types';
 import { baseConfig, mockNetworkConfig } from './test-helpers/docker-test-fixtures.test-utils';
+import * as crypto from 'crypto';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -14,15 +13,37 @@ import * as path from 'path';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.mock('execa', () => require('./test-helpers/mock-execa.test-utils').execaMockFactory());
 
-// Mock host-gateway resolution (runs execa.sync against Docker, which we don't want in unit tests)
-const mockResolveDockerHostGateway = jest.fn();
-jest.mock('./services/host-gateway', () => ({
-  resolveDockerHostGateway: (...args: any[]) => mockResolveDockerHostGateway(...args),
-}));
-
 let mockConfig: WrapperConfig;
 
 describe('generateDockerCompose', () => {
+  function routedConfig(overrides: Partial<WrapperConfig> = {}): WrapperConfig {
+    const digest = 'a'.repeat(64);
+    return {
+      ...mockConfig,
+      enableApiProxy: true,
+      experimentalModelRouting: true,
+      images: {
+        squid: `ghcr.io/example/squid:test@sha256:${digest}`,
+        agent: `ghcr.io/example/agent:test@sha256:${digest}`,
+        apiProxy: `ghcr.io/example/api-proxy:test@sha256:${digest}`,
+        router: `ghcr.io/example/router:test@sha256:${digest}`,
+      },
+      modelRouting: {
+        objective: { goal: 'cost', mode: 'balanced' },
+        task: { conversationFile: '/run/awf-routing/input/conversation.json' },
+      },
+      modelRoutingBootstrap: {
+        root: `${mockConfig.workDir}-routing`,
+        inputDir: `${mockConfig.workDir}-routing/input`,
+        outputDir: `${mockConfig.workDir}-routing/output`,
+        inputFile: `${mockConfig.workDir}-routing/input/conversation.json`,
+        containerInputFile: '/run/awf-routing/input/conversation.json',
+        containerOutputDir: '/run/awf-routing/output',
+      },
+      ...overrides,
+    };
+  }
+
   beforeEach(() => {
     mockConfig = { ...baseConfig, workDir: fs.mkdtempSync(path.join(os.tmpdir(), 'awf-test-')) };
   });
@@ -38,6 +59,323 @@ describe('generateDockerCompose', () => {
       expect(result.services.agent.image).toBe('ghcr.io/github/gh-aw-firewall/agent:latest');
       expect(result.services['squid-proxy'].build).toBeUndefined();
       expect(result.services.agent.build).toBeUndefined();
+    });
+
+    it('adds routed proxy wiring without exposing routing state to the agent', () => {
+      const result = generateDockerCompose(routedConfig(), {
+        ...mockNetworkConfig,
+        proxyIp: '172.30.0.30',
+      });
+      const apiProxyService = result.services['api-proxy'] as any;
+      const agentEnvironment = result.services.agent.environment as Record<string, string>;
+
+      expect(result.services.router).toBeDefined();
+      expect(result.services.router.environment).toBeUndefined();
+      expect(result.services.router.ports).toBeUndefined();
+      expect(result.services.router.volumes).toBeUndefined();
+      expect(result.services.router.networks).toEqual({
+        'awf-routing': { aliases: ['gh-aw-router'] },
+      });
+      expect(result.services.router.healthcheck?.test).toEqual([
+        'CMD',
+        '/usr/local/bin/gh-aw-router',
+        'healthcheck',
+      ]);
+      expect(apiProxyService.networks['awf-routing']).toEqual({});
+      expect(apiProxyService.depends_on.router).toEqual({
+        condition: 'service_healthy',
+      });
+      expect(apiProxyService.depends_on['squid-proxy']).toEqual({
+        condition: 'service_healthy',
+      });
+      expect(apiProxyService.volumes).toEqual(
+        expect.arrayContaining([
+          `${mockConfig.workDir}-routing/input:/run/awf-routing/input:ro`,
+          `${mockConfig.workDir}-routing/output:/run/awf-routing/output:rw`,
+        ]),
+      );
+      expect(agentEnvironment.AWF_ROUTING_CONFIG).toBeUndefined();
+      expect(result.networks['awf-routing']).toMatchObject({ internal: true });
+    });
+
+    it('builds the router from the checkout with the contract digest under --build-local', () => {
+      const routingConfig: WrapperConfig = {
+        ...mockConfig,
+        buildLocal: true,
+        enableApiProxy: true,
+        experimentalModelRouting: true,
+        modelRouting: {
+          objective: { goal: 'cost', mode: 'balanced' },
+          task: { conversationFile: '/run/awf-routing/input/conversation.json' },
+        },
+        modelRoutingBootstrap: {
+          root: `${mockConfig.workDir}-routing`,
+          inputDir: `${mockConfig.workDir}-routing/input`,
+          outputDir: `${mockConfig.workDir}-routing/output`,
+          inputFile: `${mockConfig.workDir}-routing/input/conversation.json`,
+          containerInputFile: '/run/awf-routing/input/conversation.json',
+          containerOutputDir: '/run/awf-routing/output',
+        },
+      };
+      const routerDir = path.join(__dirname, '..', 'containers', 'router');
+      const contractDigest = crypto.createHash('sha256')
+        .update(fs.readFileSync(path.join(routerDir, 'openapi.yaml')))
+        .digest('hex');
+
+      const router = generateDockerCompose(routingConfig, {
+        ...mockNetworkConfig,
+        proxyIp: '172.30.0.30',
+      }).services.router;
+
+      expect(router.image).toBeUndefined();
+      expect(router.build).toEqual({
+        context: routerDir,
+        dockerfile: 'Dockerfile',
+        args: { OPENAPI_SHA256: contractDigest },
+      });
+    });
+
+    it('fails routed compose generation when host staging has not happened', () => {
+      const digest = 'a'.repeat(64);
+      const routingConfig: WrapperConfig = {
+        ...mockConfig,
+        enableApiProxy: true,
+        experimentalModelRouting: true,
+        images: {
+          squid: `ghcr.io/example/squid:test@sha256:${digest}`,
+          agent: `ghcr.io/example/agent:test@sha256:${digest}`,
+          apiProxy: `ghcr.io/example/api-proxy:test@sha256:${digest}`,
+          router: `ghcr.io/example/router:test@sha256:${digest}`,
+        },
+        modelRouting: {
+          objective: { goal: 'cost', mode: 'balanced' },
+          task: { conversationFile: '/host/conversation.json' },
+        },
+      };
+
+      expect(() => generateDockerCompose(routingConfig, {
+        ...mockNetworkConfig,
+        proxyIp: '172.30.0.30',
+      })).toThrow('Model routing was configured but the routing conversation was not staged');
+    });
+
+    it('omits routing infrastructure when opt-in or routing request is absent', () => {
+      const routingConfig: WrapperConfig = {
+        ...mockConfig,
+        enableApiProxy: true,
+        modelRouting: {
+          objective: { goal: 'cost', mode: 'balanced' },
+          task: { conversationFile: '/host/conversation.json' },
+        },
+        modelRoutingBootstrap: {
+          root: '/tmp/awf-routing',
+          inputDir: '/tmp/awf-routing/input',
+          outputDir: '/tmp/awf-routing/output',
+          inputFile: '/tmp/awf-routing/input/conversation.json',
+          containerInputFile: '/run/awf-routing/input/conversation.json',
+          containerOutputDir: '/run/awf-routing/output',
+        },
+      };
+      for (const optIn of [undefined, false, true]) {
+        routingConfig.experimentalModelRouting = optIn;
+        if (optIn === true) delete routingConfig.modelRouting;
+        const compose = generateDockerCompose(routingConfig, { ...mockNetworkConfig, proxyIp: '172.30.0.30' });
+        const proxy = compose.services['api-proxy'];
+        expect(compose.services.router).toBeUndefined();
+        expect(compose.networks['awf-routing']).toBeUndefined();
+        expect(proxy.networks).not.toHaveProperty('awf-routing');
+        expect(proxy.volumes?.some(volume => volume.includes('/run/awf-routing/'))).toBe(false);
+        expect(proxy.environment?.AWF_ROUTING_CONFIG).toBeUndefined();
+      }
+    });
+
+    describe('router OpenTelemetry export settings', () => {
+      const savedEnv = { ...process.env };
+
+      function generateRouted(overrides: Partial<WrapperConfig> = {}) {
+        return generateDockerCompose(routedConfig(overrides), { ...mockNetworkConfig, proxyIp: '172.30.0.30' });
+      }
+
+      // A gh-aw-style run: the shared OTLP settings point at an external collector for the api-proxy.
+      function setSharedHostTelemetry(): void {
+        process.env.OTEL_EXPORTER_OTLP_ENDPOINT = 'https://external-collector.example';
+        process.env.OTEL_EXPORTER_OTLP_HEADERS = 'authorization=Bearer%20shared-canary';
+        process.env.OTEL_SERVICE_NAME = 'shared-service';
+        process.env.GH_AW_OTLP_ENDPOINTS = '[{"url":"https://external-collector.example"}]';
+        process.env.GH_AW_OTLP_WORKLOAD_IDENTITY = 'true';
+        process.env.ACTIONS_ID_TOKEN_REQUEST_URL = 'https://token.example/canary';
+        process.env.ACTIONS_ID_TOKEN_REQUEST_TOKEN = 'id-token-canary';
+        process.env.GITHUB_AW_OTEL_TRACE_ID = '0af7651916cd43dd8448eb211c80319c';
+        process.env.GITHUB_AW_OTEL_PARENT_SPAN_ID = 'b7ad6b7169203331';
+        process.env.GITHUB_TOKEN = 'ghp_canary';
+        process.env.COPILOT_GITHUB_TOKEN = 'copilot-canary';
+        process.env.HTTPS_PROXY = 'http://proxy.example:3128';
+      }
+
+      afterEach(() => {
+        for (const key of Object.keys(process.env)) {
+          if (!(key in savedEnv)) delete process.env[key];
+        }
+        Object.assign(process.env, savedEnv);
+      });
+
+      it('passes AWF_ROUTER_OTEL_* settings to the router as OTEL_* without other changes', () => {
+        const baseline = generateRouted().services.router;
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_ENDPOINT = 'http://otel-collector:4318';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = 'http://metrics-collector:4318/v1/metrics';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_TRACES_HEADERS = 'authorization=Bearer%20router-canary';
+        process.env.AWF_ROUTER_OTEL_TRACES_SAMPLER = 'parentbased_traceidratio';
+        process.env.AWF_ROUTER_OTEL_TRACES_SAMPLER_ARG = '0.5';
+        process.env.AWF_ROUTER_OTEL_RESOURCE_ATTRIBUTES = 'service.namespace=awf,deployment.environment.name=ci';
+        process.env.AWF_ROUTER_OTEL_METRICS_EXPORTER = 'none';
+        process.env.AWF_ROUTER_OTEL_SDK_DISABLED = 'false';
+        process.env.AWF_ROUTER_OTEL_SERVICE_NAME = '';
+
+        const router = generateRouted().services.router;
+
+        expect(router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_ENDPOINT: 'http://otel-collector:4318',
+          OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: 'http://metrics-collector:4318/v1/metrics',
+          OTEL_EXPORTER_OTLP_TRACES_HEADERS: 'authorization=Bearer%20router-canary',
+          OTEL_TRACES_SAMPLER: 'parentbased_traceidratio',
+          OTEL_TRACES_SAMPLER_ARG: '0.5',
+          OTEL_RESOURCE_ATTRIBUTES: 'service.namespace=awf,deployment.environment.name=ci',
+          OTEL_METRICS_EXPORTER: 'none',
+          OTEL_SDK_DISABLED: 'false',
+        });
+        expect({ ...router, environment: undefined }).toEqual(baseline);
+        expect(router.networks).toEqual({ 'awf-routing': { aliases: ['gh-aw-router'] } });
+        expect(router.ports).toBeUndefined();
+        expect(router.volumes).toBeUndefined();
+      });
+
+      it('never forwards shared host telemetry, credentials or proxy settings to the router', () => {
+        const baseline = generateRouted().services.router;
+        setSharedHostTelemetry();
+
+        const compose = generateRouted();
+
+        expect(compose.services.router).toEqual(baseline);
+        expect(compose.services.router.environment).toBeUndefined();
+        // The shared settings still configure the api-proxy.
+        expect(compose.services['api-proxy'].environment?.OTEL_EXPORTER_OTLP_ENDPOINT)
+          .toBe('https://external-collector.example');
+      });
+
+      it('adds only the router settings when shared host telemetry is also configured', () => {
+        setSharedHostTelemetry();
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_ENDPOINT = 'http://otel-collector:4318';
+
+        const environment = generateRouted().services.router.environment as Record<string, string>;
+
+        expect(environment).toEqual({ OTEL_EXPORTER_OTLP_ENDPOINT: 'http://otel-collector:4318' });
+        for (const value of Object.values(environment)) {
+          expect(value).not.toMatch(/canary|external-collector|proxy\.example/);
+        }
+      });
+
+      it('keeps the whole AWF_ROUTER_OTEL_* namespace out of the agent, whatever supplies it', () => {
+        // Supported and unsupported names, from the host with --env-all, an --env-file and --env.
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_HEADERS = 'authorization=Bearer%20host-canary';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_LOGS_HEADERS = 'authorization=logs-canary';
+        const envFile = path.join(mockConfig.workDir, 'agent.env');
+        fs.writeFileSync(envFile, 'AWF_ROUTER_OTEL_EXPORTER_OTLP_HEADER=file-canary\nKEEP_FROM_FILE=kept\n');
+
+        const compose = generateRouted({
+          envAll: true,
+          envFile,
+          additionalEnv: {
+            AWF_ROUTER_OTEL_EXPORTER_OTLP_TRACES_HEADERS: 'x-traces=flag-canary',
+            AWF_ROUTER_OTEL_ANYTHING: 'flag-canary',
+            KEEP_FROM_FLAG: 'kept',
+          },
+        });
+        const agentEnvironment = compose.services.agent.environment as Record<string, string>;
+
+        expect(Object.keys(agentEnvironment).filter(key => key.startsWith('AWF_ROUTER_OTEL_'))).toEqual([]);
+        expect(Object.values(agentEnvironment).join('\n')).not.toMatch(/canary/);
+        expect(agentEnvironment).toMatchObject({ KEEP_FROM_FILE: 'kept', KEEP_FROM_FLAG: 'kept' });
+        // Only AWF's own environment configures the router.
+        expect(compose.services.router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_HEADERS: 'authorization=Bearer%20host-canary',
+        });
+      });
+
+      it('escapes $ so that Compose passes router settings literally', () => {
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_HEADERS = 'x-api-key=abc$part${HOME}$$';
+        process.env.AWF_ROUTER_OTEL_SERVICE_NAME = 'router$1';
+
+        expect(generateRouted().services.router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_HEADERS: 'x-api-key=abc$$part$${HOME}$$$$',
+          OTEL_SERVICE_NAME: 'router$$1',
+        });
+      });
+
+      it('puts router settings in the router service only', () => {
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_ENDPOINT = 'http://endpoint-canary:4318';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_HEADERS = 'authorization=Bearer%20header-canary';
+        process.env.AWF_ROUTER_OTEL_SERVICE_NAME = 'name-canary';
+
+        const { router, ...otherServices } = generateRouted({ envAll: true }).services;
+
+        expect(router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_ENDPOINT: 'http://endpoint-canary:4318',
+          OTEL_EXPORTER_OTLP_HEADERS: 'authorization=Bearer%20header-canary',
+          OTEL_SERVICE_NAME: 'name-canary',
+        });
+        expect(JSON.stringify(otherServices)).not.toMatch(/canary/);
+      });
+
+      it('redacts an escaped endpoint and header in the audit snapshot', () => {
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_ENDPOINT = ' http://user:pa$$word-canary@otel-collector:4318';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_HEADERS = 'authorization=Bearer%20$token-canary';
+
+        const compose = generateRouted();
+        expect(compose.services.router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_ENDPOINT: ' http://user:pa$$$$word-canary@otel-collector:4318',
+          OTEL_EXPORTER_OTLP_HEADERS: 'authorization=Bearer%20$$token-canary',
+        });
+
+        expect(redactDockerComposeSecrets(compose).services.router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_ENDPOINT: ' http://[REDACTED]@otel-collector:4318',
+          OTEL_EXPORTER_OTLP_HEADERS: '[REDACTED]',
+        });
+      });
+
+      it('redacts the user info of endpoints with leading whitespace in the audit snapshot', () => {
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_TRACES_ENDPOINT = ' \u00a0http://user:pw-canary@traces:4318/v1/traces';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_METRICS_ENDPOINT = '\u0085\thttps://id-canary@metrics:4318/v1/metrics';
+
+        const redacted = redactDockerComposeSecrets(generateRouted());
+
+        expect(redacted.services.router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: ' \u00a0http://[REDACTED]@traces:4318/v1/traces',
+          OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: '\u0085\thttps://[REDACTED]@metrics:4318/v1/metrics',
+        });
+      });
+
+      it('redacts router collector headers and endpoint user info in the audit snapshot', () => {
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_ENDPOINT = 'http://user:pw-canary@otel-collector:4318';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_HEADERS = 'authorization=Bearer%20router-canary';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_TRACES_HEADERS = 'x-traces=traces-canary';
+        process.env.AWF_ROUTER_OTEL_EXPORTER_OTLP_METRICS_HEADERS = 'x-metrics=metrics-canary';
+        process.env.AWF_ROUTER_OTEL_SERVICE_NAME = 'gh-aw-router-ci';
+
+        const compose = generateRouted();
+        const redacted = redactDockerComposeSecrets(compose);
+
+        expect(redacted.services.router.environment).toEqual({
+          OTEL_EXPORTER_OTLP_ENDPOINT: 'http://[REDACTED]@otel-collector:4318',
+          OTEL_EXPORTER_OTLP_HEADERS: '[REDACTED]',
+          OTEL_EXPORTER_OTLP_TRACES_HEADERS: '[REDACTED]',
+          OTEL_EXPORTER_OTLP_METRICS_HEADERS: '[REDACTED]',
+          OTEL_SERVICE_NAME: 'gh-aw-router-ci',
+        });
+        expect(JSON.stringify(redacted)).not.toMatch(/canary/);
+        // The compose file that runs the router keeps the real values.
+        expect(compose.services.router.environment?.OTEL_EXPORTER_OTLP_HEADERS)
+          .toBe('authorization=Bearer%20router-canary');
+      });
     });
 
     it('should use local build when buildLocal is true', () => {
@@ -266,567 +604,4 @@ describe('generateDockerCompose', () => {
       expect(agentNetworks['awf-net'].ipv4_address).toBe('172.30.0.20');
     });
 
-    describe('network-isolation (topology) mode', () => {
-      it('should emit an internal awf-net with a subnet and an external awf-ext bridge', () => {
-        const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
-
-        expect(result.networks['awf-net'].internal).toBe(true);
-        expect(result.networks['awf-net'].external).toBeUndefined();
-        expect(result.networks['awf-net'].name).toBe('awf-net');
-        expect(result.networks['awf-net'].ipam?.config?.[0]?.subnet).toBe(mockNetworkConfig.subnet);
-        expect(result.networks['awf-ext'].driver).toBe('bridge');
-      });
-
-      it('should dual-home squid on awf-net and awf-ext', () => {
-        const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
-
-        const squidNetworks = result.services['squid-proxy'].networks as { [key: string]: { ipv4_address?: string } };
-        expect(squidNetworks['awf-net'].ipv4_address).toBe('172.30.0.10');
-        expect(squidNetworks['awf-ext']).toBeDefined();
-      });
-
-      it('keeps cli-proxy on awf-net only when it targets an attached DIFC proxy', () => {
-        const config = {
-          ...mockConfig,
-          networkIsolation: true,
-          difcProxyHost: 'awmg-cli-proxy:18443',
-        };
-        const networkWithCliProxy = {
-          ...mockNetworkConfig,
-          cliProxyIp: '172.30.0.50',
-        };
-        const result = generateDockerCompose(config, networkWithCliProxy);
-
-        const cliProxyNetworks = result.services['cli-proxy'].networks as { [key: string]: { ipv4_address?: string } };
-        expect(cliProxyNetworks['awf-net'].ipv4_address).toBe('172.30.0.50');
-        expect(cliProxyNetworks['awf-ext']).toBeUndefined();
-      });
-
-      it('keeps cli-proxy on awf-net only when the DIFC proxy is a sibling addressed by its awf-net IP', () => {
-        const config = {
-          ...mockConfig,
-          networkIsolation: true,
-          difcProxyHost: '172.30.0.60:18443',
-        };
-        const networkWithCliProxy = {
-          ...mockNetworkConfig,
-          cliProxyIp: '172.30.0.50',
-        };
-        const result = generateDockerCompose(config, networkWithCliProxy);
-
-        const cliProxyNetworks = result.services['cli-proxy'].networks as { [key: string]: { ipv4_address?: string } };
-        expect(cliProxyNetworks['awf-net'].ipv4_address).toBe('172.30.0.50');
-        expect(cliProxyNetworks['awf-ext']).toBeUndefined();
-      });
-
-      it('dual-homes only a credential-free relay when cli-proxy targets an external DIFC proxy', () => {
-        const config = {
-          ...mockConfig,
-          networkIsolation: true,
-          difcProxyHost: 'host.docker.internal:18443',
-        };
-        const networkWithCliProxy = {
-          ...mockNetworkConfig,
-          cliProxyIp: '172.30.0.50',
-        };
-        const result = generateDockerCompose(config, networkWithCliProxy);
-
-        const cliProxyNetworks = result.services['cli-proxy'].networks as { [key: string]: { ipv4_address?: string } };
-        expect(cliProxyNetworks['awf-net'].ipv4_address).toBe('172.30.0.50');
-        expect(cliProxyNetworks['awf-ext']).toBeUndefined();
-
-        const relay = result.services['cli-proxy-egress'];
-        const relayNetworks = relay.networks as Record<string, unknown>;
-        const relayEnvironment = relay.environment as Record<string, string>;
-        expect(relayNetworks['awf-net']).toBeDefined();
-        expect(relayNetworks['awf-ext']).toBeDefined();
-        expect(relayEnvironment.GH_TOKEN).toBeUndefined();
-        expect(relayEnvironment.AWF_DIFC_PROXY_HOST).toBe('host.docker.internal');
-        expect(relayEnvironment.AWF_DIFC_PROXY_PORT).toBe('18443');
-      });
-
-      it('keeps cli-proxy off awf-ext outside network-isolation mode', () => {
-        const config = {
-          ...mockConfig,
-          networkIsolation: false,
-          difcProxyHost: 'host.docker.internal:18443',
-        };
-        const networkWithCliProxy = {
-          ...mockNetworkConfig,
-          cliProxyIp: '172.30.0.50',
-        };
-        const result = generateDockerCompose(config, networkWithCliProxy);
-
-        const cliProxyNetworks = result.services['cli-proxy'].networks as { [key: string]: { ipv4_address?: string } };
-        expect(cliProxyNetworks['awf-ext']).toBeUndefined();
-        expect(result.services['cli-proxy-egress']).toBeUndefined();
-      });
-
-      it('should keep the agent on awf-net only (no external network)', () => {
-        const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
-
-        const agentNetworks = result.services.agent.networks as { [key: string]: unknown };
-        expect(agentNetworks['awf-net']).toBeDefined();
-        expect(agentNetworks['awf-ext']).toBeUndefined();
-      });
-
-      it('should not create the iptables-init service', () => {
-        const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
-
-        expect(result.services['iptables-init']).toBeUndefined();
-      });
-
-      it('should set AWF_NETWORK_ISOLATION=1 in the agent environment', () => {
-        const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
-
-        expect(result.services.agent.environment?.AWF_NETWORK_ISOLATION).toBe('1');
-      });
-
-      it('should point agent DNS at the Docker embedded resolver', () => {
-        const result = generateDockerCompose({ ...mockConfig, networkIsolation: true }, mockNetworkConfig);
-
-        expect(result.services.agent.dns).toEqual(['127.0.0.11']);
-      });
-
-      it('keeps host gateway off the agent proxy bypass list in topology mode', () => {
-        const result = generateDockerCompose(
-          { ...mockConfig, networkIsolation: true, enableHostAccess: true },
-          mockNetworkConfig,
-        );
-
-        const noProxy = String(result.services.agent.environment?.NO_PROXY ?? '').split(',');
-        expect(noProxy).not.toContain('host.docker.internal');
-        expect(noProxy).not.toContain('172.30.0.1');
-        expect(result.services.agent.extra_hosts?.['host.docker.internal']).toBeUndefined();
-      });
-
-      it('should still build the iptables-init service in default (iptables) mode', () => {
-        const result = generateDockerCompose(mockConfig, mockNetworkConfig);
-
-        expect(result.services['iptables-init']).toBeDefined();
-        expect(result.networks['awf-net'].external).toBe(true);
-        expect(result.networks['awf-ext']).toBeUndefined();
-        expect(result.services.agent.environment?.AWF_NETWORK_ISOLATION).toBeUndefined();
-      });
-    });
-
-    describe('gVisor runtime (non-iptables compose agent)', () => {
-      it('omits iptables-init but keeps the compose agent when networkIsolation is false', () => {
-        const config = {
-          ...mockConfig,
-          containerRuntime: 'gvisor',
-          networkIsolation: false,
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services.agent).toBeDefined();
-        expect(result.services['iptables-init']).toBeUndefined();
-      });
-
-      it('sets AWF_SKIP_IPTABLES_INIT (not AWF_NETWORK_ISOLATION) in the agent environment', () => {
-        const config = {
-          ...mockConfig,
-          containerRuntime: 'gvisor',
-          networkIsolation: false,
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services.agent.environment?.AWF_SKIP_IPTABLES_INIT).toBe('1');
-        expect(result.services.agent.environment?.AWF_NETWORK_ISOLATION).toBeUndefined();
-      });
-
-      it('treats the raw runsc runtime name the same as gvisor', () => {
-        const config = {
-          ...mockConfig,
-          containerRuntime: 'runsc',
-          networkIsolation: false,
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services.agent).toBeDefined();
-        expect(result.services['iptables-init']).toBeUndefined();
-        expect(result.services.agent.environment?.AWF_SKIP_IPTABLES_INIT).toBe('1');
-      });
-    });
-
-    describe('microVM runtime (sbx)', () => {
-      it('omits compose agent and agent-only helper services', () => {
-        const config = {
-          ...mockConfig,
-          containerRuntime: 'sbx',
-          runnerTopology: 'arc-dind' as const,
-          networkIsolation: false,
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services.agent).toBeUndefined();
-        expect(result.services['iptables-init']).toBeUndefined();
-        expect(result.services['sysroot-stage']).toBeUndefined();
-        expect(result.volumes?.sysroot).toBeUndefined();
-      });
-
-      it('publishes api-proxy ports when api-proxy is enabled', () => {
-        const config = {
-          ...mockConfig,
-          containerRuntime: 'sbx',
-          runnerTopology: 'arc-dind' as const,
-          networkIsolation: false,
-          enableApiProxy: true,
-        };
-        const networkWithProxy = {
-          ...mockNetworkConfig,
-          proxyIp: '172.30.0.30',
-        };
-        const result = generateDockerCompose(config, networkWithProxy);
-
-        expect(result.services['api-proxy']).toBeDefined();
-        const ports = result.services['api-proxy'].ports;
-        expect(ports).toContain('10000:10000');
-        expect(ports).toContain('10001:10001');
-        expect(ports).toContain('10002:10002');
-        expect(ports).toContain('10003:10003');
-        expect(ports).toContain('10004:10004');
-      });
-
-      it('attaches api-proxy to awf-ext in network-isolation mode for port publishing', () => {
-        const config = {
-          ...mockConfig,
-          containerRuntime: 'sbx',
-          runnerTopology: 'arc-dind' as const,
-          networkIsolation: true,
-          enableApiProxy: true,
-        };
-        const networkWithProxy = {
-          ...mockNetworkConfig,
-          proxyIp: '172.30.0.30',
-        };
-        const result = generateDockerCompose(config, networkWithProxy);
-
-        expect(result.services['api-proxy']).toBeDefined();
-        const networks = result.services['api-proxy'].networks as Record<string, any>;
-        expect(networks['awf-ext']).toBeDefined();
-        expect(result.services['api-proxy'].ports).toContain('10002:10002');
-      });
-    });
-
-    describe('host-gateway IP passthrough (AWF_HOST_GATEWAY_IP)', () => {
-      afterEach(() => {
-        mockResolveDockerHostGateway.mockReset();
-      });
-
-      it('should pass AWF_HOST_GATEWAY_IP to iptables-init when enableHostAccess is true', () => {
-        mockResolveDockerHostGateway.mockReturnValue('192.168.1.100');
-        const config = { ...mockConfig, enableHostAccess: true };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-        const initEnv = result.services['iptables-init']?.environment as Record<string, string>;
-
-        expect(mockResolveDockerHostGateway).toHaveBeenCalled();
-        expect(initEnv.AWF_HOST_GATEWAY_IP).toBe('192.168.1.100');
-      });
-
-      it('should set AWF_HOST_GATEWAY_IP to empty when enableHostAccess is false', () => {
-        const result = generateDockerCompose(mockConfig, mockNetworkConfig);
-        const initEnv = result.services['iptables-init']?.environment as Record<string, string>;
-
-        expect(mockResolveDockerHostGateway).not.toHaveBeenCalled();
-        expect(initEnv.AWF_HOST_GATEWAY_IP).toBe('');
-      });
-
-      it('should set AWF_HOST_GATEWAY_IP to empty when detection fails', () => {
-        mockResolveDockerHostGateway.mockReturnValue(undefined);
-        const config = { ...mockConfig, enableHostAccess: true };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-        const initEnv = result.services['iptables-init']?.environment as Record<string, string>;
-
-        expect(initEnv.AWF_HOST_GATEWAY_IP).toBe('');
-      });
-    });
-
-    describe('sysroot-stage service (runner.topology = arc-dind)', () => {
-      it('adds sysroot-stage service when runnerTopology is arc-dind', () => {
-        const config = { ...mockConfig, runnerTopology: 'arc-dind' as const };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services['sysroot-stage']).toBeDefined();
-        expect(result.services['sysroot-stage'].container_name).toBe('awf-sysroot-stage');
-        expect(result.services['sysroot-stage'].image).toBe(
-          'ghcr.io/github/gh-aw-firewall/build-tools:latest',
-        );
-      });
-
-      it('does not add sysroot-stage when runnerTopology is not set', () => {
-        const result = generateDockerCompose(mockConfig, mockNetworkConfig);
-        expect(result.services['sysroot-stage']).toBeUndefined();
-      });
-
-      it('does not add sysroot-stage when runnerTopology is standard', () => {
-        const config = { ...mockConfig, runnerTopology: 'standard' as const };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-        expect(result.services['sysroot-stage']).toBeUndefined();
-      });
-
-      it('agent depends_on sysroot-stage with service_completed_successfully', () => {
-        const config = { ...mockConfig, runnerTopology: 'arc-dind' as const };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services.agent.depends_on).toMatchObject({
-          'sysroot-stage': { condition: 'service_completed_successfully' },
-        });
-      });
-
-      it('declares sysroot named volume', () => {
-        const config = { ...mockConfig, runnerTopology: 'arc-dind' as const };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.volumes).toBeDefined();
-        expect(result.volumes!.sysroot).toEqual({});
-      });
-
-      it('adds sysroot:/host:rw to agent volumes', () => {
-        const config = { ...mockConfig, runnerTopology: 'arc-dind' as const };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services.agent.volumes).toContain('sysroot:/host:rw');
-      });
-
-      it('does not retain base-system bind mounts that shadow sysroot', () => {
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          dockerHostPathPrefix: '/daemon-root',
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-        const volumes = result.services.agent.volumes as string[];
-
-        expect(volumes).not.toContain('/usr:/host/usr:ro');
-        expect(volumes).not.toContain('/bin:/host/bin:ro');
-        expect(volumes).not.toContain('/lib:/host/lib:ro');
-        expect(volumes).not.toContain('/lib64:/host/lib64:ro');
-        expect(volumes).not.toContain('/opt:/host/opt:ro');
-        expect(volumes).toContain('/sys:/host/sys:ro');
-        expect(volumes).toContain('/dev:/host/dev:ro');
-        expect(volumes.some(v => v.includes(':/host/usr:ro'))).toBe(false);
-        expect(volumes.some(v => v.includes(':/host/bin:ro'))).toBe(false);
-        expect(volumes.some(v => v.includes(':/host/sbin:ro'))).toBe(false);
-        expect(volumes.some(v => v.includes(':/host/lib:ro'))).toBe(false);
-        expect(volumes.some(v => v.includes(':/host/lib64:ro'))).toBe(false);
-        expect(volumes.some(v => v.includes(':/host/opt:ro'))).toBe(false);
-        expect(volumes.filter(v => v.endsWith(':/host/sys:ro'))).toEqual(['/sys:/host/sys:ro']);
-        expect(volumes.filter(v => v.endsWith(':/host/dev:ro'))).toEqual(['/dev:/host/dev:ro']);
-      });
-
-      it('does not declare sysroot volume when topology is standard', () => {
-        const result = generateDockerCompose(mockConfig, mockNetworkConfig);
-        expect(result.volumes).toBeUndefined();
-      });
-
-      it('uses custom sysrootImage when configured', () => {
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          sysrootImage: 'ghcr.io/my-org/custom:v1',
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services['sysroot-stage'].image).toBe('ghcr.io/my-org/custom:v1');
-      });
-
-      it('uses imageTag in default sysroot image', () => {
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          imageTag: '0.28.0',
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.services['sysroot-stage'].image).toBe(
-          'ghcr.io/github/gh-aw-firewall/build-tools:0.28.0',
-        );
-      });
-
-      it('warns when runnerToolCachePath is under /opt', () => {
-        const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          runnerToolCachePath: '/opt/hostedtoolcache',
-        };
-
-        generateDockerCompose(config, mockNetworkConfig);
-
-        expect(warnSpy).toHaveBeenCalledWith(
-          expect.stringContaining('under /opt (/opt/hostedtoolcache)')
-        );
-        warnSpy.mockRestore();
-      });
-
-      it('does not warn when runnerToolCachePath is on a shared path', () => {
-        const warnSpy = jest.spyOn(logger, 'warn').mockImplementation();
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          runnerToolCachePath: '/var/lib/awf/tool-cache',
-        };
-
-        generateDockerCompose(config, mockNetworkConfig);
-
-        expect(warnSpy).not.toHaveBeenCalledWith(expect.stringContaining('under /opt'));
-        warnSpy.mockRestore();
-      });
-
-      it('declares sysroot volume in network-isolation mode', () => {
-        const config = {
-          ...mockConfig,
-          networkIsolation: true,
-          runnerTopology: 'arc-dind' as const,
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-
-        expect(result.volumes).toEqual({ sysroot: {} });
-      });
-
-      it('filters out workDir and home dot-directory bind mounts on split-fs', () => {
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          workDir: '/tmp/awf-12345',
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-        const volumes = result.services.agent.volumes as string[];
-        const workspaceDir = process.env.GITHUB_WORKSPACE || process.cwd();
-
-        // workDir-based mounts should be dropped
-        expect(volumes.some(v => v.startsWith('/tmp/awf-12345'))).toBe(false);
-
-        // Home dot-directory mounts should be dropped, but workspace mounts under home should remain.
-        const effectiveHomeForFilter = getRealUserHome();
-        const homeTargets = volumes
-          .filter(v => {
-            const target = v.split(':')[1];
-            return target.startsWith(`/host${effectiveHomeForFilter}`) && !v.startsWith('/dev/null');
-          })
-          .map(v => v.split(':')[1]);
-
-        expect(homeTargets).toContain(`/host${workspaceDir}`);
-        expect(homeTargets.some(target => target.startsWith(`/host${effectiveHomeForFilter}/.`))).toBe(false);
-
-        // An explicitly supplied home-root mount (including trailing slash source)
-        // survives the filter: the caller vouches for its daemon visibility, and a
-        // writable /host$HOME is required by the credential overlays and entrypoint.
-        const effectiveHome = getRealUserHome();
-        const configWithHomeRootMount = {
-          ...config,
-          volumeMounts: [`${effectiveHome}/:/host${effectiveHome}:rw`],
-        };
-        const resultWithHomeRootMount = generateDockerCompose(configWithHomeRootMount, mockNetworkConfig);
-        const homeRootMounts = (resultWithHomeRootMount.services.agent.volumes as string[]).filter(v => {
-          const target = v.split(':')[1];
-          return target === `/host${effectiveHome}` || target === `/host${effectiveHome}/`;
-        });
-        expect(homeRootMounts).toEqual([`${effectiveHome}/:/host${effectiveHome}:rw`]);
-
-        // The chroot-home volume sourced from workDir is still dropped.
-        expect(
-          (resultWithHomeRootMount.services.agent.volumes as string[]).some(v =>
-            v.startsWith('/tmp/awf-12345-chroot-home'),
-          ),
-        ).toBe(false);
-
-        // Credential overlays under /host$HOME are kept when a writable home survives.
-        expect(
-          (resultWithHomeRootMount.services.agent.volumes as string[]).some(
-            v => v.startsWith('/dev/null:') && v.split(':')[1].startsWith(`/host${effectiveHome}/`),
-          ),
-        ).toBe(true);
-
-        // Without such a mount, those overlays are skipped (no writable parent exists).
-        expect(
-          volumes.some(
-            v => v.startsWith('/dev/null:') && v.split(':')[1].startsWith(`/host${effectiveHome}/`),
-          ),
-        ).toBe(false);
-
-        // Should still have /tmp:/tmp, /sys, /dev, sysroot volume
-        expect(volumes).toContain('/tmp:/tmp:rw');
-        expect(volumes).toContain('/sys:/host/sys:ro');
-        expect(volumes).toContain('/dev:/host/dev:ro');
-        expect(volumes).toContain('sysroot:/host:rw');
-      });
-
-      it('drops the workDir-adjacent chroot-home bind mount on split-fs', () => {
-        const config = {
-          ...mockConfig,
-          runnerTopology: 'arc-dind' as const,
-          workDir: '/tmp/awf-12345',
-        };
-        const result = generateDockerCompose(config, mockNetworkConfig);
-        const volumes = result.services.agent.volumes as string[];
-
-        // The empty-home mount is sourced from `${workDir}-chroot-home`, a sibling
-        // of workDir under the runner's /tmp that the DinD daemon cannot see.
-        expect(volumes.some(v => v.split(':')[0] === '/tmp/awf-12345-chroot-home')).toBe(false);
-        expect(volumes.some(v => v.split(':')[0].startsWith('/tmp/awf-12345'))).toBe(false);
-      });
-    });
-
-    // Regression: `filesystem.allowWrite` is expressed in guest-visible paths,
-    // and each runtime realises those paths differently. Compose generation
-    // still builds an agent service object for microVM runtimes (so infra
-    // containers can wire depends_on edges) even though it is omitted from the
-    // emitted file, so an ungated policy was evaluated against compose bind
-    // mounts the agent never uses. A Cloud Hypervisor guest path such as
-    // `/workspace/allowed` is not backed by any host bind mount, so it threw
-    // during writeConfigs() -- long before the Cloud Hypervisor planner ran.
-    describe('filesystem.allowWrite runtime gating', () => {
-      it('does not apply the compose write policy to Cloud Hypervisor guest paths', () => {
-        const microVmConfig = {
-          ...mockConfig,
-          containerRuntime: 'cloud-hypervisor',
-          filesystemAllowWrite: ['/workspace/allowed', '/tmp/gh-aw/agent'],
-        };
-
-        expect(() => generateDockerCompose(microVmConfig, mockNetworkConfig)).not.toThrow();
-
-        // The agent itself is launched by the microVM backend, not compose.
-        const policed = generateDockerCompose(microVmConfig, mockNetworkConfig);
-        expect(policed.services.agent).toBeUndefined();
-
-        // Every volume compose *does* emit must be byte-identical to the same
-        // run with no policy at all: the policy belongs to the Cloud Hypervisor
-        // mount tree, so it must not rewrite a single compose mode here.
-        const allVolumes = (compose: ReturnType<typeof generateDockerCompose>): string[] =>
-          Object.entries(compose.services)
-            .flatMap(([name, service]: [string, any]) =>
-              ((service.volumes ?? []) as string[]).map((volume) => `${name} ${volume}`))
-            .sort();
-        const unpoliced = generateDockerCompose(
-          { ...mockConfig, containerRuntime: 'cloud-hypervisor' },
-          mockNetworkConfig,
-        );
-        expect(allVolumes(policed)).toEqual(allVolumes(unpoliced));
-      });
-
-      it('still enforces the compose write policy for Docker and gVisor', () => {
-        for (const containerRuntime of [undefined, 'docker', 'gvisor']) {
-          const composeConfig = {
-            ...mockConfig,
-            ...(containerRuntime ? { containerRuntime } : {}),
-            filesystemAllowWrite: [],
-          };
-          const volumes = generateDockerCompose(composeConfig, mockNetworkConfig)
-            .services.agent.volumes as string[];
-
-          // An empty allowlist narrows every non-internal writable bind mount.
-          expect(volumes).toContain('/tmp:/tmp:ro');
-          expect(volumes).not.toContain('/tmp:/tmp:rw');
-
-          // And a guest path with no backing writable host mount still fails
-          // closed for compose runtimes rather than being silently ignored.
-          expect(() => generateDockerCompose(
-            { ...composeConfig, filesystemAllowWrite: ['/workspace/allowed'] },
-            mockNetworkConfig,
-          )).toThrow(/filesystem\.allowWrite/);
-        }
-      });
-    });
 });

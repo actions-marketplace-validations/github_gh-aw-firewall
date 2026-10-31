@@ -64,9 +64,11 @@ export interface VolumeOptions {
    * When not specified, logs are written to ${workDir}/squid-logs during
    * runtime and moved to /tmp/squid-logs-<timestamp> after cleanup.
    *
-   * Note: This only affects Squid proxy logs. Agent logs (e.g., from
-   * Copilot CLI --log-dir) are handled separately and always preserved
-   * to /tmp/awf-agent-logs-<timestamp>.
+   * This does not select an agent log directory. Default ~/.copilot/logs
+   * are backed by workDir/agent-logs and preserved to
+   * /tmp/awf-agent-logs-<timestamp> when non-empty during cleanup.
+   * An explicit Copilot --log-dir writes to its own sandbox path; consumers
+   * must read the runner-visible source of the corresponding mount.
    *
    * @example '/tmp/my-proxy-logs'
    */
@@ -113,6 +115,14 @@ export interface VolumeOptions {
    * @example '/tmp/gh-aw/sandbox/agent/session-state'
    */
   sessionStateDir?: string;
+
+  /**
+   * Host-only directory for opt-in full command stdout/stderr capture.
+   * The directory must be new, absolute, and outside every agent-visible mount.
+   * AWF writes `metadata.json` and per-attempt stream files there.
+   */
+  commandOutputCaptureDir?: string;
+  commandOutputCaptureMaxBytes?: number;
 
   /**
    * Host runner tool cache directory to mount read-only into chroot mode.

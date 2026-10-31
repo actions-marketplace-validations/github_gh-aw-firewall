@@ -1,14 +1,14 @@
 import execa from 'execa';
 import { logger } from './logger';
-import { runComposeDown } from './container-stop';
+import { runComposeDown, fixSquidLogPermissions } from './container-stop';
 import {
   AGENT_CONTAINER_NAME,
   SQUID_CONTAINER_NAME,
   IPTABLES_INIT_CONTAINER_NAME,
   API_PROXY_CONTAINER_NAME,
+  ROUTER_CONTAINER_NAME,
   CLI_PROXY_CONTAINER_NAME,
   ENCLAVE_AGENT_API_PROXY_CONTAINER_NAME,
-  ENCLAVE_AGENT_CLI_PROXY_CONTAINER_NAME,
   ENCLAVE_MCP_SERVER_CONTAINER_NAME,
 } from './constants';
 import { getLocalDockerEnv } from './docker-host';
@@ -23,6 +23,8 @@ import {
 import { checkSquidLogs } from './squid-log-reader';
 import { isGvisorRuntime } from './container-runtime';
 import { removeConflictingComposeNetworks } from './compose-network-conflicts';
+import { captureEnclaveStartupDiagnostics } from './enclave/startup-diagnostics';
+import type { ProtectedCommandOutputCapture, CapturedOutputStream, CommandAttemptOutcome } from './protected-command-output-capture';
 
 const GVISOR_RETRYABLE_AGENT_EXIT_CODES = new Set([134, 139]);
 const MAX_GVISOR_AGENT_RETRIES = 1;
@@ -30,7 +32,13 @@ const MAX_GVISOR_AGENT_RETRIES = 1;
 // Node/V8 initialisation (before any agent work began) and are safe to restart.
 const GVISOR_STARTUP_CRASH_WINDOW_MS = 30_000;
 
-class InfrastructureReadinessError extends Error {}
+class InfrastructureReadinessError extends Error {
+  constructor(message: string, cause: unknown) {
+    super(message);
+    this.name = 'InfrastructureReadinessError';
+    Object.defineProperty(this, 'cause', { value: cause, configurable: true });
+  }
+}
 class PostReadinessAgentStartupError extends Error {}
 
 function getComposeUpArgs(skipPull?: boolean): string[] {
@@ -63,6 +71,7 @@ async function attemptContainerStartup(
   skipPull?: boolean,
   onNetworkReady?: () => Promise<void>,
   onInfrastructureReady?: () => Promise<void>,
+  proxyLogsDir?: string,
 ): Promise<Error | undefined> {
   // Phase 1 (topology mode only): start squid-proxy alone so the compose-managed
   // awf-net is created before any health-gated dependents (cli-proxy, agent) start.
@@ -88,6 +97,7 @@ async function attemptContainerStartup(
     logger.info('Topology peers attached; continuing with full container bring-up...');
   }
 
+  let enclaveServerStarted = false;
   try {
     if (onInfrastructureReady) {
       const listed = await execa('docker', ['compose', 'config', '--services'], {
@@ -98,6 +108,7 @@ async function attemptContainerStartup(
         .split('\n')
         .map((service) => service.trim())
         .filter(Boolean);
+      enclaveServerStarted = services.includes('enclave-mcp-server');
       const infrastructure = services.filter(
         (service) => service !== 'agent' && service !== 'iptables-init',
       );
@@ -110,6 +121,7 @@ async function attemptContainerStartup(
       } catch (error) {
         throw new InfrastructureReadinessError(
           error instanceof Error ? error.message : String(error),
+          error,
         );
       }
       if (!services.includes('agent')) {
@@ -127,6 +139,9 @@ async function attemptContainerStartup(
     await runDockerComposeUp(workDir, composeArgs);
     return undefined;
   } catch (error) {
+    if (enclaveServerStarted) {
+      await captureEnclaveStartupDiagnostics(workDir, proxyLogsDir, 'startup-failure');
+    }
     return error instanceof Error ? error : new Error(String(error));
   }
 }
@@ -142,11 +157,11 @@ function createCliProxyStartupError(dnsFailureHost?: string | null): Error {
     message +=
       `\n\nDNS resolution failed for "${dnsFailureHost}" (getaddrinfo EAI_AGAIN/ENOTFOUND). ` +
       `On ARC/DinD runners, containers created by the Docker-in-Docker daemon run on the DinD ` +
-      `Docker network, which does not forward DNS to the Kubernetes cluster resolver. If ` +
-      `"${dnsFailureHost}" is a Kubernetes Service name, the cli-proxy cannot resolve it. ` +
-      `To fix this, address the DIFC proxy by IP instead of a Service name, or configure the ` +
-      `DinD daemon's DNS (e.g. dockerd --dns <kube-dns-ip>) so container lookups reach ` +
-      `Kubernetes DNS. See https://github.github.io/gh-aw/guides/arc-dind-copilot-agent/ for details.`;
+      `Docker network, which may inherit Kubernetes search domains / ndots settings that break ` +
+      `single-label peer lookups on internal Docker networks, or may not forward DNS to the ` +
+      `Kubernetes cluster resolver for Service names. To fix this, set dockerd --dns-opt ndots:0, ` +
+      `address the DIFC proxy by IP, or configure dockerd DNS (e.g. --dns <kube-dns-ip>) so ` +
+      `container lookups reach Kubernetes DNS. See https://github.github.io/gh-aw/guides/arc-dind-copilot-agent/ for details.`;
   }
 
   return new Error(message);
@@ -184,7 +199,7 @@ async function handleRetryStartupFailure(
     throw createCliProxyStartupError(dnsFailureHost);
   }
   if (await didContainerFailStartup(retryErrorMsg, ENCLAVE_MCP_SERVER_CONTAINER_NAME)) {
-    await logContainerLogsToStderr(ENCLAVE_MCP_SERVER_CONTAINER_NAME);
+    await captureEnclaveStartupDiagnostics(workDir, proxyLogsDir, 'startup-failure');
     throw retryError;
   }
   // Any remaining retry error (e.g. squid healthcheck or domain blockage) falls
@@ -255,7 +270,7 @@ async function handleStartupFailure(
   }
 
   if (firstAttemptEnclaveServerFailure) {
-    await logContainerLogsToStderr(ENCLAVE_MCP_SERVER_CONTAINER_NAME);
+    await captureEnclaveStartupDiagnostics(workDir, proxyLogsDir, 'startup-failure');
     throw error;
   }
 
@@ -309,10 +324,10 @@ export async function startContainers(
       AGENT_CONTAINER_NAME,
       IPTABLES_INIT_CONTAINER_NAME,
       API_PROXY_CONTAINER_NAME,
+      ROUTER_CONTAINER_NAME,
       CLI_PROXY_CONTAINER_NAME,
       ENCLAVE_MCP_SERVER_CONTAINER_NAME,
       ENCLAVE_AGENT_API_PROXY_CONTAINER_NAME,
-      ENCLAVE_AGENT_CLI_PROXY_CONTAINER_NAME,
     ], {
       reject: false,
       env: getLocalDockerEnv(),
@@ -337,6 +352,7 @@ export async function startContainers(
           skipPull,
           onNetworkReady,
           onInfrastructureReady,
+          proxyLogsDir,
         );
         if (error) throw error;
       }
@@ -347,6 +363,7 @@ export async function startContainers(
     skipPull,
     onNetworkReady,
     onInfrastructureReady,
+    proxyLogsDir,
   );
   if (startupError) {
     if (
@@ -388,24 +405,155 @@ async function isGvisorStartupCrash(containerName: string): Promise<boolean> {
 /**
  * Runs the agent command in the container and reports any blocked domains
  */
-export async function runAgentCommand(workDir: string, allowedDomains: string[], proxyLogsDir?: string, agentTimeoutMinutes?: number, containerRuntime?: string): Promise<{ exitCode: number; blockedDomains: string[] }> {
+export async function runAgentCommand(
+  workDir: string,
+  allowedDomains: string[],
+  proxyLogsDir?: string,
+  agentTimeoutMinutes?: number,
+  containerRuntime?: string,
+  commandOutputCapture?: ProtectedCommandOutputCapture,
+): Promise<{ exitCode: number; blockedDomains: string[] }> {
   logger.info('Executing agent command...');
 
   try {
-    // Compute the absolute deadline once so the retry shares the same budget.
-    const overallDeadlineMs = agentTimeoutMinutes ? Date.now() + agentTimeoutMinutes * 60 * 1000 : undefined;
+    // Keep timeout enforcement on a host-controlled clock; the agent can write
+    // the shared runtime marker used for advisory API-proxy steering.
+    const agentStartTimeMs = Date.now();
+    const overallDeadlineMs = agentTimeoutMinutes
+      ? agentStartTimeMs + agentTimeoutMinutes * 60 * 1000
+      : undefined;
 
-    const executeAgentAttempt = async (logsSince?: string): Promise<number> => {
+    let attemptNumber = 0;
+    const executeAgentAttempt = async (
+      logsSince?: string,
+    ): Promise<{ exitCode: number; outcome: Exclude<CommandAttemptOutcome, 'running'> }> => {
       // Stream logs in real-time using docker logs -f (follow mode)
       // Run this in the background and wait for the container to exit separately
       const logArgs = ['logs', ...(logsSince ? ['--since', logsSince] : []), '-f', AGENT_CONTAINER_NAME];
+      const currentAttempt = commandOutputCapture ? ++attemptNumber : 0;
+      commandOutputCapture?.beginAttempt(currentAttempt);
       const logsProcess = execa('docker', logArgs, {
-        stdio: 'inherit',
+        stdio: commandOutputCapture ? ['ignore', 'pipe', 'pipe'] : 'inherit',
+        ...(commandOutputCapture ? { encoding: null, buffer: false } : {}),
         reject: false,
         env: getLocalDockerEnv(),
       });
+      let outputStreamFailed = false;
+      const forwardOutput = (
+        source: NodeJS.ReadableStream | null,
+        destination: NodeJS.WriteStream,
+        stream: CapturedOutputStream,
+      ): Promise<void> => new Promise(resolve => {
+        if (!source) {
+          outputStreamFailed = true;
+          resolve();
+          return;
+        }
+        let destinationUnavailable = false;
+        let sourceEnded = false;
+        let pendingWrites = 0;
+        let settled = false;
+        const presentationFailures = new Set<'error' | 'closed' | 'backpressure'>();
+        const cleanupDestinationListeners = (): void => {
+          if (!sourceEnded || pendingWrites !== 0) return;
+          destination.off('error', onDestinationError);
+          destination.off('close', onDestinationClose);
+        };
+        const settle = (): void => {
+          cleanupDestinationListeners();
+          if (sourceEnded && (pendingWrites === 0 || destinationUnavailable) && !settled) {
+            settled = true;
+            resolve();
+          }
+        };
+        const markDestinationUnavailable = (reason: 'error' | 'closed' | 'backpressure'): void => {
+          if (presentationFailures.has(reason)) return;
+          presentationFailures.add(reason);
+          destinationUnavailable = true;
+          commandOutputCapture!.recordPresentationFailure(stream, reason);
+          settle();
+        };
+        const onDestinationError = (): void => markDestinationUnavailable('error');
+        const onDestinationClose = (): void => {
+          if (!destination.writableFinished) markDestinationUnavailable('closed');
+        };
+        destination.on('error', onDestinationError);
+        destination.once('close', onDestinationClose);
+        source.once('end', () => {
+          sourceEnded = true;
+          settle();
+        });
+        source.once('close', () => {
+          if (!(source as NodeJS.ReadableStream & { readableEnded?: boolean }).readableEnded) {
+            outputStreamFailed = true;
+          }
+          sourceEnded = true;
+          settle();
+        });
+        source.on('data', (value: Buffer | string) => {
+          const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
+          commandOutputCapture!.recordOutput(currentAttempt, stream, chunk);
+          if (destinationUnavailable) return;
+          if (destination.destroyed || !destination.writable) {
+            markDestinationUnavailable('closed');
+            return;
+          }
+          try {
+            pendingWrites++;
+            const writeCompleted = (error?: Error | null): void => {
+              if (error) markDestinationUnavailable('error');
+              pendingWrites--;
+              settle();
+            };
+            const canContinue = destination.write(chunk, writeCompleted);
+            if (!canContinue && !destinationUnavailable) {
+              markDestinationUnavailable('backpressure');
+            }
+          } catch {
+            markDestinationUnavailable('error');
+            pendingWrites = Math.max(0, pendingWrites - 1);
+            settle();
+          }
+        });
+        source.on('error', () => {
+          outputStreamFailed = true;
+          sourceEnded = true;
+          settle();
+        });
+      });
+      const outputDrainPromises: Promise<void>[] = [];
+      if (commandOutputCapture) {
+        outputDrainPromises.push(forwardOutput(logsProcess.stdout, process.stdout, 'stdout'));
+        outputDrainPromises.push(forwardOutput(logsProcess.stderr, process.stderr, 'stderr'));
+      }
+      const recordAttemptCompletion = async (
+        exitCode: number,
+        outcome: Exclude<CommandAttemptOutcome, 'running'>,
+      ): Promise<{ exitCode: number; outcome: Exclude<CommandAttemptOutcome, 'running'> }> => {
+        let drainTimeout: ReturnType<typeof setTimeout> | undefined;
+        const drainResult = await Promise.race([
+          Promise.all([logsProcess, ...outputDrainPromises]).then(([logsResult]) => ({
+            completed: true as const,
+            logsDrained: !outputStreamFailed && logsResult.exitCode === 0,
+          })),
+          new Promise<{ completed: false; logsDrained: false }>(resolve => {
+            drainTimeout = setTimeout(() => resolve({ completed: false, logsDrained: false }), 5_000);
+          }),
+        ]);
+        if (drainTimeout) clearTimeout(drainTimeout);
+        if (!drainResult.completed) {
+          const processWithKill = logsProcess as typeof logsProcess & { kill?: (signal?: string) => void };
+          processWithKill.kill?.('SIGTERM');
+          logsProcess.stdout?.destroy();
+          logsProcess.stderr?.destroy();
+        }
+        const logsDrained = drainResult.logsDrained;
+        commandOutputCapture?.finishAttempt(currentAttempt, { exitCode, outcome, logsDrained });
+        return { exitCode, outcome };
+      };
 
       let exitCode: number;
+      let outcome: Exclude<CommandAttemptOutcome, 'running'> = 'exited';
 
       if (overallDeadlineMs !== undefined) {
         const remainingMs = overallDeadlineMs - Date.now();
@@ -414,8 +562,7 @@ export async function runAgentCommand(workDir: string, allowedDomains: string[],
           // No time left (budget exhausted by a previous attempt).
           logger.warn(`Agent command timed out after ${agentTimeoutMinutes} minutes, stopping container...`);
           await execa('docker', ['stop', '-t', '10', AGENT_CONTAINER_NAME], { reject: false, env: getLocalDockerEnv() });
-          await logsProcess;
-          return 124;
+          return recordAttemptCompletion(124, 'timed_out');
         }
 
         logger.info(`Agent timeout: ${agentTimeoutMinutes} minutes`);
@@ -434,6 +581,7 @@ export async function runAgentCommand(workDir: string, allowedDomains: string[],
         const raceResult = await Promise.race([waitPromise, timeoutPromise]);
 
         if (raceResult.type === 'timeout') {
+          outcome = 'timed_out';
           logger.warn(`Agent command timed out after ${agentTimeoutMinutes} minutes, stopping container...`);
           // Stop the container gracefully (10 second grace period before SIGKILL)
           await execa('docker', ['stop', '-t', '10', AGENT_CONTAINER_NAME], { reject: false, env: getLocalDockerEnv() });
@@ -450,14 +598,15 @@ export async function runAgentCommand(workDir: string, allowedDomains: string[],
       }
 
       // Wait for the logs process to finish (it should exit automatically when container stops)
-      await logsProcess;
-      return exitCode;
+      return recordAttemptCompletion(exitCode, outcome);
     };
 
-    let exitCode = await executeAgentAttempt();
+    let attemptResult = await executeAgentAttempt();
+    let exitCode = attemptResult.exitCode;
 
-    if (isGvisorRuntime(containerRuntime)) {
+    if (isGvisorRuntime(containerRuntime) && !isAgentExternallyKilled()) {
       for (let attempt = 1; attempt <= MAX_GVISOR_AGENT_RETRIES; attempt++) {
+        if (isAgentExternallyKilled()) break;
         if (!GVISOR_RETRYABLE_AGENT_EXIT_CODES.has(exitCode)) {
           break;
         }
@@ -471,6 +620,7 @@ export async function runAgentCommand(workDir: string, allowedDomains: string[],
           );
           break;
         }
+        if (isAgentExternallyKilled()) break;
 
         logger.warn(
           `gVisor agent exited with code ${exitCode} before startup completed; retrying container launch (${attempt}/${MAX_GVISOR_AGENT_RETRIES})...`
@@ -481,7 +631,19 @@ export async function runAgentCommand(workDir: string, allowedDomains: string[],
           stderr: 'inherit',
           env: getLocalDockerEnv(),
         });
-        exitCode = await executeAgentAttempt(logsSince);
+        if (isAgentExternallyKilled()) {
+          await execa('docker', ['stop', '-t', '3', AGENT_CONTAINER_NAME], {
+            reject: false,
+            env: getLocalDockerEnv(),
+          });
+          if (commandOutputCapture) {
+            attemptResult = await executeAgentAttempt(logsSince);
+            exitCode = attemptResult.exitCode;
+          }
+          break;
+        }
+        attemptResult = await executeAgentAttempt(logsSince);
+        exitCode = attemptResult.exitCode;
       }
     }
 
@@ -490,13 +652,23 @@ export async function runAgentCommand(workDir: string, allowedDomains: string[],
     // unreliable and the signal handler will drive the rest of the shutdown.
     if (isAgentExternallyKilled()) {
       logger.debug('Agent was externally killed, skipping post-run analysis');
+      commandOutputCapture?.finishCommand(exitCode || 143, 'cancelled');
       return { exitCode: exitCode || 143, blockedDomains: [] };
     }
 
+    commandOutputCapture?.finishCommand(
+      exitCode,
+      attemptResult.outcome,
+    );
     logger.debug(`Agent exit code: ${exitCode}`);
 
     // Small delay to ensure Squid logs are flushed to disk
     await new Promise(resolve => setTimeout(resolve, 200));
+
+    // Squid writes its logs as UID 13, so the runner user cannot read them
+    // without a repair from inside the still-running container. Do this before
+    // reading access.log, otherwise the diagnostics below fail with EACCES.
+    await fixSquidLogPermissions();
 
     // Check Squid logs to see if any domains were blocked (do this BEFORE cleanup)
     const { hasDenials, blockedTargets } = await checkSquidLogs(workDir, proxyLogsDir);

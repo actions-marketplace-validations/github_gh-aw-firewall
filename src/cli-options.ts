@@ -1,9 +1,9 @@
 import { Command, Option } from 'commander';
-import * as path from 'path';
-import * as os from 'os';
 import { version } from '../package.json';
 import { collectRulesetFile, collectStringArray, formatItem } from './option-parsers';
-import { CLOUD_HYPERVISOR_RELEASE_VERSION } from './types/runtime-options';
+import {
+  CLOUD_HYPERVISOR_RELEASE_VERSION,
+} from './types/runtime-options';
 
 // Option group markers used by the custom help formatter to insert section headers.
 // Each key is the long flag name of the first option in a group.
@@ -12,6 +12,7 @@ const optionGroupHeaders: Record<string, string> = {
   'allow-domains': 'Domain Filtering:',
   'build-local': 'Image Management:',
   'cloud-hypervisor-preview': 'Cloud Hypervisor Preview (GitHub-hosted Ubuntu x86_64 KVM only):',
+  'nvx-preview': 'NVX Preview (Linux x86_64 KVM only):',
   'env': 'Container Configuration:',
   'dns-servers': 'Network & Security:',
   'upstream-proxy': 'Network & Security:',
@@ -178,6 +179,7 @@ program
    '                                       "sbx" — Docker sbx microVM with hypervisor isolation.\n' +
    '                                       "cloud-hypervisor" — explicit GitHub-hosted Ubuntu x86_64 KVM\n' +
    '                                       Cloud Hypervisor v53.0 preview.\n' +
+   '                                       "nvx" — explicit Linux x86_64 KVM NVX one-shot microVM preview.\n' +
    '                                       Unknown values are passed through as raw Docker runtime names.'
   )
   // -- Cloud Hypervisor Preview --
@@ -188,18 +190,61 @@ program
    '                                       and pinned guest artifacts.',
    false
   )
+  .option(
+    '--cloud-hypervisor-mount-policy <policy>',
+    'Host directory exposure policy: "workspace-only" (secure default; also keeps narrow gh-aw\n' +
+    '                                       runtime directories) or "workspace-and-tool-cache" (explicitly mounts\n' +
+    '                                       RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY read-only).',
+  )
   .option('--cloud-hypervisor-binary <path>', `Path to the Cloud Hypervisor v${CLOUD_HYPERVISOR_RELEASE_VERSION} binary.`)
   .option('--cloud-hypervisor-kernel <path>', 'Path to the PCI-capable guest Linux kernel image.')
   .option('--cloud-hypervisor-rootfs <path>', 'Path to the guest root filesystem image.')
   .option('--cloud-hypervisor-supervisor <path>', 'Path to the built AWF guest supervisor.')
+  .option('--cloud-hypervisor-artifact-manifest <path>', 'Path to the release-pinned Cloud Hypervisor artifact manifest.')
+  .option('--cloud-hypervisor-artifact-manifest-bundle <path>', 'Path to the manifest GitHub artifact-attestation bundle for offline verification.')
+  .option('--cloud-hypervisor-artifact-release-tag <tag>', 'Expected AWF release tag recorded by the attested artifact manifest.')
+  .option(
+    '--cloud-hypervisor-development-allow-unattested-artifacts',
+    'DEVELOPMENT ONLY: allow legacy caller-supplied hashes when the matching\n' +
+    '                                       AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1\n' +
+    '                                       environment variable is also set.',
+    false,
+  )
   .option('--cloud-hypervisor-vcpus <count>', 'Guest virtual CPU count (default: 2).')
   .option('--cloud-hypervisor-memory-mib <mib>', 'Guest memory in MiB (default: 512).')
+  .option('--cloud-hypervisor-scratch-mib <mib>', 'Primary guest /tmp tmpfs capacity in MiB (positive integer; default: unchanged rootfs storage).')
+  .option('--cloud-hypervisor-enclave-debug-public', 'Retain bounded enclave logs in protected host-only artifacts (default for eligible verified public-only enclaves).')
   .option('--cloud-hypervisor-api-timeout-ms <ms>', 'Bounded API socket readiness timeout in milliseconds (default: 5000).')
   .option('--cloud-hypervisor-binary-sha256 <digest>', 'Expected SHA-256 digest of the Cloud Hypervisor binary.')
   .option('--cloud-hypervisor-virtiofsd-sha256 <digest>', 'Expected SHA-256 digest of the sibling virtiofsd binary.')
   .option('--cloud-hypervisor-kernel-sha256 <digest>', 'Expected SHA-256 digest of the guest kernel.')
   .option('--cloud-hypervisor-rootfs-sha256 <digest>', 'Expected SHA-256 digest of the guest rootfs.')
   .option('--cloud-hypervisor-supervisor-sha256 <digest>', 'Expected SHA-256 digest of the AWF guest supervisor.')
+
+  // -- NVX Preview --
+  .option(
+   '--nvx-preview',
+   'Enable the NVX one-shot microVM workload-execution preview.\n' +
+   '                                       Linux x86_64 KVM hosts only. Requires pinned, attested guest artifacts.',
+   false
+  )
+  .option(
+    '--nvx-mount-policy <policy>',
+    'Host directory exposure policy for the live guest workspace export: "workspace-only"\n' +
+    '                                       (secure default) or "workspace-and-tool-cache" (additionally exports\n' +
+    '                                       RUNNER_TOOL_CACHE/AGENT_TOOLSDIRECTORY read-only).',
+  )
+  .option('--nvx-layer <path>', 'Path to the prebuilt guest distro layer directory used as the NVX filesystem base layer.')
+  .option('--nvx-artifact-manifest <path>', 'Path to the release-pinned NVX artifact manifest.')
+  .option('--nvx-artifact-manifest-bundle <path>', 'Path to the manifest GitHub artifact-attestation bundle for offline verification.')
+  .option('--nvx-signer-workflow <workflow>', 'Expected GitHub Actions workflow identity that signed the artifact manifest.')
+  .option('--nvx-openvmm <path>', 'Path to the trusted, attested OpenVMM binary.')
+  .option('--nvx-kernel <path>', 'Path to the trusted, attested guest Linux kernel image.')
+  .option('--nvx-initramfs <path>', 'Path to the trusted, attested guest initramfs image.')
+  .option('--nvx-memory-mib <mib>', 'Guest memory in MiB (default: 512).')
+  .option('--nvx-memory-max-bytes <bytes>', 'Guest cgroup memory ceiling in bytes (default: 536870912).')
+  .option('--nvx-pids-max <count>', 'Guest cgroup pids ceiling (default: 128).')
+  .option('--nvx-scratch-bytes <bytes>', 'Bounded per-run guest-writable scratch overlay size in bytes.')
 
   // -- Container Configuration --
   .option(
@@ -248,6 +293,14 @@ program
     'Allocate a pseudo-TTY (required for interactive tools like Claude Code)',
     false
   )
+  .option(
+    '--capture-command-output <directory>',
+    'Capture raw stdout/stderr into protected host-only storage (non-TTY Compose runtimes only)',
+  )
+  .option(
+    '--capture-command-output-max-bytes <bytes>',
+    'Maximum total bytes retained across command output capture (default: 67108864; max: 67108864)',
+  )
 
   // -- Network & Security --
   .option(
@@ -273,12 +326,25 @@ program
     '--network-isolation',
     'Enforce egress via Docker network topology (internal network +\n' +
     '                                       dual-homed proxy) instead of iptables. Requires no sudo/NET_ADMIN.\n' +
-    '                                       Not yet supported with --dns-over-https or --enable-host-access.\n' +
+    '                                       Host HTTP(S) access uses Squid; no direct host route is provided.\n' +
+    '                                       Not yet supported with --dns-over-https.\n' +
     '                                       Enabled by default (strict security).'
   )
   .option(
     '--no-network-isolation',
     'Disable network-isolation mode (requires --legacy-security).'
+  )
+  .option(
+    '--network-subnet <cidr>',
+    'IPv4 CIDR for the awf-net Docker network (default: 172.30.0.0/24).\n' +
+    '                                       Use this when the default collides with the host or cluster\n' +
+    '                                       network (e.g. the OpenShift service CIDR 172.30.0.0/16).\n' +
+    '                                       Example: 10.88.0.0/24'
+  )
+  .option(
+    '--verify-sbx-egress',
+    'Fail before agent startup unless Docker sbx blocks direct non-proxy egress.',
+    false
   )
   .option(
     '--topology-attach <name>',
@@ -422,7 +488,7 @@ program
   )
   .option(
     '--max-model-multiplier <model:multiplier,...>',
-    'Per-model cost multipliers for effective token accounting (requires --enable-api-proxy).\n' +
+    'Per-model cost multipliers used by --max-model-multiplier-cap (requires --enable-api-proxy).\n' +
     '                                       Format: comma-separated model:multiplier pairs, e.g.\n' +
     '                                       claude-opus-4-5-1m:10,claude-opus-4-5-200k:2.5\n' +
     '                                       Multipliers must be positive numbers. Models without\n' +
@@ -452,9 +518,9 @@ program
   )
   .option(
     '--enable-token-steering',
-    'Enable effective token budget steering in the API proxy (requires --enable-api-proxy).\n' +
-    '                                       Injects budget-warning system messages at 80%, 90%, 95%, and 99%\n' +
-    '                                       usage to nudge the agent to wrap up before hitting the hard limit.',
+    'Enable runtime and AI-credit steering in the API proxy (requires --enable-api-proxy).\n' +
+    '                                       Injects advisory warnings at 80%, 90%, 95%, and 99% of configured budgets/deadlines\n' +
+    '                                       into the next eligible request; it does not interrupt work or guarantee completion.',
     false
   )
 
@@ -469,6 +535,22 @@ program
     '--difc-proxy-ca-cert <path>',
     'Path to TLS CA cert written by the external DIFC proxy.\n' +
     '                                       Recommended when --difc-proxy-host is set for TLS verification.',
+  )
+  .option(
+    '--max-github-api-points-rest <points>',
+    'Maximum GitHub REST API secondary-rate-limit points allowed per AWF run.\n' +
+    '                                       Requires --difc-proxy-host. Must be a positive integer.',
+  )
+  .option(
+    '--max-github-api-points-graphql <points>',
+    'Maximum GitHub GraphQL API secondary-rate-limit points allowed per AWF run.\n' +
+    '                                       Requires --difc-proxy-host. Must be a positive integer.',
+  )
+  .option(
+    '--max-num-tool-calls <n>',
+    'Maximum number of enclave tool calls (enclave_run_script, enclave_run_agent) allowed per AWF run.\n' +
+    '                                       Every attempted call counts; further calls are denied in-band.\n' +
+    '                                       Requires enclaves. Must be a positive integer. Default: unlimited.',
   )
   // -- Logging & Debug --
   .option(
@@ -487,8 +569,7 @@ program
   )
   .option(
     '--work-dir <dir>',
-    'Working directory for temporary files',
-    path.join(os.tmpdir(), `awf-${Date.now()}`)
+    'Working directory for temporary files'
   )
   .option(
     '--proxy-logs-dir <path>',

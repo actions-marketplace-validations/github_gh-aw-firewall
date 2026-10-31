@@ -2,7 +2,8 @@ import { generateDockerCompose, mockNetworkConfig, useAgentVolumesTestConfig } f
 import * as fs from 'fs';
 import * as path from 'path';
 import { stageHostFile } from './agent-volumes/docker-host-staging';
-import { applyHostPathPrefixToVolumes } from './host-path-prefix';
+import { applyHostPathPrefixToVolumes, resolveRunnerVisibleHostPath } from './host-path-prefix';
+import { GEMINI_SETTINGS_MOUNT, GEMINI_SETTINGS_SERVICE } from './gemini-settings-service';
 
 // Create mock functions (must remain per-file — jest.mock() is hoisted before imports)
 
@@ -14,6 +15,173 @@ jest.mock('execa', () => require('../test-helpers/mock-execa.test-utils').execaM
 const { getConfig } = useAgentVolumesTestConfig();
 
 describe('agent service', () => {
+  it('provisions the Gemini auth pin in the sysroot without an unshared workDir bind', () => {
+    const config = {
+      ...getConfig(), runnerTopology: 'arc-dind' as const, dockerHostPathPrefix: '/host',
+      enableApiProxy: true, geminiApiKey: 'fake-key',
+    };
+    const compose = generateDockerCompose(config, { ...mockNetworkConfig, proxyIp: '172.30.0.30' });
+    const volumes = compose.services.agent.volumes as string[];
+    expect(volumes).toContain('sysroot:/host:rw');
+    expect(volumes).toContain(GEMINI_SETTINGS_MOUNT);
+    expect(compose.services.agent.environment?.GEMINI_CLI_SYSTEM_SETTINGS_PATH).toBe('/etc/awf/gemini-cli/settings.json');
+    expect(compose.services.agent.environment?.AWF_GEMINI_SYSTEM_SETTINGS_FALLBACK).toBeUndefined();
+    expect(compose.services[GEMINI_SETTINGS_SERVICE]).toBeDefined();
+  });
+
+  it.each(['/host', '/tmp/gh-aw', '/tmp'])(
+    'keeps runner-temp agent logs at the requested sandbox path with the %s DinD prefix',
+    (dockerHostPathPrefix) => {
+      const runnerTemp = fs.mkdtempSync(path.join('/tmp', 'awf-runner-temp-'));
+      const logsDir = path.join(runnerTemp, 'gh-aw/sandbox/agent/logs');
+      fs.mkdirSync(logsDir, { recursive: true });
+
+      try {
+        const agentCommand = `copilot --log-dir ${logsDir}`;
+        const result = generateDockerCompose(
+          {
+            ...getConfig(),
+            runnerTopology: 'arc-dind',
+            dockerHostPathPrefix,
+            agentCommand,
+            volumeMounts: [`${logsDir}:${logsDir}:rw`],
+          },
+          mockNetworkConfig,
+        );
+        const volumes = result.services.agent.volumes as string[];
+        const translatedSource = dockerHostPathPrefix === '/tmp' ? logsDir : `${dockerHostPathPrefix}${logsDir}`;
+        const logMounts = volumes.filter((mount) => mount.split(':')[1] === `/host${logsDir}`);
+
+        expect(logMounts).toEqual([`${translatedSource}:/host${logsDir}:rw`]);
+        expect(volumes).not.toContain(`${translatedSource}:/host/tmp/gh-aw/sandbox/agent/logs:rw`);
+        expect(result.services.agent.command).toEqual(['/bin/bash', '-c', agentCommand]);
+      } finally {
+        fs.rmSync(runnerTemp, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['/host', '/tmp/gh-aw', '/tmp'])(
+    'preserves explicit agent log targets and commands with the %s DinD prefix',
+    (dockerHostPathPrefix) => {
+      const runnerTemp = fs.mkdtempSync(path.join('/tmp', 'awf-runner-temp-'));
+      const logsDir = path.join(runnerTemp, 'gh-aw/sandbox/agent/logs');
+      const canonicalLogsDir = '/tmp/gh-aw/sandbox/agent/logs';
+      fs.mkdirSync(logsDir, { recursive: true });
+
+      try {
+        const agentCommand = `copilot --log-dir ${canonicalLogsDir}`;
+        const result = generateDockerCompose(
+          {
+            ...getConfig(),
+            runnerTopology: 'arc-dind',
+            dockerHostPathPrefix,
+            agentCommand,
+            volumeMounts: [`${logsDir}:${canonicalLogsDir}:rw`],
+          },
+          mockNetworkConfig,
+        );
+        const volumes = result.services.agent.volumes as string[];
+        const translatedSource = dockerHostPathPrefix === '/tmp' ? logsDir : `${dockerHostPathPrefix}${logsDir}`;
+
+        expect(volumes).toContain(`${translatedSource}:/host${canonicalLogsDir}:rw`);
+        expect(volumes).not.toContain(`${translatedSource}:/host${logsDir}:rw`);
+        expect(result.services.agent.command).toEqual(['/bin/bash', '-c', agentCommand]);
+        expect(resolveRunnerVisibleHostPath(logsDir, dockerHostPathPrefix)).toBe(logsDir);
+        expect(logsDir).not.toBe(canonicalLogsDir);
+        expect(fs.lstatSync(logsDir).isSymbolicLink()).toBe(false);
+      } finally {
+        fs.rmSync(runnerTemp, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it.each(['/host', '/tmp/gh-aw', '/tmp'])(
+    'preserves detection input mounts and command scope with the %s DinD prefix',
+    (dockerHostPathPrefix) => {
+      const runnerTemp = fs.mkdtempSync(path.join('/tmp', 'awf-runner-temp-'));
+      const detectionDir = path.join(runnerTemp, 'gh-aw/threat-detection');
+      const safeOutputsDir = path.join(runnerTemp, 'gh-aw/safeoutputs');
+      fs.mkdirSync(detectionDir, { recursive: true });
+      fs.mkdirSync(safeOutputsDir, { recursive: true });
+
+      try {
+        const agentCommand = `copilot --add-dir ${detectionDir}`;
+        const result = generateDockerCompose(
+          {
+            ...getConfig(),
+            runnerTopology: 'arc-dind',
+            dockerHostPathPrefix,
+            agentCommand,
+            volumeMounts: [
+              `${detectionDir}:${detectionDir}:ro`,
+              `${safeOutputsDir}:${safeOutputsDir}:rw`,
+            ],
+          },
+          mockNetworkConfig,
+        );
+        const volumes = result.services.agent.volumes as string[];
+        const translatedDetectionDir = dockerHostPathPrefix === '/tmp'
+          ? detectionDir : `${dockerHostPathPrefix}${detectionDir}`;
+        const translatedSafeOutputsDir = dockerHostPathPrefix === '/tmp'
+          ? safeOutputsDir : `${dockerHostPathPrefix}${safeOutputsDir}`;
+
+        expect(volumes).toContain(`${translatedDetectionDir}:/host${detectionDir}:ro`);
+        expect(volumes).not.toContain(`${translatedDetectionDir}:/host${detectionDir}:rw`);
+        expect(volumes).toContain(`${translatedSafeOutputsDir}:/host${safeOutputsDir}:rw`);
+        expect(result.services.agent.command).toEqual(['/bin/bash', '-c', agentCommand]);
+      } finally {
+        fs.rmSync(runnerTemp, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it('keeps the Pi compatibility symlink separate from its writable file mount beneath the read-only parent', () => {
+    const runnerTemp = fs.mkdtempSync(path.join('/tmp', 'awf-runner-temp-'));
+    const ghAwDir = path.join(runnerTemp, 'gh-aw');
+    const agentDir = path.join(ghAwDir, 'sandbox/agent');
+    const piLog = path.join(agentDir, 'logs/pi-streaming.jsonl');
+    const compiledTeePath = path.join(ghAwDir, 'pi-streaming.jsonl');
+    const canonicalLog = '/tmp/gh-aw/sandbox/agent/logs/pi-streaming.jsonl';
+    fs.mkdirSync(path.dirname(piLog), { recursive: true });
+    fs.writeFileSync(piLog, '');
+    fs.symlinkSync(path.relative(path.dirname(compiledTeePath), piLog), compiledTeePath);
+
+    try {
+      const result = generateDockerCompose(
+        {
+          ...getConfig(),
+          runnerTopology: 'arc-dind',
+          dockerHostPathPrefix: '/daemon-root',
+          volumeMounts: [
+            `${ghAwDir}:${ghAwDir}:ro`,
+            `${agentDir}:${agentDir}:rw`,
+            `${piLog}:${canonicalLog}:rw`,
+          ],
+        },
+        mockNetworkConfig,
+      );
+      const volumes = result.services.agent.volumes as string[];
+      const parent = `/daemon-root${ghAwDir}:/host${ghAwDir}:ro`;
+      const child = `/daemon-root${agentDir}:/host${agentDir}:rw`;
+      const fileMount = `/daemon-root${piLog}:/host${canonicalLog}:rw`;
+
+      expect(volumes).toContain(parent);
+      expect(volumes).toContain(child);
+      expect(volumes).toContain(fileMount);
+      expect(volumes.indexOf(parent)).toBeLessThan(volumes.indexOf(child));
+      expect(volumes).not.toContain(`/daemon-root${ghAwDir}:/host${ghAwDir}:rw`);
+      expect(volumes).not.toContain(`/daemon-root/daemon-root${agentDir}:/host${agentDir}:rw`);
+      expect(fs.lstatSync(compiledTeePath).isSymbolicLink()).toBe(true);
+      expect(fs.realpathSync(compiledTeePath)).toBe(fs.realpathSync(piLog));
+      expect(fs.lstatSync(piLog).isFile()).toBe(true);
+      expect(fileMount.split(':')[1]).toBe(`/host${canonicalLog}`);
+      expect(fileMount.split(':')[1]).not.toBe(`/host${path.join(ghAwDir, 'pi-streaming.jsonl')}`);
+    } finally {
+      fs.rmSync(runnerTemp, { recursive: true, force: true });
+    }
+  });
+
   it('should auto-stage the ARC/DinD manual bootstrap files under a shared /tmp docker-host-path-prefix', () => {
     const originalPath = process.env.PATH;
     const sharedTmpPrefix = fs.mkdtempSync(path.join('/tmp', 'gh-aw-'));

@@ -15,15 +15,18 @@ import { deriveSensitiveEndpointForms, redactSensitiveValues } from './redact-se
 import { resolveLogPaths } from './log-paths';
 import { DEFAULT_DNS_SERVERS, filterForNetworkIsolation } from './dns-resolver';
 import { getSafeHostGid, getSafeHostUid, isNativeRootWithoutSudo } from './host-identity';
-import {
-  AGENT_IP,
-  API_PROXY_IP,
-  CLI_PROXY_IP,
-  DOH_PROXY_IP,
-  NETWORK_SUBNET,
-  SQUID_IP,
-} from './host-iptables-shared';
+import { resolveNetworkAddressing } from './network-subnet';
+import { readEnvFile } from './github-env';
+import { extractOtlpEndpointsFromEnv, resolveOtlpEndpointEnv } from './api-proxy-config-domains';
 import { prepareWorkDirectories } from './workdir-setup';
+import { writeFileNoFollow } from './fs-utils';
+import {
+  createSensitivePathAudit,
+  dockerSensitivePathTargets,
+  resolveSensitivePaths,
+} from './sensitive-paths';
+import { writeSensitivePathAudit } from './sensitive-path-audit';
+import { resolveApiProxyUpstreams } from './services/api-proxy-env-config';
 
 // When bundled with esbuild, this global is replaced at build time with the
 // JSON content of containers/agent/seccomp-profile.json.  In normal (tsc)
@@ -267,8 +270,8 @@ interface NetworkConfig {
 /**
  * Phase 1 — Validates and hardens the work directory.
  *
- * Creates the directory with restrictive `0o700` permissions, guards against
- * symlink injection, and re-applies the permission mask on pre-existing dirs.
+ * Creates the directory with restrictive `0o700` permissions and rejects
+ * symlinks, unsafe ownership, or group/world-writable reused directories.
  * Security-critical: docker-compose.yml (which contains plaintext secrets) is
  * written here, so non-root host processes must not be able to read it.
  */
@@ -288,7 +291,35 @@ function validateAndPrepareWorkDir(config: WrapperConfig): void {
     if (!workDirStat.isDirectory()) {
       throw new Error(`Expected directory but found non-directory path: ${config.workDir}`);
     }
-    if (!workDirCreated) {
+    const effectiveUid = process.getuid?.();
+    const sudoUid = process.env.SUDO_UID !== undefined
+      ? Number.parseInt(process.env.SUDO_UID, 10)
+      : undefined;
+    const trustedOwners = new Set<number>();
+    if (effectiveUid !== undefined) {
+      trustedOwners.add(effectiveUid);
+    }
+    if (
+      effectiveUid === 0 &&
+      sudoUid !== undefined &&
+      Number.isSafeInteger(sudoUid) &&
+      sudoUid >= 0
+    ) {
+      trustedOwners.add(sudoUid);
+    }
+    if (!trustedOwners.has(workDirStat.uid)) {
+      throw new Error(
+        `Refusing to use work directory not owned by the invoking user: ${config.workDir} ` +
+        `(owner uid=${workDirStat.uid}, trusted uid(s)=${[...trustedOwners].join(',')})`
+      );
+    }
+    if ((workDirStat.mode & 0o077) !== 0) {
+      throw new Error(
+        `Refusing to use work directory accessible by group or other users: ${config.workDir} ` +
+        `(mode=${(workDirStat.mode & 0o777).toString(8)})`
+      );
+    }
+    if (workDirCreated) {
       fs.chmodSync(config.workDir, 0o700);
     }
   } catch (error: unknown) {
@@ -450,43 +481,50 @@ function writeAuditArtifacts(
     dnsServers: squidDnsServers ?? config.dnsServers,
     ...(config.enableApiProxy && networkConfig.proxyIp ? {
       apiProxyIp: networkConfig.proxyIp,
+      apiProxyUpstreams: resolveApiProxyUpstreams(config),
     } : {}),
     // Include topology peer allow rules so the audit log correctly attributes
     // allowed connections to topology-attached containers (e.g. awmg-mcpg:8080)
     // rather than misidentifying them as "unknown" or blocked.
     topologyPeers: resolveTopologyPeerHosts(config),
+    // Effective awf-net subnet (relocated by --network-subnet when set), so
+    // log analysis classifies denied in-subnet IPs as AWF-internal rather
+    // than external blocked domains.
+    networkSubnet: networkConfig.subnet,
   });
   writeAuditArtifact(
     auditDir,
     'policy-manifest.json',
-    JSON.stringify(policyManifest, null, 2)
+    redactSensitiveValues(JSON.stringify(policyManifest, null, 2), sensitiveEndpointForms)
   );
+
+  if (config.nvx) {
+    const deferredPaths = resolveSensitivePaths('nvx').map(({ id, path: sensitivePath, reason }) => ({
+      id,
+      path: sensitivePath,
+      reason,
+    }));
+    writeSensitivePathAudit(auditDir, {
+      ...createSensitivePathAudit('nvx', []),
+      enforcement: 'deferred',
+      deferredPaths,
+    });
+  } else if (!config.cloudHypervisor) {
+    const maskedPaths = resolveSensitivePaths('docker', { workDir: config.workDir }).map((entry) => ({
+      id: entry.id,
+      path: entry.path,
+      reason: entry.reason,
+      targets: dockerSensitivePathTargets(entry.path),
+    }));
+    writeSensitivePathAudit(auditDir, createSensitivePathAudit('docker', maskedPaths));
+  }
 
   logger.debug(`Audit artifacts written to: ${auditDir}`);
 }
 
 function writeAuditArtifact(auditDir: string, filename: string, contents: string): void {
   const artifactPath = path.join(auditDir, filename);
-  const flags =
-    fs.constants.O_WRONLY |
-    fs.constants.O_CREAT |
-    fs.constants.O_TRUNC |
-    (fs.constants.O_NOFOLLOW ?? 0);
-  let fd: number | undefined;
-
-  try {
-    // Create privately and refuse a symlink target. Existing artifacts are
-    // tightened before truncation so readers cannot observe partial content.
-    fd = fs.openSync(artifactPath, flags, 0o600);
-    fs.fchmodSync(fd, 0o600);
-    fs.writeFileSync(fd, contents, { encoding: 'utf8' });
-    fs.fsyncSync(fd);
-    fs.fchmodSync(fd, 0o644);
-  } finally {
-    if (fd !== undefined) {
-      fs.closeSync(fd);
-    }
-  }
+  writeFileNoFollow(artifactPath, contents, 0o644);
 }
 
 /**
@@ -515,14 +553,17 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
   repairRunnerTempGhAwOwnership();
   repairContainerWorkDirOwnership(config);
 
-  // Use fixed network configuration (network is created by host-iptables.ts)
+  // Network addressing: policy defaults unless relocated with --network-subnet
+  // (the network itself is created by compose, or by host-iptables.ts in the
+  // legacy path).
+  const addressing = resolveNetworkAddressing(config.networkSubnet);
   const networkConfig: NetworkConfig = {
-    subnet: NETWORK_SUBNET,
-    squidIp: SQUID_IP,
-    agentIp: AGENT_IP,
-    proxyIp: API_PROXY_IP,  // Envoy API proxy sidecar
-    dohProxyIp: DOH_PROXY_IP,  // DoH proxy sidecar
-    cliProxyIp: CLI_PROXY_IP,  // CLI proxy sidecar
+    subnet: addressing.subnet,
+    squidIp: addressing.squidIp,
+    agentIp: addressing.agentIp,
+    proxyIp: addressing.proxyIp,  // Envoy API proxy sidecar
+    dohProxyIp: addressing.dohProxyIp,  // DoH proxy sidecar
+    cliProxyIp: addressing.cliProxyIp,  // CLI proxy sidecar
   };
   logger.debug(`Using network config: ${networkConfig.subnet} (squid: ${networkConfig.squidIp}, agent: ${networkConfig.agentIp}, api-proxy: ${networkConfig.proxyIp})`);
 
@@ -550,6 +591,13 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
     ? await filterForNetworkIsolation(resolvedDnsServers, logger)
     : resolvedDnsServers;
 
+  const envFileValues = config.envFile ? readEnvFile(config.envFile) : {};
+  const otlpEnv = resolveOtlpEndpointEnv(config.additionalEnv, envFileValues);
+  const otlpEndpoints = extractOtlpEndpointsFromEnv(otlpEnv);
+  if (otlpEndpoints.length > 0) {
+    logger.debug(`Auto-allowing OTLP collector endpoint(s): ${otlpEndpoints.map(({ hostname, port }) => `${hostname}:${port}`).join(', ')}`);
+  }
+
   // Note: Use container path for SSL database since it's mounted at /var/spool/squid_ssl_db
   const squidConfig = generateSquidConfig({
     // Combine non-sensitive and sensitive (secret-derived) domains so Squid allows
@@ -573,6 +621,7 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
     // to the api-proxy via HTTP_PROXY without honouring NO_PROXY for raw IPs.
     ...(config.enableApiProxy && networkConfig.proxyIp ? {
       apiProxyIp: networkConfig.proxyIp,
+      apiProxyUpstreams: resolveApiProxyUpstreams(config),
       apiProxyPorts: Object.values(API_PROXY_PORTS),
     } : {}),
     ...(config.difcProxyHost && networkConfig.cliProxyIp ? {
@@ -583,6 +632,7 @@ export async function writeConfigs(config: WrapperConfig): Promise<void> {
     // these Docker-only names is provided via the squid-proxy extra_hosts patch
     // (see patchComposeWithTopologyHosts in topology.ts).
     topologyPeers: resolveTopologyPeerHosts(config),
+    otlpEndpoints,
   });
   const squidConfigPath = path.join(config.workDir, 'squid.conf');
   fs.writeFileSync(squidConfigPath, squidConfig, { mode: 0o644 });

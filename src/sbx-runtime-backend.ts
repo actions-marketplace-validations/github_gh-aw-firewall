@@ -4,6 +4,7 @@ import type { ExternalAgentRuntimeBackend } from './external-runtime-backend';
 import { logger } from './logger';
 import {
   assertSbxApiProxyReflect,
+  assertSbxEgressEnforced,
   createSandbox,
   execInSandbox,
   isSbxAvailable,
@@ -22,8 +23,8 @@ import {
 } from './host-iptables-shared';
 import type { WrapperConfig } from './types';
 
-const SBX_GATEWAY_IP = '172.17.0.0';
 const SBX_HOST_DOCKER_INTERNAL = 'host.docker.internal';
+const SBX_GATEWAY_HOST = SBX_HOST_DOCKER_INTERNAL;
 
 interface SbxBackendLogger {
   debug(message: string, ...args: unknown[]): void;
@@ -41,6 +42,7 @@ export interface SbxRuntimeBackendDependencies {
   createSandbox: typeof createSandbox;
   execInSandbox: typeof execInSandbox;
   assertApiProxyReflect: typeof assertSbxApiProxyReflect;
+  assertEgressEnforced: typeof assertSbxEgressEnforced;
   removeSandbox: typeof removeSandbox;
   execHostCommand(command: string, options: HostCommandOptions): string;
   getWorkspaceDir(): string;
@@ -56,6 +58,7 @@ function defaultDependencies(
     createSandbox,
     execInSandbox,
     assertApiProxyReflect: assertSbxApiProxyReflect,
+    assertEgressEnforced: assertSbxEgressEnforced,
     removeSandbox,
     execHostCommand: (command, options) => execSync(command, options),
     getWorkspaceDir: () => process.env.GITHUB_WORKSPACE || process.cwd(),
@@ -113,7 +116,7 @@ export class SbxRuntimeBackend implements ExternalAgentRuntimeBackend {
       config: this.config,
       networkConfig: {
         subnet: NETWORK_SUBNET,
-        squidIp: SBX_GATEWAY_IP,
+        squidIp: SBX_GATEWAY_HOST,
         agentIp: AGENT_IP,
         proxyIp: this.config.enableApiProxy ? SBX_HOST_DOCKER_INTERNAL : undefined,
         dohProxyIp: this.config.dnsOverHttps ? DOH_PROXY_IP : undefined,
@@ -129,7 +132,7 @@ export class SbxRuntimeBackend implements ExternalAgentRuntimeBackend {
           config: this.config,
           networkConfig: {
             subnet: NETWORK_SUBNET,
-            squidIp: SBX_GATEWAY_IP,
+            squidIp: SBX_GATEWAY_HOST,
             agentIp: AGENT_IP,
             proxyIp: SBX_HOST_DOCKER_INTERNAL,
           },
@@ -157,8 +160,8 @@ export class SbxRuntimeBackend implements ExternalAgentRuntimeBackend {
 
     this.dependencies.logger.info('[sbx-diag] Verifying squid proxy connectivity...');
     const diagnosticCommand = [
-      `echo -n "squid ${SBX_GATEWAY_IP}:3128 -> "`,
-      `curl -sS --max-time 5 --proxy "http://${SBX_GATEWAY_IP}:3128" -o /dev/null -w "%{http_code}" https://api.github.com/ 2>&1`,
+      `echo -n "squid ${SBX_GATEWAY_HOST}:3128 -> "`,
+      `curl -sS --max-time 5 --proxy "http://${SBX_GATEWAY_HOST}:3128" -o /dev/null -w "%{http_code}" https://api.github.com/ 2>&1`,
       'echo ""',
     ].join(' && ');
     const diagnosticResult = await this.dependencies.execInSandbox(
@@ -173,6 +176,17 @@ export class SbxRuntimeBackend implements ExternalAgentRuntimeBackend {
     this.dependencies.logger.info(
       `[sbx-diag] Connectivity check exited with code ${diagnosticResult.exitCode}`,
     );
+
+    if (this.config.verifySbxEgress) {
+      this.dependencies.logger.info('[sbx] Verifying direct egress cannot bypass Squid...');
+      await this.dependencies.assertEgressEnforced(
+        this.sandboxName,
+        this.environment,
+        [...allowedDomains, ...(this.config.sensitiveAllowedDomains ?? [])],
+        this.config.containerWorkDir,
+      );
+      this.dependencies.logger.info('[sbx] Direct egress verification passed');
+    }
   };
 
   readonly exec: WorkflowDependencies['runAgentCommand'] = async (

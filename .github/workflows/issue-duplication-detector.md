@@ -4,29 +4,86 @@ on:
   issues:
     types: [opened]
   workflow_dispatch:
+    inputs:
+      issue_number:
+        description: Issue number to analyze
+        required: true
+        type: number
 permissions:
   copilot-requests: write
   contents: read
   issues: read
 imports:
   - shared/mcp-pagination.md
-  - shared/gh.md
 sandbox:
   agent:
     id: awf
 tools:
   github:
-    toolsets: [issues, repos, search]
+    toolsets: [issues, search]
   cache-memory:
     key: issue-duplication-detector
   bash:
-    - "*"
+    - cat
 safe-outputs:
   threat-detection:
     enabled: false
   add-comment:
     max: 1
+    target: "*"
 timeout-minutes: 10
+steps:
+  - name: Fetch issue and cached signatures
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      ISSUE_NUMBER: ${{ github.event.issue.number || inputs.issue_number }}
+      REPOSITORY: ${{ github.repository }}
+    run: |
+      set -euo pipefail
+      mkdir -p /tmp/gh-aw/agent
+      gh issue view "$ISSUE_NUMBER" --repo "$REPOSITORY" \
+        --json number,title,body,labels,createdAt \
+        > /tmp/gh-aw/agent/new-issue.json
+
+      cache=/tmp/gh-aw/cache-memory/issues.json
+      if [ -s "$cache" ]; then
+        cp "$cache" /tmp/gh-aw/agent/cached-issues.json
+      else
+        printf '[]\n' > /tmp/gh-aw/agent/cached-issues.json
+      fi
+
+      issue=/tmp/gh-aw/agent/new-issue.json
+      mkdir -p "$(dirname "$cache")"
+      [ -s "$cache" ] || printf '[]\n' > "$cache"
+      jq -s '
+        (.[0] | if type == "array" then .
+          elif (.issues | type) == "array" then .issues
+          else [] end) as $cached
+        | .[1] as $issue
+        | ($cached | map(select(
+            ((.number // .issue_number) | tostring) != ($issue.number | tostring)
+          )))
+          + [$issue | {
+            number,
+            title,
+            key_phrases: (
+              [((.title // "") + " " + (.body // ""))
+                | ascii_downcase
+                | scan("[a-z0-9][a-z0-9_-]{3,}")
+                | select(. as $word
+                  | ["about", "after", "also", "been", "could", "from", "have",
+                     "into", "issue", "just", "more", "other", "should", "some",
+                     "than", "that", "their", "there", "these", "they", "this",
+                     "those", "through", "using", "very", "what", "when", "where",
+                     "which", "while", "will", "with", "would"]
+                  | index($word) == null)]
+              | unique | .[0:30]
+            ),
+            created_at: .createdAt
+          }]
+        | .[-100:]
+      ' "$cache" "$issue" > "$cache.tmp"
+      mv "$cache.tmp" "$cache"
 ---
 
 # Issue Duplication Detector
@@ -35,31 +92,19 @@ You are an AI agent that detects potentially duplicate issues in this repository
 
 ## Your Task
 
-When a new issue is opened, analyze it to determine if it might be a duplicate of an existing issue.
+When a new issue is opened, determine whether it might duplicate an existing issue.
 
-1. **Load cached issue data**: Read the file `/tmp/gh-aw/cache-memory/issues.json` using bash (e.g., `cat /tmp/gh-aw/cache-memory/issues.json`). This file contains previously stored issue signatures from prior workflow runs.
+1. **Read the prepared data** with bash:
+   - `/tmp/gh-aw/agent/new-issue.json` contains the new issue's number, title, body, labels, and creation time.
+   - `/tmp/gh-aw/agent/cached-issues.json` contains up to 100 previously cached issue signatures, or `[]` on a cold start.
 
-   **Cold start handling**: If the file does not exist or is empty, this is a normal cold start — the cache has not been populated yet. Do NOT report `missing_data`. Still continue to step 2 to fetch the new issue details, skip step 3 because there is no cache to compare against, and then proceed to step 4 to search for issues via the GitHub API and populate the cache for future runs.
-
-2. **Fetch the new issue**: Use the `safeinputs-gh` tool to get the issue details with reliable authentication:
-   - Use the `safeinputs-gh` tool with args: `issue view ${{ github.event.issue.number }} --repo ${{ github.repository }} --json number,title,body,labels,createdAt`
-
-3. **Compare with cached issues** (skip if cache was empty):
+2. **Compare with cached issues**:
    - Compare the new issue's title and body against cached issue data
    - Look for similar titles (considering typos, rephrasing, synonyms)
    - Look for similar problem descriptions in the body
    - Consider keyword overlap and semantic similarity
 
-4. **Search for potential duplicates via GitHub API**: Always search GitHub for issues with similar keywords, whether or not the cache had data. Use the `safeinputs-gh` tool for reliable API access:
-   - Use the `safeinputs-gh` tool with args: `search issues "<key terms>" --repo ${{ github.repository }} --state open --limit 10 --json number,title,body`
-   - Use the `safeinputs-gh` tool with args: `issue list --repo ${{ github.repository }} --state open --limit 20 --json number,title,body,labels`
-   - Focus on open issues first, then consider recently closed ones
-
-5. **Update the cache**: Store the new issue's signature in the cache-memory for future comparisons:
-   - Write to `/tmp/gh-aw/cache-memory/issues.json` using bash (e.g., write the JSON content with `cat > /tmp/gh-aw/cache-memory/issues.json << 'EOF'`)
-   - Include: issue number, title, key phrases extracted from body, creation date
-   - Merge with existing cache data if the file already existed
-   - Keep the cache size manageable (store last 100 issues max)
+3. **Search for potential duplicates**: Always use GitHub search to find up to 10 open issues with similar key terms in `${{ github.repository }}`. Consider recently closed issues when relevant. Do not list all open issues.
 
 ## Duplicate Detection Criteria
 
@@ -72,6 +117,7 @@ Consider an issue a potential duplicate if ANY of these conditions are met:
 ## Output Behavior
 
 **If duplicates are found**: Add a helpful comment to the new issue:
+- Set `item_number` to the `number` from `/tmp/gh-aw/agent/new-issue.json`, including for manual workflow runs.
 - List the potential duplicate issues with links
 - Briefly explain why they appear similar
 - Be polite and acknowledge this is automated detection
@@ -79,24 +125,10 @@ Consider an issue a potential duplicate if ANY of these conditions are met:
 
 **If no duplicates found**: Do not add a comment. Use the noop safe-output.
 
-## Example Comment Format
-
-```
-👋 Hello! I noticed this issue might be related to existing issues:
-
-- #123 - Similar title about [topic]
-- #456 - Describes the same error message
-
-If one of these addresses your concern, please consider closing this issue as a duplicate. Otherwise, feel free to clarify how your issue differs!
-
-*This is an automated message from the issue duplication detector.*
-```
-
 ## Guidelines
 
 - Be conservative: Only flag issues that are clearly similar
 - Provide value: Don't spam with low-confidence matches
 - Be helpful: Always explain why issues appear related
-- Respect the cache: Keep stored data minimal and relevant
-- Use pagination: Always use `--limit` when listing/searching issues with `gh issue list` or `gh search issues`, and `--paginate` or `--per-page` when using `gh api`
-- **Prefer `safeinputs-gh` tool over MCP tools for GitHub API access**: The `safeinputs-gh` tool uses the automatic `GITHUB_TOKEN` which is always valid, whereas MCP tools may use a separate token that can expire. Use `safeinputs-gh` with args like `issue view`, `issue list`, `search issues`, and `api` for reliable access.
+- Explain that detection is automated and suggest reviewing linked issues
+- Respect the cached signatures and specify a result limit for every search

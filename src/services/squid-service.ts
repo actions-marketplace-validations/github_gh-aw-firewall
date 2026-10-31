@@ -5,6 +5,7 @@ import type { RuntimeImageName } from '../image-resolver';
 import { logger } from '../logger';
 import { WrapperConfig } from '../types';
 import { applyHostPathPrefixToVolumes } from './host-path-prefix';
+import { SNI_GUARD_CERT_PATH, SNI_GUARD_KEY_PATH } from '../squid/ssl-bump';
 
 /** Network configuration passed to service builders */
 export interface NetworkConfig {
@@ -33,6 +34,17 @@ interface SquidServiceParams {
   squidLogsPath: string;
   imageConfig: ImageBuildConfig;
 }
+
+/**
+ * AWF-owned top-level Squid log files repaired during container preflight.
+ * Keep this explicit instead of globbing or recursive chowning so startup does
+ * not traverse user-provided proxy log directories.
+ */
+export const SQUID_LOG_FILES = [
+  '/var/log/squid/access.log',
+  '/var/log/squid/audit.jsonl',
+  '/var/log/squid/cache.log',
+] as const;
 
 /**
  * Builds the Squid proxy service configuration for Docker Compose.
@@ -80,6 +92,16 @@ export function buildSquidService(params: SquidServiceParams): any {
       start_period: '5s',
     },
     ports: [`${SQUID_PORT}:${SQUID_PORT}`],
+    // Squid runs as PID 1 in the foreground (`exec squid -N`); if the process
+    // itself crashes (e.g. transient resource pressure from many concurrent
+    // proxied builds), the container exits and its network endpoint is torn
+    // down. Without a restart policy, peers that already resolved Squid's IP
+    // (e.g. the agent, via HTTP_PROXY/HTTPS_PROXY) see a bare `EHOSTUNREACH`
+    // on their next connection attempt instead of a quick self-heal. Bound the
+    // retry count so persistent startup failures (bad config, missing certs)
+    // still surface promptly via the existing exited/unhealthy detection in
+    // didContainerFailStartup() once retries are exhausted.
+    restart: 'on-failure:3',
     // Security hardening: Drop unnecessary capabilities
     // Squid only needs network capabilities, not system administration capabilities
     cap_drop: [
@@ -123,17 +145,32 @@ export function buildSquidService(params: SquidServiceParams): any {
   // already owned by the proxy user on a FS that denies root chown), we fall
   // back to chmod 0777 — the same strategy as config-writer.ts — so the
   // container does not exit when the directory is already writable.
-  // The chown is non-recursive (no -R): only the bind-mount dir's own
-  // ownership is repaired, not its (potentially large) contents.
+  // The chown is non-recursive (no -R): it repairs the bind-mount dir's own
+  // ownership plus AWF's known top-level Squid log files, not its (potentially
+  // large) contents. Existing log files can be left behind when topology mode
+  // starts Squid once to create the internal network and Compose then recreates
+  // Squid after patching topology peer host entries.
   //
   // Use $$ to escape $ for Docker Compose variable interpolation.
   // Docker Compose interprets $VAR as variable substitution in YAML values;
   // $$ produces a literal $ that the shell inside the container will expand.
   const SQUID_PROXY_USER = 'proxy';
+  const squidLogFiles = SQUID_LOG_FILES.join(' ');
+  const logFilePreflight =
+    `; for f in ${squidLogFiles}; do ` +
+    `if [ -L "$$f" ] || [ -e "$$f" ]; then chown -h ${SQUID_PROXY_USER}:${SQUID_PROXY_USER} "$$f" 2>/dev/null || true; fi; ` +
+    `done`;
   const chownPreflight =
     `chown ${SQUID_PROXY_USER}:${SQUID_PROXY_USER} /var/log/squid 2>/dev/null || chmod 0777 /var/log/squid` +
+    logFilePreflight +
     `; if [ -d /var/spool/squid_ssl_db ]; then chown ${SQUID_PROXY_USER}:${SQUID_PROXY_USER} /var/spool/squid_ssl_db 2>/dev/null || chmod 0777 /var/spool/squid_ssl_db; fi`;
   const dropToProxy = `exec su -s /bin/bash ${SQUID_PROXY_USER} -c`;
+  const initializeSniGuard =
+    `if grep -Fq "cert=${SNI_GUARD_CERT_PATH}" /etc/squid/squid.conf; then ` +
+    `echo "[squid-entrypoint] Generating ephemeral TLS SNI guard certificate"; ` +
+    `(umask 077; openssl req -x509 -newkey rsa:2048 -sha256 -nodes -days 1 ` +
+    `-subj "/CN=awf-sni-guard.invalid" -keyout ${SNI_GUARD_KEY_PATH} ` +
+    `-out ${SNI_GUARD_CERT_PATH} >/dev/null 2>&1); fi`;
 
   squidService.user = '0:0';
   if (squidConfigContent) {
@@ -147,7 +184,7 @@ export function buildSquidService(params: SquidServiceParams): any {
     // entrypoint's later sed -i succeeds), then exec the image entrypoint.
     squidService.entrypoint = [
       '/bin/bash', '-c',
-      `${chownPreflight} && ${dropToProxy} 'echo "$$AWF_SQUID_CONFIG_B64" | base64 -d > /etc/squid/squid.conf && exec /usr/local/bin/entrypoint.sh'`,
+      `${chownPreflight} && ${dropToProxy} 'echo "$$AWF_SQUID_CONFIG_B64" | base64 -d > /etc/squid/squid.conf && ${initializeSniGuard} && exec /usr/local/bin/entrypoint.sh'`,
     ];
   } else {
     // No config injection — just chown + drop + run the image entrypoint.

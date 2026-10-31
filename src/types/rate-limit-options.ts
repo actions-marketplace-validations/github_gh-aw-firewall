@@ -4,7 +4,20 @@
 
 import type { RateLimitConfig } from './rate-limit';
 
+export interface ModelCatalogueOptions {
+  enabled?: boolean;
+  offline?: boolean;
+  source?: string;
+  trustSource?: boolean;
+  localSnapshot?: Record<string, unknown>;
+  maxAgeSeconds?: number;
+  refreshSeconds?: number;
+  timeoutMs?: number;
+  cacheDirectory?: string;
+}
+
 export interface RateLimitOptions {
+  modelCatalogue?: ModelCatalogueOptions;
   /**
    * Rate limiting configuration for the API proxy sidecar
    *
@@ -16,61 +29,79 @@ export interface RateLimitOptions {
   rateLimitConfig?: RateLimitConfig;
 
   /**
-   * Maximum total effective tokens allowed for the current AWF run.
-   *
-   * When set, the API proxy tracks effective token usage across requests and
-   * rejects additional requests once this limit is reached.
-   */
-  maxEffectiveTokens?: number;
-
-  /**
    * Maximum total AI credits allowed for the current AWF run.
    *
    * When set, the API proxy tracks AI credits across responses using
    * model-specific pricing and rejects additional requests once this limit is
-   * reached.
+   * reached. Unpriced models are allowed with a warning; unpriced usage is
+   * excluded from totals, so actual spending may exceed this limit.
    */
   maxAiCredits?: number;
 
   /**
-   * Default AI credits pricing for models not in the built-in pricing table.
+   * Default AI credits pricing for models not resolved by another pricing source.
    *
-   * When maxAiCredits is active and the api-proxy encounters a model not in its
-   * pricing table, it uses these rates as a fallback. If not set and the model
-   * is unrecognized, the request is rejected with HTTP 400 (type:
-   * unknown_model_ai_credits) to prevent unaccounted spending.
+   * When the api-proxy encounters a model without resolvable pricing, it uses
+   * these rates as a fallback. If not set, the request proceeds with a warning
+   * and unpriced usage is excluded from AI-credit totals.
    *
-   * Rates are per 1 million tokens in dollars.
+   * Rates are per 1 million tokens in dollars. Reasoning tokens use the output
+   * rate unless a distinct reasoning rate is supplied.
    *
-   * @example { input: 3.0, output: 15.0, cachedInput: 0.3, cacheWrite: 3.75 }
+   * @example { input: 3.0, output: 15.0, cachedInput: 0.3, cacheWrite: 3.75, reasoning: 15.0 }
    */
-  defaultAiCreditsPricing?: { input: number; output: number; cachedInput?: number; cacheWrite?: number | null };
+  defaultAiCreditsPricing?: {
+    input: number;
+    output: number;
+    cachedInput?: number;
+    cacheWrite?: number | null;
+    reasoning?: number;
+  };
 
   /** Provider/model pricing overlays in models.dev provider format. */
   apiProxyProviders?: Record<string, unknown>;
 
   /**
-   * Model-specific multipliers used by effective token accounting.
+   * Versioned provider-scoped model prices supplied by the workflow compiler.
+   * Rates use USD per million tokens and are consumed offline by the API proxy.
+   */
+  modelPricingCatalog?: {
+    schemaVersion: 1;
+    unit: 'USD_PER_1M_TOKENS';
+    catalogId: string;
+    version: string;
+    providers: Record<string, {
+      models: Record<string, {
+        input: number;
+        output: number;
+        cachedInput: number;
+        cacheWrite: number | null;
+        reasoning: number;
+      }>;
+    }>;
+  };
+
+  /**
+   * Model-specific multipliers used by the model multiplier cap.
    *
    * Keys are model names and values are positive numeric multipliers.
    * Resolution uses exact match first, then a hyphen-suffix prefix match
    * (for example `claude-opus-4.7` matches `claude-opus-4.7-20260501`).
-   * Models that still do not match use `effectiveTokenDefaultModelMultiplier`
-   * when set, otherwise the highest configured multiplier.
+   * Models that still do not match use `defaultModelMultiplier` when set,
+   * otherwise the multiplier defaults to 1.
    */
-  effectiveTokenModelMultipliers?: Record<string, number>;
+  modelMultipliers?: Record<string, number>;
 
   /**
-   * Default multiplier used for models not present in
-   * `effectiveTokenModelMultipliers`.
+   * Default multiplier used for models not present in `modelMultipliers`.
    */
-  effectiveTokenDefaultModelMultiplier?: number;
+  defaultModelMultiplier?: number;
 
   /**
    * Maximum allowed model multiplier for the current AWF run.
    *
    * When set, the API proxy resolves each incoming request's model against the
-   * configured `effectiveTokenModelMultipliers` (and `effectiveTokenDefaultModelMultiplier`)
+   * configured `modelMultipliers` (and `defaultModelMultiplier`)
    * and rejects any request whose resolved multiplier exceeds this cap with
    * HTTP 400 and error type `model_multiplier_cap_exceeded`.
    *
@@ -114,15 +145,12 @@ export interface RateLimitOptions {
   maxCacheMisses?: number;
 
   /**
-   * Enable effective token budget steering warnings in the API proxy
+   * Enable runtime and AI-credit steering warnings in the API proxy.
    *
-   * When true, the api-proxy injects budget-warning system messages into outgoing
-   * LLM requests when cumulative usage crosses the configured thresholds (80%, 90%,
-   * 95%, 99%). This nudges the agent to wrap up before hitting the hard limit.
-   * When false (the default), no steering messages are injected.
-   *
-   * Requires `maxEffectiveTokens` to be set. Has no effect without a configured
-   * effective token budget.
+   * When true, the api-proxy injects advisory messages into the next eligible
+   * outbound request at 80%, 90%, 95%, and 99% of configured budgets/deadlines.
+   * Messages are not an interruption or guarantee of completion. When false
+   * (the default), no steering messages are injected.
    *
    * @default false
    */

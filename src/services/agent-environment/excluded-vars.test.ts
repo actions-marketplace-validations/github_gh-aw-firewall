@@ -29,10 +29,10 @@ describe('buildExclusionSet', () => {
         'AWF_ENCLAVE_MCP_GATEWAY_ENDPOINT',
         'AWF_ENCLAVE_MCP_GATEWAY_CONTAINER',
         'AWF_ENCLAVE_MCP_READINESS_TIMEOUT_MS',
-        'MCP_GATEWAY_ENCLAVE_CAPABILITY_KEY',
-        'AWF_ENCLAVE_GITHUB_PROXY_CONTAINER',
-        'AWF_ENCLAVE_GITHUB_PROXY_IDENTITY',
-        'AWF_ENCLAVE_GITHUB_PROXY_CA_CERT',
+        'AWF_ENCLAVE_GITHUB_MCP_AGENT_ID',
+        'AWF_ENCLAVE_GITHUB_EXECUTOR_CAPABILITY',
+        'AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_CAPABILITY',
+        'AWF_ENCLAVE_GITHUB_DELEGATION_CONTROL_ENDPOINT',
       ]) {
         expect(excluded.has(name)).toBe(true);
       }
@@ -65,6 +65,7 @@ describe('buildExclusionSet', () => {
       expect(set.has('AWF_PREFLIGHT_BINARY')).toBe(true);
       expect(set.has('AWF_STAGED_RUNNER_BINARY_NAME')).toBe(true);
       expect(set.has('AWF_GEMINI_ENABLED')).toBe(true);
+      expect(set.has('AWF_RESOLVED_CONFIG')).toBe(true);
       expect(set.has('MCP_GATEWAY_HOST_DOMAIN')).toBe(true);
     });
 

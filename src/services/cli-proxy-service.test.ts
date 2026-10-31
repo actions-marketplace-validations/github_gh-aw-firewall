@@ -1,4 +1,5 @@
 import { isExternalDifcProxyHost, normalizeLoopbackDifcHost } from './cli-proxy-service';
+import { getSafeHostGid, getSafeHostUid } from '../host-identity';
 import { generateDockerCompose, WrapperConfig, baseConfig, mockNetworkConfig, useTempWorkDir } from './service-test-setup.test-utils';
 
 // Create mock functions (must remain per-file — jest.mock() is hoisted before imports)
@@ -40,7 +41,7 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         expect(result.services['cli-proxy']).toBeDefined();
         const proxy = result.services['cli-proxy'] as any;
         expect(proxy.container_name).toBe('awf-cli-proxy');
-        expect(proxy.user).toBeUndefined();
+        expect(proxy.user).toBe(`${getSafeHostUid()}:${getSafeHostGid()}`);
         // cli-proxy gets its own IP on awf-net (no shared network namespace)
         expect((proxy.networks as any)['awf-net'].ipv4_address).toBe('172.30.0.50');
         expect(proxy.network_mode).toBeUndefined();
@@ -63,6 +64,13 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
         const proxy = result.services['cli-proxy'];
         expect(proxy.extra_hosts).toEqual({ 'host.docker.internal': 'host-gateway' });
+      });
+
+      it('should disable inherited DNS search domains so peer names resolve directly', () => {
+        const configWithCliProxy = { ...mockConfig, difcProxyHost: 'awmg-cli-proxy:18443' };
+        const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
+        const proxy = result.services['cli-proxy'];
+        expect(proxy.dns_search).toEqual([]);
       });
 
       it('should mount CA cert as read-only volume when difcProxyCaCert is set', () => {
@@ -91,6 +99,19 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         const env = proxy.environment as Record<string, string>;
         expect(env.AWF_DIFC_PROXY_HOST).toBe('host.docker.internal');
         expect(env.AWF_DIFC_PROXY_PORT).toBe('18443');
+      });
+
+      it('should pass configured GitHub API point budgets only to cli-proxy', () => {
+        const configWithLimits = {
+          ...mockConfig,
+          difcProxyHost: 'host.docker.internal:18443',
+          maxGithubApiPointsRest: 2000,
+          maxGithubApiPointsGraphql: 1500,
+        };
+        const result = generateDockerCompose(configWithLimits, mockNetworkConfigWithCliProxy);
+        const env = result.services['cli-proxy'].environment as Record<string, string>;
+        expect(env.AWF_MAX_GITHUB_API_POINTS_REST).toBe('2000');
+        expect(env.AWF_MAX_GITHUB_API_POINTS_GRAPHQL).toBe('1500');
       });
 
       it('should route cli-proxy through a credential-free relay for an external topology target', () => {
@@ -221,6 +242,23 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         expect((proxy.healthcheck as any).test).toEqual(['CMD', 'curl', '-f', 'http://127.0.0.1:11000/health']);
       });
 
+      it.each([false, true])('should allow parallel gh threads while retaining resource limits (networkIsolation=%s)', (networkIsolation) => {
+        const configWithCliProxy = {
+          ...mockConfig,
+          difcProxyHost: 'host.docker.internal:18443',
+          networkIsolation,
+        };
+        const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
+        const proxy = result.services['cli-proxy'];
+        expect(proxy.pids_limit).toBe(256);
+        expect(proxy.mem_limit).toBe('256m');
+        expect(proxy.memswap_limit).toBe('256m');
+        expect(proxy.cpu_shares).toBe(256);
+        if (networkIsolation) {
+          expect(result.services['cli-proxy-egress'].pids_limit).toBe(20);
+        }
+      });
+
       it('should drop all capabilities from cli-proxy', () => {
         const configWithCliProxy = { ...mockConfig, difcProxyHost: 'host.docker.internal:18443' };
         const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
@@ -243,6 +281,8 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         const agent = result.services['agent'];
         const env = agent.environment as Record<string, string>;
         expect(env.AWF_CLI_PROXY_URL).toBe('http://172.30.0.50:11000');
+        expect(env.NO_PROXY.split(',')).toEqual(expect.arrayContaining(['172.30.0.50', 'cli-proxy']));
+        expect(env.no_proxy).toBe(env.NO_PROXY);
       });
 
       it('should set AWF_CLI_PROXY_IP in agent environment using cli-proxy IP', () => {
@@ -286,7 +326,7 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         expect(dependsOn['cli-proxy-mcpg']).toBeUndefined();
       });
 
-      it('should pass GH_TOKEN to cli-proxy environment when available', () => {
+      it('should use a non-secret placeholder instead of GH_TOKEN', () => {
         const originalGhToken = process.env.GH_TOKEN;
         try {
           process.env.GH_TOKEN = 'ghp_cli_proxy_test_token';
@@ -294,7 +334,8 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
           const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
           const proxy = result.services['cli-proxy'];
           const env = proxy.environment as Record<string, string>;
-          expect(env.GH_TOKEN).toBe('ghp_cli_proxy_test_token');
+          expect(env.GH_TOKEN).toBe('awf-cli-proxy-placeholder');
+          expect(JSON.stringify(proxy)).not.toContain('ghp_cli_proxy_test_token');
         } finally {
           if (originalGhToken !== undefined) {
             process.env.GH_TOKEN = originalGhToken;
@@ -304,7 +345,7 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         }
       });
 
-      it('should fall back to GITHUB_TOKEN for cli-proxy when GH_TOKEN is absent', () => {
+      it('should not copy GITHUB_TOKEN into cli-proxy when GH_TOKEN is absent', () => {
         const originalGhToken = process.env.GH_TOKEN;
         const originalGithubToken = process.env.GITHUB_TOKEN;
         try {
@@ -314,7 +355,8 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
           const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
           const proxy = result.services['cli-proxy'];
           const env = proxy.environment as Record<string, string>;
-          expect(env.GH_TOKEN).toBe('ghp_github_token_fallback');
+          expect(env.GH_TOKEN).toBe('awf-cli-proxy-placeholder');
+          expect(JSON.stringify(proxy)).not.toContain('ghp_github_token_fallback');
         } finally {
           if (originalGhToken !== undefined) {
             process.env.GH_TOKEN = originalGhToken;
@@ -329,7 +371,7 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
         }
       });
 
-      it('should not set GH_TOKEN in cli-proxy when neither GH_TOKEN nor GITHUB_TOKEN is set', () => {
+      it('should use the placeholder when no ambient GitHub token is set', () => {
         const originalGhToken = process.env.GH_TOKEN;
         const originalGithubToken = process.env.GITHUB_TOKEN;
         try {
@@ -339,7 +381,7 @@ describe('CLI proxy sidecar (external DIFC proxy)', () => {
           const result = generateDockerCompose(configWithCliProxy, mockNetworkConfigWithCliProxy);
           const proxy = result.services['cli-proxy'];
           const env = proxy.environment as Record<string, string>;
-          expect(env.GH_TOKEN).toBeUndefined();
+          expect(env.GH_TOKEN).toBe('awf-cli-proxy-placeholder');
         } finally {
           if (originalGhToken !== undefined) {
             process.env.GH_TOKEN = originalGhToken;

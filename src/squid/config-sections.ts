@@ -1,12 +1,14 @@
 import type { SquidConfig } from '../types';
 import { generateDlpSquidConfig } from '../dlp';
 import { DEFAULT_DNS_SERVERS } from '../dns-resolver';
-import { generateSslBumpSection } from './ssl-bump';
+import { generateSslBumpSection, generateTlsSniGuardSection } from './ssl-bump';
 import { validateAndSanitizeHostAccessPort, validateApiProxyPort } from './validation';
 import { formatDomainForSquid } from './domain-acl';
+import { parseDomainList } from '../domain-matchers';
 
 type DomainsByProto = ReturnType<typeof import('./domain-acl').parseDomainConfig>['domainsByProto'];
 type PatternsByProto = ReturnType<typeof import('./domain-acl').parseDomainConfig>['patternsByProto'];
+const IPV4_REGEX = /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/;
 
 function generateDlpSections(enableDlp?: boolean): {
   aclSection: string;
@@ -31,6 +33,8 @@ function generateSslSections(options: {
   urlPatterns?: string[];
   domainsByProto: DomainsByProto;
   patternsByProto: PatternsByProto;
+  blockedDomains?: string[];
+  apiProxyIp?: string;
   cliProxyIp?: string;
 }): {
   portConfig: string;
@@ -39,9 +43,9 @@ function generateSslSections(options: {
 } {
   const { port, sslBump, caFiles, sslDbPath, urlPatterns, domainsByProto, patternsByProto, cliProxyIp } = options;
 
-  let sslBumpSection = '';
+  let sslBumpSection: string;
   let sslBumpUrlAccessSection = '';
-  let portConfig = `http_port ${port}\nhttp_port [::]:${port}`;
+  let portConfig: string;
 
   const hasPlainDomainsForSslBump = domainsByProto.both.length > 0;
   const hasPatternsForSslBump = patternsByProto.both.length > 0;
@@ -75,6 +79,32 @@ ${denyNonMatching}
 `;
     }
     portConfig = '';
+  } else {
+    const tlsDomains = [...domainsByProto.both, ...domainsByProto.https];
+    const tlsPlainDomains = tlsDomains.filter(domain => !IPV4_REGEX.test(domain));
+    const allowedIps = tlsDomains.filter(domain => IPV4_REGEX.test(domain));
+    const tlsDomainPatterns = [
+      ...patternsByProto.both.map(pattern => pattern.regex),
+      ...patternsByProto.https.map(pattern => pattern.regex),
+    ];
+    const normalizedBlockedDomains = (options.blockedDomains ?? []).map(
+      domain => domain.replace(/^https?:\/\//, '').replace(/\/$/, '')
+    );
+    const {
+      plainDomains: blockedPlainDomains,
+      patterns: blockedPatterns,
+    } = parseDomainList(normalizedBlockedDomains);
+    sslBumpSection = generateTlsSniGuardSection({
+      port,
+      plainDomains: tlsPlainDomains,
+      domainPatterns: tlsDomainPatterns,
+      blockedDomains: blockedPlainDomains.map(entry => entry.domain),
+      blockedDomainPatterns: blockedPatterns.map(pattern => pattern.regex),
+      allowedIps,
+      apiProxyIp: options.apiProxyIp,
+      cliProxyIp,
+    });
+    portConfig = '';
   }
 
   return {
@@ -87,7 +117,8 @@ ${denyNonMatching}
 function generatePortAclsAndRules(
   enableHostAccess?: boolean,
   allowHostPorts?: string,
-  apiProxyPorts?: number[]
+  apiProxyPorts?: number[],
+  otlpEndpoints?: SquidConfig['otlpEndpoints']
 ): string {
   let portAclsSection = `# Port ACLs
 acl SSL_ports port 443
@@ -108,6 +139,13 @@ acl Safe_ports port 443         # HTTPS`;
     for (const proxyPort of apiProxyPorts) {
       validateApiProxyPort(proxyPort);
       portAclsSection += `\nacl Safe_ports port ${proxyPort}     # AWF api-proxy sidecar`;
+    }
+  }
+
+  for (const port of [...new Set((otlpEndpoints ?? []).map(endpoint => endpoint.port))]) {
+    if (port !== 80 && port !== 443) {
+      const sanitizedPort = validateAndSanitizeHostAccessPort(String(port));
+      portAclsSection += `\nacl Safe_ports port ${sanitizedPort}     # OTLP collector endpoint`;
     }
   }
 
@@ -141,8 +179,6 @@ acl from_api_proxy src ${apiProxyIp}/32
 http_access allow from_api_proxy
 ` : '';
 }
-
-const IPV4_REGEX = /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/;
 
 /**
  * Generate allow rules for trusted topology-peer hostnames in network-isolation
@@ -201,7 +237,22 @@ function generateAllowedIpSection(domains: string[]): string {
 }
 
 function generateDnsSection(dnsServers?: string[]): string {
-  return `dns_nameservers ${(dnsServers && dnsServers.length > 0) ? dnsServers.join(' ') : DEFAULT_DNS_SERVERS.join(' ')}`;
+  const servers = (dnsServers && dnsServers.length > 0) ? dnsServers.join(' ') : DEFAULT_DNS_SERVERS.join(' ');
+  return `dns_nameservers ${servers}
+# A single transient upstream DNS failure (e.g. a SERVFAIL from an overloaded
+# resolver during concurrent container startup) must not turn into a sustained
+# false-positive block of an allowlisted domain. Squid's default
+# negative_dns_ttl (1 minute) caches that one failure and rejects every
+# request for the same domain for up to 60 seconds. Shrinking it means the
+# very next lookup attempt re-queries the resolver instead of replaying the
+# cached failure.
+negative_dns_ttl 1 seconds
+# Retry another configured nameserver quickly while keeping the total timeout
+# above the retry interval. If dns_timeout is equal to Squid's default
+# dns_retransmit_interval (5 seconds), Squid can hit the total timeout before
+# sending the retry to the fallback nameserver.
+dns_retransmit_interval 1 seconds
+dns_timeout 10 seconds`;
 }
 
 function generateConfigSections(options: {
@@ -212,6 +263,7 @@ function generateConfigSections(options: {
   sslDbPath?: string;
   urlPatterns?: string[];
   domains?: string[];
+  blockedDomains?: string[];
   domainsByProto: DomainsByProto;
   patternsByProto: PatternsByProto;
   enableHostAccess?: boolean;
@@ -220,6 +272,7 @@ function generateConfigSections(options: {
   apiProxyIp?: string;
   dnsServers?: string[];
   topologyPeers?: string[];
+  otlpEndpoints?: SquidConfig['otlpEndpoints'];
   cliProxyIp?: string;
 }): {
   dlpAclSection: string;
@@ -241,6 +294,7 @@ function generateConfigSections(options: {
     sslDbPath,
     urlPatterns,
     domains,
+    blockedDomains,
     domainsByProto,
     patternsByProto,
     enableHostAccess,
@@ -249,6 +303,7 @@ function generateConfigSections(options: {
     apiProxyIp,
     dnsServers,
     topologyPeers,
+    otlpEndpoints,
     cliProxyIp,
   } = options;
 
@@ -261,9 +316,11 @@ function generateConfigSections(options: {
     urlPatterns,
     domainsByProto,
     patternsByProto,
+    blockedDomains,
+    apiProxyIp,
     cliProxyIp,
   });
-  const portAclsAndRules = generatePortAclsAndRules(enableHostAccess, allowHostPorts, apiProxyPorts);
+  const portAclsAndRules = generatePortAclsAndRules(enableHostAccess, allowHostPorts, apiProxyPorts, otlpEndpoints);
   const apiProxySection = generateApiProxySection(apiProxyIp);
   const allowedIpSection = generateAllowedIpSection(domains ?? []);
   const topologyPeersSection = generateTopologyPeersSection(topologyPeers);

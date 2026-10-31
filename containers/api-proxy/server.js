@@ -13,9 +13,11 @@
 'use strict';
 
 const { logRequest } = require('./logging');
+const { getCatalogueLoader } = require('./catalogue-loader');
 const {
   MODEL_ALIASES,
   MODEL_FALLBACK,
+  MODEL_POLICY_CONFIG,
   parseModelFallbackConfig,
   makeModelBodyTransform: makeModelBodyTransformForProvider,
   filterResolvableAliases,
@@ -25,6 +27,7 @@ const {
 const {
   keyValidationResults,
   cachedModels,
+  getRuntimeModels,
   getRuntimeCatalogSnapshot,
   configureKeyValidation,
   resetKeyValidationState,
@@ -41,16 +44,19 @@ const {
 } = require('./key-validation');
 const { createProviderServer: createProviderServerFactory } = require('./server-factory');
 const { bootPrimary } = require('./startup');
+const { createProductionRoutingSession } = require('./routing-runtime');
+const { getFallbackModels, validateFallbackChain } = require('./model-fallback-chain');
 
 const {
+  configureFallbackProviders,
   proxyRequest,
   proxyWebSocket,
   checkRateLimit,
   limiter,
   HTTPS_PROXY,
   extractBillingHeaders,
-  getEffectiveTokenReflectState,
   getAiCreditsReflectState,
+  getTimeoutSteeringReflectState,
   getMaxRunsReflectState,
   getMaxCacheMissesReflectState,
   getPermissionDeniedReflectState,
@@ -98,6 +104,12 @@ if (!HTTPS_PROXY) {
 }
 
 const { createAllAdapters } = require('./providers');
+const {
+  resolveApiKey,
+  resolveCopilotAuthToken,
+  deriveCopilotApiTarget,
+  isGithubCopilotCatalogTarget,
+} = require('./providers/copilot-auth');
 
 /**
  * Model cache keys of the provider slots that are actually configured for this
@@ -121,6 +133,11 @@ function makeModelBodyTransform(provider) {
     cachedModels,
     refreshProviderModelsForResolution,
     getConfiguredModelCacheKeys,
+    getRuntimeModels,
+    provider === 'copilot' &&
+      !resolveApiKey(process.env) &&
+      Boolean(resolveCopilotAuthToken(process.env)) &&
+      isGithubCopilotCatalogTarget(deriveCopilotApiTarget(process.env)),
   );
 }
 
@@ -130,81 +147,107 @@ const registeredAdapters = createAllAdapters(process.env, {
   copilotBodyTransform: makeModelBodyTransform('copilot'),
   geminiBodyTransform: makeModelBodyTransform('gemini'),
 });
+const getRegisteredAdapter = provider => registeredAdapters.find(adapter => adapter.name === provider);
+configureFallbackProviders({ getAdapter: getRegisteredAdapter });
+
+/**
+ * Validate provider-qualified apiProxy.fallbackModels entries against the
+ * configured adapters.
+ *
+ * @returns {string[]} Actionable configuration errors
+ */
+function validateFallbackModelsConfig(env = process.env) {
+  return validateFallbackChain(getFallbackModels(env), getRegisteredAdapter);
+}
+
+const routing = createProductionRoutingSession({
+  getAdapter: provider => registeredAdapters.find(adapter => adapter.name === provider),
+});
 
 configureKeyValidation({
   getRegisteredAdapters: () => registeredAdapters,
   getModelAliases: () => MODEL_ALIASES,
 });
 
+function getFilteredModelAliases() {
+  if (!MODEL_ALIASES) return null;
+  const configuredProviders = getConfiguredModelCacheKeys();
+  return {
+    models: filterResolvableAliases(
+      MODEL_ALIASES.models,
+      filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
+      configuredProviders,
+    ),
+  };
+}
+
+function buildModelsSnapshot() {
+  const filteredAliases = getFilteredModelAliases();
+  return {
+    filteredAliases,
+    modelsJson: _buildModelsJson(
+      registeredAdapters,
+      cachedModels,
+      filteredAliases,
+      getRuntimeCatalogSnapshot(),
+    ),
+  };
+}
+
 const { healthResponse, reflectEndpoints, handleManagementEndpoint } = createManagementHandlers({
   getAdapters: () => registeredAdapters,
   getCachedModels: () => cachedModels,
   getRuntimeModelMetadata: () => getRuntimeCatalogSnapshot(),
+  getRoutingModelMetadata: () => Object.fromEntries(
+    registeredAdapters.map(adapter => [adapter.name, getRuntimeModels(adapter.name) || []]),
+  ),
   isModelFetchComplete: () => isModelFetchComplete(),
   getKeyValidationState: () => ({ complete: isKeyValidationComplete(), results: keyValidationResults }),
   getLimiter: () => limiter,
   httpsProxy: HTTPS_PROXY,
-  getModelAliases: () => {
-    if (!MODEL_ALIASES) return null;
-    const configuredProviders = getConfiguredModelCacheKeys();
-    return {
-      models: filterResolvableAliases(
-        MODEL_ALIASES.models,
-        filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
-        configuredProviders,
-      ),
-    };
-  },
+  getModelAliases: getFilteredModelAliases,
+  modelPolicy: MODEL_POLICY_CONFIG,
   getModelFallback: () => MODEL_FALLBACK,
   getEffectiveModelFallback: () => getEffectiveModelFallbackForReflect(registeredAdapters),
-  getEffectiveTokenUsage: () => getEffectiveTokenReflectState(),
   getAiCreditsUsage: () => getAiCreditsReflectState(),
+  getTimeoutSteeringUsage: () => getTimeoutSteeringReflectState(),
   getMaxRunsUsage: () => getMaxRunsReflectState(),
   getMaxCacheMissesUsage: () => getMaxCacheMissesReflectState(),
   getPermissionDeniedUsage: () => getPermissionDeniedReflectState(),
+  getRoutingState: () => routing?.getReflectState() ?? null,
+  modelBudgetEnabled: Boolean(process.env.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET),
 });
 
 function buildModelsJson() {
-  const configuredProviders = getConfiguredModelCacheKeys();
-  const filteredAliases = MODEL_ALIASES ? {
-    models: filterResolvableAliases(
-      MODEL_ALIASES.models,
-      filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
-      configuredProviders,
-    ),
-  } : null;
-  return _buildModelsJson(registeredAdapters, cachedModels, filteredAliases, getRuntimeCatalogSnapshot());
+  return buildModelsSnapshot().modelsJson;
 }
 
 function writeModelsJson(logDir) {
-  const configuredProviders = getConfiguredModelCacheKeys();
-  const filteredAliases = MODEL_ALIASES ? {
-    models: filterResolvableAliases(
-      MODEL_ALIASES.models,
-      filterAvailableModelsToConfiguredProviders(cachedModels, configuredProviders),
-      configuredProviders,
-    ),
-  } : null;
-  const modelsJson = _buildModelsJson(
-    registeredAdapters,
-    cachedModels,
-    filteredAliases,
-    getRuntimeCatalogSnapshot(),
-  );
+  const { filteredAliases, modelsJson } = buildModelsSnapshot();
   return _writeModelsJson(registeredAdapters, cachedModels, filteredAliases, logDir, modelsJson);
 }
 
-function createProviderServer(adapter) {
+function createProviderServer(adapter, catalogueReady) {
   return createProviderServerFactory(adapter, {
     handleManagementEndpoint,
     reflectEndpoints,
     checkRateLimit,
     proxyRequest,
     proxyWebSocket,
+    routing,
+    modelBudgetEnabled: Boolean(process.env.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET),
+    catalogueReady,
   });
 }
 
 if (require.main === module) {
+  const fallbackModelErrors = validateFallbackModelsConfig();
+  if (fallbackModelErrors.length > 0) {
+    for (const message of fallbackModelErrors) {
+      logRequest('error', 'fallback_models_invalid', { message });
+    }
+    process.exit(1);
+  }
   bootPrimary({
     registeredAdapters,
     createProviderServer,
@@ -218,11 +261,14 @@ if (require.main === module) {
     otelShutdown,
     logRequest,
     HTTPS_PROXY,
+    routing,
+    catalogue: getCatalogueLoader(),
   });
 }
 
 module.exports = {
   proxyRequest,
+  validateFallbackModelsConfig,
   proxyWebSocket,
   buildUpstreamPath,
   shouldStripHeader,

@@ -1,13 +1,75 @@
 'use strict';
 
+const { getFallbackReason } = require('./model-fallback-chain');
+
+/**
+ * Forward a fully buffered upstream (error) response to the client, emitting
+ * the same completion/auth/error diagnostics as the streaming path.
+ */
+function sendBufferedUpstreamResponse(proxyRes, responseBody, {
+  completionCtx, authErrCtx, initiatorSent, billingInfo, res, span, requestId,
+  logRequestCompletion, logUpstreamAuthError, logUpstreamErrorResponse, otel,
+  requestModel = null, requestTools = null, providerErrorBody,
+}) {
+  logRequestCompletion(proxyRes.statusCode, responseBody.length, initiatorSent, billingInfo, completionCtx);
+  logUpstreamAuthError(proxyRes.statusCode, { ...authErrCtx, responseBody });
+  if (typeof logUpstreamErrorResponse === 'function') {
+    logUpstreamErrorResponse(proxyRes.statusCode, {
+      ...authErrCtx,
+      requestModel,
+      requestTools,
+      transformed: providerErrorBody !== undefined,
+      responseHeaders: proxyRes.headers,
+      responseBody,
+      responseBodyBytes: responseBody.length,
+      responseBodyTruncated: false,
+      ...(providerErrorBody !== undefined ? { providerErrorBody } : {}),
+    });
+  }
+
+  const resHeaders = {
+    ...proxyRes.headers,
+    'x-request-id': requestId,
+    'content-length': String(responseBody.length),
+  };
+  delete resHeaders['transfer-encoding'];
+  authErrCtx?.req?.awfRouting?.onUpstreamResponseHeaders?.(proxyRes.headers);
+  res.awfUpstreamResponse = true;
+  res.writeHead(proxyRes.statusCode, resHeaders);
+  res.end(responseBody);
+  otel.endSpan(span, proxyRes.statusCode);
+}
+
+/**
+ * Handle a buffered fallback-eligible (5xx / 404) upstream response: switch to
+ * the next model in the ordered fallback chain when the failure is
+ * model-specific, otherwise forward the response unchanged.
+ *
+ * @returns {boolean} true when a fallback request was dispatched.
+ */
+function handleFallbackEligibleResponse(proxyRes, responseBody, ctx) {
+  const reason = getFallbackReason(proxyRes.statusCode, responseBody);
+  if (reason && typeof ctx.onModelFallback === 'function' &&
+      ctx.onModelFallback({
+        statusCode: proxyRes.statusCode,
+        reason,
+        abandon: () => sendBufferedUpstreamResponse(proxyRes, responseBody, ctx),
+      })) {
+    return true;
+  }
+  sendBufferedUpstreamResponse(proxyRes, responseBody, ctx);
+  return false;
+}
+
 function handle400WithRetry(proxyRes, requestHeaders, responseBody, {
   provider, requestId, hasRetried, onRetry,
   modelNotSupportedRetryCount, maxModelNotSupportedRetries, onModelNotSupportedRetry,
-  onModelEndpointBlockedRetry,
+  onModelEndpointBlockedRetry, onWireApiEndpointRetry = null, onModelFallback = null,
   completionCtx, authErrCtx, initiatorSent, billingInfo, res, span,
   parseDeprecatedHeaderFromBody, learnAndStripDeprecatedHeaderValue,
   parseModelNotSupportedFromBody, parseModelEndpointBlockedFromBody, logRequest, sanitizeForLog,
-  logRequestCompletion, logUpstreamAuthError, otel,
+  logRequestCompletion, logUpstreamAuthError, logUpstreamErrorResponse, otel,
+  requestModel = null, requestTools = null,
 }) {
   // ── (a) Deprecated beta-header retry (first attempt for anthropic/copilot) ──
   if (!hasRetried && (provider === 'anthropic' || provider === 'copilot')) {
@@ -24,15 +86,29 @@ function handle400WithRetry(proxyRes, requestHeaders, responseBody, {
     }
   }
 
+  const endpointBlocked = provider === 'copilot' && parseModelEndpointBlockedFromBody(responseBody);
+  let compatibilityError = null;
+  if (endpointBlocked && typeof onWireApiEndpointRetry === 'function') {
+    try {
+      if (onWireApiEndpointRetry()) return true;
+    } catch (err) {
+      compatibilityError = err?.code === 'unsupported_wire_api_feature' ? err : {
+        code: 'unsupported_wire_api_feature',
+        message: 'Cannot translate this Copilot request to the alternate wire API. Check the request fields, ' +
+          'or choose a model supporting the requested endpoint. AWF will not drop request features.',
+      };
+    }
+  }
+
   // ── (b) Permanent endpoint-blocked fallback (copilot only) ───────────────────
   // When Copilot rejects a model because it is not accessible via the requested
   // endpoint (e.g. gpt-5.4-mini on /chat/completions), this is a permanent
   // per-model restriction — not a transient catalogue issue.  Try the next
   // ranked candidate from the alias resolution if one is available.
   if (
-    provider === 'copilot' &&
+    endpointBlocked &&
     onModelEndpointBlockedRetry &&
-    parseModelEndpointBlockedFromBody(responseBody)
+    !res.headersSent
   ) {
     const { req } = authErrCtx;
     logRequest('warn', 'model_endpoint_blocked_fallback', {
@@ -43,6 +119,23 @@ function handle400WithRetry(proxyRes, requestHeaders, responseBody, {
     });
     const didRetry = onModelEndpointBlockedRetry();
     if (didRetry) return true;
+  }
+
+  // Prefer a compatible replacement to repeatedly sending a model the
+  // provider has already rejected. Without catalogue evidence or an explicit
+  // chain, retain the bounded transient retry below.
+  if (typeof onModelFallback === 'function') {
+    const reason = getFallbackReason(proxyRes.statusCode, responseBody);
+    const abandon = () => sendBufferedUpstreamResponse(proxyRes, responseBody, {
+      completionCtx, authErrCtx, initiatorSent, billingInfo, res, span, requestId,
+      logRequestCompletion, logUpstreamAuthError, logUpstreamErrorResponse, otel,
+      requestModel, requestTools,
+    });
+    if (reason && onModelFallback({
+      statusCode: proxyRes.statusCode,
+      reason: endpointBlocked ? 'model_endpoint_incompatible' : reason,
+      abandon,
+    })) return true;
   }
 
   // ── (c) Transient model-not-supported retry (copilot only, up to MAX) ──────
@@ -63,7 +156,29 @@ function handle400WithRetry(proxyRes, requestHeaders, responseBody, {
     return true;
   }
 
-  // ── (d) Model-unavailable diagnostic (non-retryable model-not-supported 400) ───
+  // AWF replaces the provider's rejection with its own envelope. The
+  // upstream-errors record keeps the provider's error identifiers, while the
+  // routing request record attributes the rewritten response to AWF.
+  let providerErrorBody;
+  if (endpointBlocked) {
+    providerErrorBody = { responseBody, contentEncoding: proxyRes.headers?.['content-encoding'] };
+    const code = compatibilityError?.code || 'model_endpoint_incompatible';
+    const req = authErrCtx?.req;
+    if (req?.awfRouting) req.awfRouting.localError = { code, type: 'invalid_request_error' };
+    responseBody = Buffer.from(JSON.stringify({
+      error: {
+        code,
+        type: 'invalid_request_error',
+        message: compatibilityError?.message ||
+          `Copilot model "${requestModel || '(unknown)'}" is unavailable on the selected wire API. ` +
+          'Choose a model supporting the requested endpoint and request features, or configure an explicit ' +
+          'model alias/fallback policy. AWF will not drop request features or silently select another model.',
+      },
+    }));
+    proxyRes = { statusCode: 400, headers: { 'content-type': 'application/json' } };
+  }
+
+  // ── (e) Model-unavailable diagnostic (non-retryable model-not-supported 400) ───
   if (proxyRes.statusCode === 400 && parseModelNotSupportedFromBody(responseBody)) {
     const { req } = authErrCtx;
     logRequest('error', 'model_unavailable', {
@@ -78,21 +193,16 @@ function handle400WithRetry(proxyRes, requestHeaders, responseBody, {
     });
   }
 
-  logRequestCompletion(proxyRes.statusCode, responseBody.length, initiatorSent, billingInfo, completionCtx);
-  logUpstreamAuthError(proxyRes.statusCode, { ...authErrCtx, responseBody });
-
-  const resHeaders = {
-    ...proxyRes.headers,
-    'x-request-id': requestId,
-    'content-length': String(responseBody.length),
-  };
-  delete resHeaders['transfer-encoding'];
-  res.writeHead(proxyRes.statusCode, resHeaders);
-  res.end(responseBody);
-  otel.endSpan(span, proxyRes.statusCode);
+  sendBufferedUpstreamResponse(proxyRes, responseBody, {
+    completionCtx, authErrCtx, initiatorSent, billingInfo, res, span, requestId,
+    logRequestCompletion, logUpstreamAuthError, logUpstreamErrorResponse, otel,
+    requestModel, requestTools, providerErrorBody,
+  });
   return false;
 }
 
 module.exports = {
   handle400WithRetry,
+  handleFallbackEligibleResponse,
+  sendBufferedUpstreamResponse,
 };

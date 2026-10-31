@@ -54,6 +54,16 @@ describe('awf-config.schema.json', () => {
     expect(validate.errors).toBeNull();
   });
 
+  it('accepts trusted enclave repository sensitivity', () => {
+    expect(validate({
+      enclaves: [{
+        script: {},
+        repos: [{ repo: 'github/gh-aw', sensitivity: 'trusted' }],
+      }],
+    })).toBe(true);
+    expect(validate.errors).toBeNull();
+  });
+
   it('accepts a full valid config', () => {
     const valid = {
       $schema: 'https://github.com/github/gh-aw-firewall/releases/latest/download/awf-config.schema.json',
@@ -73,7 +83,6 @@ describe('awf-config.schema.json', () => {
         caCert: '/path/to/api-proxy-ca.crt',
         anthropicAutoCache: true,
         anthropicCacheTailTtl: '5m',
-        maxEffectiveTokens: 100000,
         maxAiCredits: 5.5,
         modelMultipliers: {
           'gpt-4o': 2,
@@ -206,11 +215,14 @@ describe('awf-config.schema.json', () => {
     expect(validate({ apiProxy: { anthropicCacheTailTtl: '1h' } })).toBe(true);
   });
 
-  it('validates effective-token guard apiProxy fields', () => {
-    expect(validate({ apiProxy: { maxEffectiveTokens: 1000 } })).toBe(true);
-    expect(validate({ apiProxy: { maxEffectiveTokens: 0 } })).toBe(false);
+  it('validates AI-credit and model multiplier apiProxy fields', () => {
+    expect(validate({ apiProxy: { maxEffectiveTokens: 1000 } })).toBe(false);
     expect(validate({ apiProxy: { maxAiCredits: 1.2 } })).toBe(true);
-    expect(validate({ apiProxy: { maxAiCredits: 0 } })).toBe(false);
+    expect(validate({ apiProxy: { maxAiCredits: 0 } })).toBe(true);
+    expect(validate({ apiProxy: { maxAiCredits: -1 } })).toBe(true);
+    expect(validate({ apiProxy: { maxAiCredits: -2 } })).toBe(false);
+    expect(validate({ apiProxy: { maxAiCredits: -0.5 } })).toBe(false);
+    expect(validate({ apiProxy: { maxAiCredits: 10001 } })).toBe(true);
     expect(validate({ apiProxy: { modelMultipliers: { 'gpt-4o': 2, 'claude': 1.5 } } })).toBe(true);
     expect(validate({ apiProxy: { modelMultipliers: { 'gpt-4o': 0 } } })).toBe(false);
     expect(validate({ apiProxy: { defaultModelMultiplier: 27 } })).toBe(true);
@@ -222,6 +234,13 @@ describe('awf-config.schema.json', () => {
   it('accepts apiProxy.requestedModel as a string', () => {
     expect(validate({ apiProxy: { requestedModel: 'gpt-4o' } })).toBe(true);
     expect(validate({ apiProxy: { requestedModel: 123 } })).toBe(false);
+  });
+
+  it('validates apiProxy.fallbackModels as an ordered list of model IDs', () => {
+    expect(validate({ apiProxy: { fallbackModels: ['gpt-5.4', 'claude-sonnet-4.6'] } })).toBe(true);
+    expect(validate({ apiProxy: { fallbackModels: 'gpt-5.4' } })).toBe(false);
+    expect(validate({ apiProxy: { fallbackModels: [''] } })).toBe(false);
+    expect(validate({ apiProxy: { fallbackModels: ['a', 'a'] } })).toBe(false);
   });
 
   it('accepts apiProxy.modelRouter with string fields', () => {
@@ -257,6 +276,15 @@ describe('awf-config.schema.json', () => {
   it('accepts container.runnerToolCachePath as a string', () => {
     expect(validate({ container: { runnerToolCachePath: '/opt/hostedtoolcache' } })).toBe(true);
     expect(validate({ container: { runnerToolCachePath: 123 } })).toBe(false);
+  });
+
+  it('validates Cloud Hypervisor mount policies', () => {
+    expect(validate({ cloudHypervisor: { mountPolicy: 'workspace-only' } })).toBe(true);
+    expect(validate({
+      cloudHypervisor: { mountPolicy: 'workspace-and-tool-cache' },
+    })).toBe(true);
+    expect(validate({ cloudHypervisor: { mountPolicy: 'automatic' } })).toBe(false);
+    expect(validate({ cloudHypervisor: { mountPolicy: true } })).toBe(false);
   });
 
   it('accepts valid container.mounts array', () => {

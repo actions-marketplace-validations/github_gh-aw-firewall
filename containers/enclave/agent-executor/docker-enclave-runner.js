@@ -7,6 +7,7 @@ const {
   buildRemoveArgs,
   deriveEnclaveContainerSpec,
   normalizeTimeoutMs,
+  withDynamicBinding,
 } = require('./enclave-runner-spec');
 
 /**
@@ -20,18 +21,30 @@ class DockerEnclaveRunner {
     this.config = config;
     this.runtimeName = runtimeName;
     this.docker = deps.docker || defaultDockerClient;
+    this.nowMs = deps.nowMs || Date.now;
     this.cleanupTail = Promise.resolve();
   }
 
-  async assertNetworkIsolated() {
-    const expectedMembers = ['awf-enclave-agent-api-proxy@172.31.0.30/24,'];
-    if (this.config.githubEnabled) {
-      expectedMembers.push('awf-enclave-agent-cli-proxy@172.31.0.40/24,');
+  async assertNetworkIsolated(requireGithubGateway = true) {
+    const proxyMember = 'awf-enclave-agent-api-proxy@172.31.0.30/24,';
+    const expectedMemberSets = [[proxyMember]];
+    // Both the static issues-read-v1 profile and a dynamic entry attach the
+    // compiler-owned shared gateway to this network: static invocations
+    // authenticate with the job-lifetime agent identity, dynamic ones with a
+    // per-invocation delegated bearer. Either way the steady state has exactly
+    // these two members.
+    if (this.config.githubEnabled || this.config.dynamicEnabled) {
+      const steadyStateMembers = [
+        proxyMember,
+        `${this.config.githubGatewayContainer}@172.31.0.40/24,`,
+      ];
+      if (requireGithubGateway) expectedMemberSets.splice(0, 1, steadyStateMembers);
+      else expectedMemberSets.push(steadyStateMembers);
     }
-    const expectedTopologies = new Set([
-      `true|bridge|172.31.0.0/24,|${expectedMembers.join('')}`,
-      `true|bridge|172.31.0.0/24,|${[...expectedMembers].reverse().join('')}`,
-    ]);
+    const expectedTopologies = new Set(expectedMemberSets.flatMap((members) => [
+      `true|bridge|172.31.0.0/24,|${members.join('')}`,
+      `true|bridge|172.31.0.0/24,|${[...members].reverse().join('')}`,
+    ]));
     const network = await this.docker.runDocker([
       'network',
       'inspect',
@@ -53,16 +66,19 @@ class DockerEnclaveRunner {
     if (image.exitCode !== 0) {
       throw new Error('Enclave image is not available locally');
     }
-    await this.assertNetworkIsolated();
+    // The shared gateway is attached by the host readiness gate after this
+    // server starts. Every launch still requires the steady-state topology.
+    await this.assertNetworkIsolated(false);
   }
 
-  spec(runId, invocationId, seedId) {
+  spec(runId, invocationId, seedId, dynamic, launch = true) {
     return deriveEnclaveContainerSpec({
-      config: this.config,
+      config: withDynamicBinding(this.config, dynamic),
       runId,
       invocationId,
       seedId,
       runtimeName: this.runtimeName,
+      launch,
     });
   }
 
@@ -98,12 +114,12 @@ class DockerEnclaveRunner {
 
   /** Deterministic orphan cleanup for every container labelled with this run. */
   async reconcileRun(runId) {
-    const spec = this.spec(runId, 'reconcile', '0'.repeat(32));
+    const spec = this.spec(runId, 'reconcile', '0'.repeat(32), undefined, false);
     await this.serializeCleanup(() => this.removeListed(spec.runListArgs));
   }
 
-  async cleanupInvocation(runId, invocationId) {
-    const spec = this.spec(runId, invocationId, '0'.repeat(32));
+  async cleanupInvocation(handle) {
+    const spec = this.spec(handle.runId, handle.invocationId, '0'.repeat(32), undefined, false);
     await this.serializeCleanup(() => this.removeListed(spec.invocationListArgs));
   }
 
@@ -113,32 +129,28 @@ class DockerEnclaveRunner {
    * Cleanup failures fail closed on the timeout/error paths, where a live
    * sandbox may still hold a mount of private repository content.
    */
-  async runEnclaveContainer(params) {
-    const spec = this.spec(params.runId, params.invocationId, params.seedId);
-    const timeoutMs = normalizeTimeoutMs(
-      (params.timeoutMs ?? this.config.timeoutSeconds * 1000) + CLI_GRACE_MS,
-    );
+  async launchInvocation(params) {
+    const spec = this.spec(params.runId, params.invocationId, params.seedId, params.binding);
+    await this.assertNetworkIsolated();
+    const remainingMs = params.deadlineMs - this.nowMs();
+    if (remainingMs <= 0) throw new Error('Enclave agent deadline elapsed during network preflight');
+    const timeoutMs = normalizeTimeoutMs(remainingMs + CLI_GRACE_MS);
+    const cancellation = new AbortController();
+    return {
+      runId: params.runId,
+      invocationId: params.invocationId,
+      cancellation,
+      result: this.docker.runDocker(spec.launchArgs, timeoutMs, cancellation.signal),
+    };
+  }
 
-    let result;
-    let runError;
-    try {
-      await this.assertNetworkIsolated();
-      result = await this.docker.runDocker(spec.launchArgs, timeoutMs);
-    } catch (error) {
-      runError = error;
-    }
-
-    try {
-      await this.cleanupInvocation(params.runId, params.invocationId);
-    } catch (cleanupError) {
-      throw cleanupError;
-    }
-
-    if (runError) throw runError;
-    // stdout/stderr are intentionally dropped here: the broker never reads,
-    // logs, or forwards enclave output. Only the exit status and the dedicated
-    // bounded result file are consulted.
+  async collectResult(handle) {
+    const result = await handle.result;
     return { exitCode: result.exitCode, timedOut: result.timedOut };
+  }
+
+  cancelInvocation(handle) {
+    handle.cancellation.abort();
   }
 }
 

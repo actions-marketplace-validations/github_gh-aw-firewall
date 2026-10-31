@@ -1,13 +1,12 @@
 import {
-  assertSbxApiProxyReflect,
+  assertSbxEgressEnforced,
   createSandbox,
-  execInSandbox,
-  isSbxAvailable,
   removeSandbox,
   SBX_DEFAULT_NAME,
   testHelpers,
 } from './sbx-manager';
 import * as fs from 'fs';
+import * as path from 'path';
 import { spawnSync } from 'child_process';
 import { mockExecaFn } from './test-helpers/mock-execa.test-utils';
 import { logger } from './logger';
@@ -16,7 +15,6 @@ const {
   restoreHomeCredentials,
   sanitizeEnvForSbx,
   withCreateSandboxEnvironment,
-  withLocalBinOnPath,
 } = testHelpers;
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -31,7 +29,8 @@ jest.mock('fs', () => {
     existsSync: jest.fn(() => false),
     readdirSync: jest.fn(() => []),
     renameSync: jest.fn(() => undefined),
-    mkdirSync: jest.fn(() => undefined),
+    mkdtempSync: jest.fn(() => '/home/runner/.awf-sbx-cred-backup-test'),
+    chmodSync: jest.fn(() => undefined),
     rmSync: jest.fn(() => undefined),
     lstatSync: jest.fn(() => ({
       isDirectory: () => true,
@@ -47,7 +46,8 @@ jest.mock('fs', () => {
 const mockedExistsSync = fs.existsSync as jest.Mock;
 const mockedReaddirSync = fs.readdirSync as jest.Mock;
 const mockedRenameSync = fs.renameSync as jest.Mock;
-const mockedMkdirSync = fs.mkdirSync as jest.Mock;
+const mockedMkdtempSync = fs.mkdtempSync as jest.Mock;
+const mockedChmodSync = fs.chmodSync as jest.Mock;
 const mockedRmSync = fs.rmSync as jest.Mock;
 const mockedLstatSync = fs.lstatSync as jest.Mock;
 const mockedStatSync = fs.statSync as jest.Mock;
@@ -151,6 +151,104 @@ describe('sbx-manager', () => {
     });
   });
 
+  describe('assertSbxEgressEnforced', () => {
+    it('probes denied domains without proxy environment variables or curl configuration', async () => {
+      mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+
+      await expect(assertSbxEgressEnforced(
+        'awf-agent-test',
+        { HTTPS_PROXY: 'http://host.docker.internal:3128' },
+        ['github.com'],
+        '/workspace',
+      )).resolves.toBeUndefined();
+
+      const args: string[] = mockExecaFn.mock.calls[0][1];
+      const command = args[args.length - 1];
+      expect(command).toContain('env -u HTTP_PROXY -u HTTPS_PROXY');
+      expect(command).toContain('-u ALL_PROXY -u all_proxy');
+      expect(command).toContain('https://1.1.1.1/');
+      expect(command).toContain('curl --disable --fail --insecure --silent');
+      expect(command).toContain('exit 86');
+      expect(spawnSync('bash', ['-n', '-c', command]).status).toBe(0);
+    });
+
+    it('does not select a probe covered by a mixed-case plain-domain allowlist', async () => {
+      mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+
+      await expect(assertSbxEgressEnforced(
+        'awf-agent-test',
+        {},
+        ['EXAMPLE.COM'],
+      )).resolves.toBeUndefined();
+
+      const args: string[] = mockExecaFn.mock.calls[0][1];
+      const command = args[args.length - 1];
+      expect(command).not.toContain('https://example.com/');
+    });
+
+    it('rejects startup when a direct request reaches the internet on every retry', async () => {
+      jest.useFakeTimers();
+      try {
+        mockExecaFn.mockResolvedValue({ exitCode: 86, stdout: '', stderr: '' });
+
+        const assertion = expect(assertSbxEgressEnforced(
+          'awf-agent-test',
+          {},
+          ['github.com'],
+        )).rejects.toThrow('direct egress bypassed Squid');
+
+        await jest.advanceTimersByTimeAsync(2_000);
+        await jest.advanceTimersByTimeAsync(2_000);
+        await assertion;
+        // One initial probe plus retries for the transient-Squid-startup grace window.
+        expect(mockExecaFn).toHaveBeenCalledTimes(3);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('tolerates a transient bypass that clears on retry', async () => {
+      jest.useFakeTimers();
+      try {
+        mockExecaFn
+          .mockResolvedValueOnce({ exitCode: 86, stdout: '', stderr: '' })
+          .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+
+        const assertion = expect(assertSbxEgressEnforced(
+          'awf-agent-test',
+          {},
+          ['github.com'],
+        )).resolves.toBeUndefined();
+
+        await jest.advanceTimersByTimeAsync(2_000);
+        await assertion;
+        expect(mockExecaFn).toHaveBeenCalledTimes(2);
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('fails closed when the probe cannot execute', async () => {
+      mockExecaFn.mockResolvedValueOnce({ exitCode: 127, stdout: '', stderr: '' });
+
+      await expect(assertSbxEgressEnforced(
+        'awf-agent-test',
+        {},
+        ['github.com'],
+      )).rejects.toThrow('Could not verify Docker sbx egress enforcement');
+    });
+
+    it('fails when the allowlist covers every built-in probe domain', async () => {
+      await expect(assertSbxEgressEnforced(
+        'awf-agent-test',
+        {},
+        ['1.1.1.1', '*.com', '*.org', '*.net'],
+      )).rejects.toThrow('allowlist covers every built-in probe domain');
+
+      expect(mockExecaFn).not.toHaveBeenCalled();
+    });
+  });
+
   describe('createSandbox', () => {
     beforeEach(() => {
       // Default: no host $HOME subdirs exist, so home-mount curation is a no-op
@@ -161,9 +259,20 @@ describe('sbx-manager', () => {
       mockedReaddirSync.mockReturnValue([]);
       mockedRenameSync.mockReset();
       mockedRenameSync.mockReturnValue(undefined);
+      mockedMkdtempSync.mockReset();
+      mockedMkdtempSync.mockReturnValue(
+        `${process.env.HOME || '/home/runner'}/.awf-sbx-cred-backup-test`,
+      );
+      mockedChmodSync.mockReset();
+      mockedChmodSync.mockReturnValue(undefined);
       mockedLstatSync.mockReset();
       mockedLstatSync.mockImplementation((p: fs.PathLike) => {
-        if (!mockedExistsSync(p)) {
+        const pathname = String(p);
+        const movedToBackup = mockedRenameSync.mock.calls.some(([from, to]) =>
+          String(from) === pathname && String(to).includes('.awf-sbx-cred-backup'));
+        const restoredFromBackup = mockedRenameSync.mock.calls.some(([from, to]) =>
+          String(from).includes('.awf-sbx-cred-backup') && String(to) === pathname);
+        if (!mockedExistsSync(p) || (movedToBackup && !restoredFromBackup)) {
           throw Object.assign(new Error(`ENOENT: no such file or directory, lstat '${String(p)}'`), {
             code: 'ENOENT',
           });
@@ -179,57 +288,36 @@ describe('sbx-manager', () => {
       });
       mockedRealpathSync.mockReset();
       mockedRealpathSync.mockImplementation((p: fs.PathLike) => String(p));
+      mockedRmSync.mockReset();
+      mockedRmSync.mockReturnValue(undefined);
       // Ensure no scrubbed state leaks between tests.
       restoreHomeCredentials();
+      mockedRmSync.mockClear();
       mockedRenameSync.mockReset();
       mockedRenameSync.mockReturnValue(undefined);
     });
 
-    describe('API proxy readiness', () => {
-      describe('assertSbxApiProxyReflect', () => {
-        it('installs a resolver alias and probes the reflection endpoint with Node fetch', async () => {
-          mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
-          const environment: Record<string, string> = { NO_PROXY: 'api-proxy' };
-
-          await expect(assertSbxApiProxyReflect(
-            'awf-agent-test',
-            environment,
-            '/workspace',
-          )).resolves.toBeUndefined();
-
-          const args: string[] = mockExecaFn.mock.calls[0][1];
-          const command = args[args.length - 1];
-          expect(environment.HOSTALIASES).toBe('/tmp/awf-hostaliases');
-          expect(command).toContain(
-            'printf "api-proxy localhost\\n" > "$HOSTALIASES"',
-          );
-          expect(command).toContain('base64 --decode > /tmp/awf-reflect-bridge.cjs');
-          expect(command).toContain('nohup node /tmp/awf-reflect-bridge.cjs');
-          const encodedBridge = command.match(/printf %s ([A-Za-z0-9+/=]+) \| base64/)?.[1];
-          expect(encodedBridge).toBeDefined();
-          const bridgeSource = Buffer.from(encodedBridge!, 'base64').toString('utf8');
-          expect(bridgeSource).toContain('host: `${upstreamHost}:10000`');
-          expect(() => new Function('require', bridgeSource)).not.toThrow();
-          expect(command).toContain('http://api-proxy:10000/reflect');
-          expect(command).toContain('node -e');
-          expect(command).toContain('console.error(error, error.cause)');
-          expect(command).toContain('AbortSignal.timeout(500)');
-          expect(command).toContain('cat /tmp/awf-reflect-bridge.log');
-          expect(command).toContain('for attempt in $(seq 1 30)');
-          expect(command).toContain('exit 1; }');
-          expect(command).not.toContain('/etc/hosts');
-          expect(spawnSync('bash', ['-n', '-c', command]).status).toBe(0);
-        });
-
-        it('fails closed when the reflection endpoint is unreachable', async () => {
-          mockExecaFn.mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: '' });
-
-          await expect(assertSbxApiProxyReflect(
-            'awf-agent-test',
-            {},
-          )).rejects.toThrow('cannot reach the API proxy /reflect endpoint');
-        });
+    it('rejects concurrent creates before a second call can replace credential state', async () => {
+      let releaseAuthCheck!: (result: { exitCode: number; stdout: string; stderr: string }) => void;
+      mockExecaFn.mockReturnValueOnce(new Promise((resolve) => {
+        releaseAuthCheck = resolve;
+      }));
+      mockExecaFn.mockResolvedValueOnce({
+        exitCode: 0, stdout: 'Created sandbox', stderr: '',
       });
+
+      const firstCreate = createSandbox({
+        workspaceDir: '/workspace', squidIp: '172.30.0.10',
+      });
+      await Promise.resolve();
+
+      await expect(createSandbox({
+        workspaceDir: '/workspace', squidIp: '172.30.0.10',
+      })).rejects.toThrow('sandbox creation is in progress');
+      expect(mockExecaFn).toHaveBeenCalledTimes(1);
+
+      releaseAuthCheck({ exitCode: 0, stdout: '', stderr: '' });
+      await expect(firstCreate).resolves.toBe(SBX_DEFAULT_NAME);
     });
 
     it('uses shell agent, configured mounts, and sanitized env', async () => {
@@ -388,6 +476,7 @@ describe('sbx-manager', () => {
       const homePath = process.env.HOME || '/home/runner';
       const secrets = [
         `${homePath}/.config/gh`,
+        `${homePath}/.config/glab-cli`,
         `${homePath}/.config/gcloud`,
         `${homePath}/.config/rclone`,
       ];
@@ -418,7 +507,7 @@ describe('sbx-manager', () => {
       mockedExistsSync.mockImplementation(
         (p: fs.PathLike) => String(p) === `${homePath}/.claude` || String(p) === secret,
       );
-      mockedMkdirSync.mockImplementationOnce(() => {
+      mockedMkdtempSync.mockImplementationOnce(() => {
         throw new Error('read-only home');
       });
       mockExecaFn
@@ -429,8 +518,170 @@ describe('sbx-manager', () => {
 
       expect(mockedRenameSync).not.toHaveBeenCalled();
       expect(mockedLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Could not create credential backup dir'),
+        expect.stringContaining('Could not secure credential backup dir'),
       );
+    });
+
+    it.each([
+      ['GLAB_CONFIG_DIR', '/workspace/gitlab-auth', '/workspace/gitlab-auth/config.yml'],
+      ['XDG_CONFIG_HOME', '/workspace/xdg', '/workspace/xdg/glab-cli/config.yml'],
+      ['XDG_CONFIG_DIRS', '/workspace/xdg', '/workspace/xdg/glab-cli/config.yml'],
+    ])('scrubs and restores exposed %s GitLab credentials', async (key, value, secret) => {
+      const saved = process.env[key];
+      process.env[key] = value;
+      try {
+        mockedExistsSync.mockImplementation((p: fs.PathLike) => (
+          String(p) === secret || String(p) === path.dirname(secret) ||
+          String(p).includes('.awf-sbx-cred-backup')
+        ));
+        mockExecaFn
+          .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
+          .mockResolvedValueOnce({ exitCode: 0, stdout: 'Created sandbox', stderr: '' });
+
+        await createSandbox({ workspaceDir: '/workspace', squidIp: '172.30.0.10' });
+        expect(mockedRenameSync).toHaveBeenCalledWith(secret, expect.any(String));
+        const backup = mockedRenameSync.mock.calls.find(([original]) => original === secret)?.[1];
+        restoreHomeCredentials();
+        expect(mockedRenameSync).toHaveBeenCalledWith(backup, secret);
+      } finally {
+        if (saved === undefined) delete process.env[key];
+        else process.env[key] = saved;
+      }
+    });
+
+    it('scrubs the backing credential file behind a mounted symlink alias', async () => {
+      const homePath = process.env.HOME || '/home/runner';
+      const link = `${homePath}/.config/glab-cli`;
+      const aliasFile = `${link}/config.yml`;
+      const backingDir = '/workspace/gitlab-auth';
+      const backingFile = `${backingDir}/config.yml`;
+      const saved = process.env.GLAB_CONFIG_DIR;
+      process.env.GLAB_CONFIG_DIR = link;
+      mockedExistsSync.mockImplementation((p: fs.PathLike) => [
+        `${homePath}/.config`,
+        link,
+        aliasFile,
+        '/workspace',
+        backingDir,
+        backingFile,
+      ].includes(String(p)) || String(p).includes('.awf-sbx-cred-backup'));
+      const defaultLstat = mockedLstatSync.getMockImplementation()!;
+      mockedLstatSync.mockImplementation((p: fs.PathLike) => {
+        const pathname = String(p);
+        const movedToBackup = mockedRenameSync.mock.calls.some(([from, to]) =>
+          String(from) === pathname && String(to).includes('.awf-sbx-cred-backup'));
+        const restoredFromBackup = mockedRenameSync.mock.calls.some(([from, to]) =>
+          String(from).includes('.awf-sbx-cred-backup') && String(to) === pathname);
+        if (pathname === link && movedToBackup && !restoredFromBackup) {
+          throw Object.assign(new Error(`ENOENT: '${link}'`), { code: 'ENOENT' });
+        }
+        return pathname === link
+          ? { isDirectory: () => false, isSymbolicLink: () => true, dev: 1, ino: 2 } as fs.Stats
+          : defaultLstat(p);
+      });
+      mockedRealpathSync.mockImplementation((p: fs.PathLike) => ({
+        [link]: backingDir,
+        [aliasFile]: backingFile,
+      }[String(p)] || String(p)));
+      mockExecaFn
+        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
+        .mockResolvedValueOnce({ exitCode: 0, stdout: 'Created sandbox', stderr: '' });
+
+      try {
+        await createSandbox({ workspaceDir: '/workspace', squidIp: '172.30.0.10' });
+        expect(mockedRenameSync).toHaveBeenCalledWith(link, expect.any(String));
+        expect(mockedRenameSync).toHaveBeenCalledWith(backingFile, expect.any(String));
+        restoreHomeCredentials();
+      } finally {
+        if (saved === undefined) delete process.env.GLAB_CONFIG_DIR;
+        else process.env.GLAB_CONFIG_DIR = saved;
+      }
+    });
+
+    it.each(['backup', 'rename'])(
+      'fails closed when a GitLab override is covered by a credential directory whose %s fails',
+      async (failure) => {
+        const homePath = process.env.HOME || '/home/runner';
+        const gitLabDir = `${homePath}/.config/gh`;
+        const gitLabFile = `${gitLabDir}/config.yml`;
+        const saved = process.env.GLAB_CONFIG_DIR;
+        process.env.GLAB_CONFIG_DIR = gitLabDir;
+        try {
+          mockedExistsSync.mockImplementation((p: fs.PathLike) => [
+            `${homePath}/.config`,
+            gitLabDir,
+            gitLabFile,
+          ].includes(String(p)));
+          if (failure === 'backup') {
+            mockedMkdtempSync.mockImplementationOnce(() => { throw new Error('read-only home'); });
+          } else {
+            mockedRenameSync.mockImplementationOnce(() => { throw new Error('busy'); });
+          }
+          mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+
+          await expect(createSandbox({
+            workspaceDir: '/workspace', squidIp: '172.30.0.10',
+          })).rejects.toThrow('Cannot hide GitLab CLI credentials');
+          expect(mockExecaFn).toHaveBeenCalledTimes(1);
+        } finally {
+          if (saved === undefined) delete process.env.GLAB_CONFIG_DIR;
+          else process.env.GLAB_CONFIG_DIR = saved;
+        }
+      },
+    );
+
+    it('does not move GitLab credentials outside mounted paths', async () => {
+      const saved = process.env.GLAB_CONFIG_DIR;
+      process.env.GLAB_CONFIG_DIR = '/private/gitlab-auth';
+      try {
+        mockedExistsSync.mockImplementation((p: fs.PathLike) => (
+          String(p) === '/private/gitlab-auth/config.yml'
+        ));
+        mockExecaFn
+          .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
+          .mockResolvedValueOnce({ exitCode: 0, stdout: 'Created sandbox', stderr: '' });
+
+        await createSandbox({ workspaceDir: '/workspace', squidIp: '172.30.0.10' });
+        expect(mockedRenameSync).not.toHaveBeenCalled();
+      } finally {
+        if (saved === undefined) delete process.env.GLAB_CONFIG_DIR;
+        else process.env.GLAB_CONFIG_DIR = saved;
+      }
+    });
+
+    it.each(['backup', 'rename'])('refuses to create sbx when GitLab credential %s fails', async (failure) => {
+      const homePath = process.env.HOME || '/home/runner';
+      mockedExistsSync.mockImplementation((p: fs.PathLike) => (
+        String(p) === `${homePath}/.config` || String(p) === `${homePath}/.config/glab-cli`
+      ));
+      if (failure === 'backup') {
+        mockedMkdtempSync.mockImplementationOnce(() => { throw new Error('read-only home'); });
+      } else {
+        mockedRenameSync.mockImplementationOnce(() => { throw new Error('busy'); });
+      }
+      mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+
+      await expect(createSandbox({
+        workspaceDir: '/workspace', squidIp: '172.30.0.10',
+      })).rejects.toThrow('Cannot hide GitLab CLI credentials');
+      expect(mockExecaFn).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses to back up credentials beneath an extra mount that exposes the backup path', async () => {
+      const homePath = process.env.HOME || '/home/runner';
+      mockedExistsSync.mockImplementation((p: fs.PathLike) => [
+        `${homePath}/.config`,
+        `${homePath}/.config/glab-cli`,
+      ].includes(String(p)));
+      mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
+
+      await expect(createSandbox({
+        workspaceDir: '/workspace',
+        squidIp: '172.30.0.10',
+        extraMounts: [`${homePath}:${homePath}:rw`],
+      })).rejects.toThrow('credential backup directory would be exposed');
+      expect(mockExecaFn).toHaveBeenCalledTimes(1);
+      expect(mockedRenameSync).not.toHaveBeenCalled();
     });
 
     it('continues after a credential path cannot be moved aside', async () => {
@@ -475,7 +726,6 @@ describe('sbx-manager', () => {
       expect(scrubMove).toBeDefined();
       const backupPath = scrubMove![1];
 
-      mockedRenameSync.mockClear();
       // removeSandbox: stop + rm both succeed, then restore runs.
       mockExecaFn
         .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
@@ -513,6 +763,35 @@ describe('sbx-manager', () => {
       expect(mockedLogger.warn).toHaveBeenCalledWith(
         expect.stringContaining('Could not restore credential path'),
       );
+    });
+
+    it('preserves the backup instead of restoring through a replaced parent path', async () => {
+      const homePath = process.env.HOME || '/home/runner';
+      const secret = `${homePath}/.claude/.credentials.json`;
+      const parent = path.dirname(secret);
+      mockedExistsSync.mockImplementation((p: fs.PathLike) =>
+        [parent, secret].includes(String(p)) || String(p).includes('.awf-sbx-cred-backup'));
+      mockExecaFn
+        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
+        .mockResolvedValueOnce({ exitCode: 0, stdout: 'Created sandbox', stderr: '' });
+      await createSandbox({ workspaceDir: '/workspace', squidIp: '172.30.0.10' });
+      const backup = mockedRenameSync.mock.calls.find(([original]) => original === secret)?.[1];
+      mockedRealpathSync.mockImplementation((p: fs.PathLike) =>
+        String(p) === parent ? `${homePath}/attacker-output` : String(p));
+      mockedRenameSync.mockClear();
+
+      restoreHomeCredentials();
+
+      expect(mockedRenameSync).not.toHaveBeenCalledWith(backup, secret);
+      expect(mockedLogger.warn).toHaveBeenCalledWith(
+        expect.stringContaining('Credential parent path changed'),
+      );
+      expect(mockedRmSync).not.toHaveBeenCalled();
+      const callsBeforeRetry = mockExecaFn.mock.calls.length;
+      await expect(createSandbox({
+        workspaceDir: '/workspace', squidIp: '172.30.0.10',
+      })).rejects.toThrow('previous credential backups still need restoration');
+      expect(mockExecaFn).toHaveBeenCalledTimes(callsBeforeRetry);
     });
 
     it('skips whitelisted home subdirs that do not exist on the host', async () => {
@@ -716,213 +995,4 @@ describe('sbx-manager', () => {
     });
   });
 
-  describe('execInSandbox', () => {
-    it('returns exit code 0 on success', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      const result = await execInSandbox('awf-agent-test', 'echo hello');
-      expect(result.exitCode).toBe(0);
-    });
-
-    it('returns non-zero exit code and warns', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 42 });
-
-      const result = await execInSandbox('awf-agent-test', 'exit 42');
-      expect(result.exitCode).toBe(42);
-      expect(mockedLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('exited with code 42'),
-      );
-    });
-
-    it('returns exit code 1 when exitCode is null', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: null });
-
-      const result = await execInSandbox('awf-agent-test', 'cmd');
-      expect(result.exitCode).toBe(1);
-    });
-
-    it('returns exit code 124 on timeout', async () => {
-      const timeoutError = Object.assign(new Error('timed out'), { timedOut: true });
-      mockExecaFn.mockRejectedValueOnce(timeoutError);
-
-      const result = await execInSandbox('awf-agent-test', 'sleep 999', { timeoutMinutes: 1 });
-      expect(result.exitCode).toBe(124);
-      expect(mockedLogger.error).toHaveBeenCalledWith(
-        expect.stringContaining('timed out after 1 minutes'),
-      );
-    });
-
-    it('returns exit code 1 on unexpected exec error', async () => {
-      mockExecaFn.mockRejectedValueOnce(new Error('exec failed'));
-
-      const result = await execInSandbox('awf-agent-test', 'cmd');
-      expect(result.exitCode).toBe(1);
-      expect(mockedLogger.error).toHaveBeenCalledWith(
-        expect.stringContaining('exec failed'),
-      );
-    });
-
-    it('passes workDir flag when specified', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      await execInSandbox('awf-agent-test', 'ls', { workDir: '/workspace' });
-
-      const args: string[] = mockExecaFn.mock.calls[0][1];
-      expect(args).toContain('--workdir');
-      expect(args).toContain('/workspace');
-    });
-
-    it('passes --tty flag when tty option is true', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      await execInSandbox('awf-agent-test', 'bash', { tty: true });
-
-      const args: string[] = mockExecaFn.mock.calls[0][1];
-      expect(args).toContain('--tty');
-    });
-
-    it('passes --env flags for environment variables', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      await execInSandbox('awf-agent-test', 'env', { environment: { FOO: 'bar', BAZ: 'qux' } });
-
-      const args: string[] = mockExecaFn.mock.calls[0][1];
-      expect(args).toContain('--env');
-      expect(args).toContain('FOO=bar');
-      expect(args).toContain('BAZ=qux');
-    });
-
-    it('sets timeout when timeoutMinutes is specified', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      await execInSandbox('awf-agent-test', 'cmd', { timeoutMinutes: 5 });
-
-      const callOptions = mockExecaFn.mock.calls[0][2];
-      expect(callOptions.timeout).toBe(5 * 60 * 1000);
-    });
-
-    it('wraps the command so ~/.local/bin is on PATH after login init', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      await execInSandbox('awf-agent-test', 'copilot --version');
-
-      const args: string[] = mockExecaFn.mock.calls[0][1];
-      // The command runs via a login shell (`bash -lc`) whose /etc/profile can
-      // reset PATH, so the export must be embedded in the command string.
-      expect(args).toContain('-lc');
-      const shellCommand = args[args.length - 1];
-      expect(shellCommand).toBe(
-        'export PATH="$HOME/.local/bin${PATH:+:$PATH}"; copilot --version',
-      );
-      expect(shellCommand.indexOf('.local/bin')).toBeLessThan(
-        shellCommand.indexOf('copilot --version'),
-      );
-    });
-
-    it('does not set timeout when timeoutMinutes is not specified', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0 });
-
-      await execInSandbox('awf-agent-test', 'cmd');
-
-      const callOptions = mockExecaFn.mock.calls[0][2];
-      expect(callOptions.timeout).toBeUndefined();
-    });
-  });
-
-  describe('withLocalBinOnPath', () => {
-    it('prepends ~/.local/bin using the runtime $HOME', () => {
-      expect(withLocalBinOnPath('copilot')).toBe(
-        'export PATH="$HOME/.local/bin${PATH:+:$PATH}"; copilot',
-      );
-    });
-
-    it('guards against an empty PATH producing a trailing colon', () => {
-      // ${PATH:+:$PATH} appends the existing PATH only when it is non-empty, so
-      // no empty element (which the shell treats as the cwd) is introduced.
-      expect(withLocalBinOnPath('x')).toContain('${PATH:+:$PATH}');
-    });
-
-    it('preserves the original command verbatim', () => {
-      const cmd = 'foo && bar | baz > out.txt';
-      expect(withLocalBinOnPath(cmd).endsWith(`; ${cmd}`)).toBe(true);
-    });
-  });
-
-  describe('removeSandbox', () => {
-    it('warns when sbx rm exits non-zero', async () => {
-      mockExecaFn
-        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' }) // stop
-        .mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: 'still running' }); // rm
-
-      await removeSandbox('awf-agent-test');
-
-      expect(mockedLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to remove sandbox "awf-agent-test"'),
-      );
-    });
-
-    it('warns when sbx stop exits non-zero', async () => {
-      mockExecaFn
-        .mockResolvedValueOnce({ exitCode: 1, stdout: '', stderr: 'not found' }) // stop
-        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' }); // rm
-
-      await removeSandbox('awf-agent-test');
-
-      expect(mockedLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to stop sandbox "awf-agent-test"'),
-      );
-    });
-
-    it('handles stop throwing (sandbox may already be stopped)', async () => {
-      mockExecaFn
-        .mockRejectedValueOnce(new Error('stop threw')) // stop throws
-        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' }); // rm
-
-      await removeSandbox('awf-agent-test');
-
-      expect(mockedLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('removed'),
-      );
-    });
-
-    it('logs success when stop and rm both succeed', async () => {
-      mockExecaFn
-        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
-        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' });
-
-      await removeSandbox('awf-agent-test');
-
-      expect(mockedLogger.info).toHaveBeenCalledWith(
-        expect.stringContaining('"awf-agent-test" removed'),
-      );
-    });
-
-    it('warns (not throws) when rm exits null', async () => {
-      mockExecaFn
-        .mockResolvedValueOnce({ exitCode: 0, stdout: '', stderr: '' })
-        .mockResolvedValueOnce({ exitCode: null, stdout: '', stderr: 'null exit' });
-
-      await removeSandbox('awf-agent-test');
-
-      expect(mockedLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining('Failed to remove sandbox'),
-      );
-    });
-  });
-
-  describe('isSbxAvailable', () => {
-    it('returns true when sbx version succeeds', async () => {
-      mockExecaFn.mockResolvedValueOnce({ exitCode: 0, stdout: 'sbx 1.0.0', stderr: '' });
-
-      const result = await isSbxAvailable();
-      expect(result).toBe(true);
-    });
-
-    it('returns false when sbx version throws (not installed)', async () => {
-      mockExecaFn.mockRejectedValueOnce(new Error('command not found: sbx'));
-
-      const result = await isSbxAvailable();
-      expect(result).toBe(false);
-    });
-  });
 });

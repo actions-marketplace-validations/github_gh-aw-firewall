@@ -1,59 +1,90 @@
 # AWF enclave images. Build context: containers/.
+# Supply the release's build-tools digest, or a locally built base via BuildKit context.
+ARG BUILD_TOOLS_IMAGE=awf-build-tools
 
-FROM python:3.14.7-alpine3.24 AS enclave-script
+FROM python:3.14.10-alpine3.24@sha256:eb2c62658b8d51bff0acc408504b76521d02030de56a8a3c1e830083e89b89d2 AS enclave-script
 
 RUN apk upgrade --no-cache \
     && python3 -c 'import json, pathlib, sys; sys.exit(0)' \
     && test -x /usr/local/bin/python3 \
-    && rm -f /sbin/apk
+    && ln -s /usr/local/bin/python3 /usr/bin/python3
 COPY enclave/script-entrypoint.py /usr/local/bin/run-enclave-script
 RUN chmod 0555 /usr/local/bin/run-enclave-script \
     && mkdir -p /script /awf/seed
+COPY trust/ /opt/awf/trust/
+RUN apk add --no-cache openssl ca-certificates \
+    && sh /opt/awf/trust/install-system-trust.sh \
+    && rm -f /sbin/apk
 
-FROM node:24.18.1-trixie-slim AS enclave-agent-build
+FROM node:26.11.1-trixie-slim@sha256:193fe51b64e77981119c98c2002c9e32a70e2f006fb4d25068ce0558998917f0 AS enclave-agent-build
 
-ARG COPILOT_CLI_VERSION=1.0.77
+COPY trust/ /opt/awf/trust/
+RUN apt-get update && apt-get install -y --no-install-recommends openssl ca-certificates \
+    && sh /opt/awf/trust/install-system-trust.sh \
+    && rm -rf /var/lib/apt/lists/*
+ENV NODE_OPTIONS="--require=/opt/awf/trust/node-trust.cjs"
+
 ARG NPM_CONFIG_REGISTRY=https://registry.npmjs.org/
-RUN npm_config_ignore_scripts=false npm install -g "@github/copilot@${COPILOT_CLI_VERSION}" \
-    && npm_config_ignore_scripts=true npm install \
-         --prefix /usr/local/lib/node_modules/@github/copilot \
-         --omit=dev adm-zip@0.6.0 \
+COPY enclave/package*.json /tmp/copilot-cli/
+RUN npm_config_ignore_scripts=false npm ci --prefix /tmp/copilot-cli --install-strategy=nested \
+    && mkdir -p /usr/local/lib/node_modules/@github/copilot \
+    && cp -a /tmp/copilot-cli/node_modules/@github/copilot/. /usr/local/lib/node_modules/@github/copilot/ \
+    && mkdir -p /usr/local/lib/node_modules/@github/copilot/node_modules \
+    && cp -a /tmp/copilot-cli/node_modules/. /usr/local/lib/node_modules/@github/copilot/node_modules/ \
+    && rm -rf /usr/local/lib/node_modules/@github/copilot/node_modules/@github/copilot \
+    && ln -s ../lib/node_modules/@github/copilot/npm-loader.js /usr/local/bin/copilot \
     && find /usr/local/lib/node_modules/@github/copilot \
          -path '*/foundry-local-sdk/node_modules/adm-zip' -prune -type d \
          -exec sh -c 'rm -rf "$1" && cp -a /usr/local/lib/node_modules/@github/copilot/node_modules/adm-zip "$1"' sh {} \; \
+    && COPILOT_CLI_VERSION="$(node -p 'require("/usr/local/lib/node_modules/@github/copilot/package.json").version')" \
     && copilot --version | grep -q "GitHub Copilot CLI ${COPILOT_CLI_VERSION}"
 
-FROM ubuntu:26.04 AS enclave-agent
+FROM ${BUILD_TOOLS_IMAGE} AS enclave-agent
 
-ARG COPILOT_CLI_VERSION=1.0.77
+ARG BUILD_TOOLS_IMAGE
+LABEL org.opencontainers.image.base.name="${BUILD_TOOLS_IMAGE}"
+
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends bash ca-certificates git python3 ripgrep \
+    && apt-get install -y --no-install-recommends libatomic1 python3 ripgrep \
+    && /usr/bin/ip -Version \
+    && gcc --version && make --version && cmake --version && gh --version \
     && test -r /etc/ssl/certs/ca-certificates.crt \
     && rm -rf /var/lib/apt/lists/* \
     && rm -f /usr/bin/apt /usr/bin/apt-get /usr/bin/apt-cache
 COPY --from=enclave-agent-build /usr/local/bin/node /usr/local/bin/node
+COPY trust/ /opt/awf/trust/
+RUN sh /opt/awf/trust/install-system-trust.sh \
+    && sh /opt/awf/trust/install-node-trust.sh
 COPY --from=enclave-agent-build /usr/local/lib/node_modules/@github/copilot/ /usr/local/lib/node_modules/@github/copilot/
-RUN ln -s ../lib/node_modules/@github/copilot/npm-loader.js /usr/local/bin/copilot \
-    && node --version | grep -qE '^v24\.' \
+# Avoid uutils env's executable-name check on shebangs under BuildKit's QEMU.
+RUN sed -i '1c#!/usr/local/bin/node' /usr/local/lib/node_modules/@github/copilot/npm-loader.js \
+    && ln -s ../lib/node_modules/@github/copilot/npm-loader.js /usr/local/bin/copilot \
+    && node --version | grep -qE '^v26\.' \
+    && COPILOT_CLI_VERSION="$(node -p 'require("/usr/local/lib/node_modules/@github/copilot/package.json").version')" \
     && copilot --version | grep -q "GitHub Copilot CLI ${COPILOT_CLI_VERSION}" \
     && rm -f /usr/bin/pebble \
     && rm -rf /root/.cache/copilot
 COPY enclave/agent-entrypoint.py /usr/local/bin/run-enclave-agent
-COPY enclave/github-cli-wrapper.py /usr/local/bin/gh
-RUN chmod 0555 /usr/local/bin/run-enclave-agent /usr/local/bin/gh \
+RUN chmod 0555 /usr/local/bin/run-enclave-agent \
     && python3 -m py_compile /usr/local/bin/run-enclave-agent \
-    && python3 -m py_compile /usr/local/bin/gh \
     && rm -rf /usr/local/bin/__pycache__ \
     && mkdir -p /agent /awf/seed /run/awf-enclave-github
 
-FROM node:22.23.2-alpine3.24 AS enclave-mcp-server
+FROM node:26.11.1-alpine3.24@sha256:143494b1da2945f061539253adc65e4f1569ddf07da2d384c022c791a9d90a4a AS enclave-mcp-server
 
-RUN apk upgrade --no-cache \
+COPY trust/ /opt/awf/trust/
+RUN apk add --no-cache openssl ca-certificates \
+    && apk upgrade --no-cache \
     && apk add --no-cache docker-cli \
+    && sh /opt/awf/trust/install-system-trust.sh \
+    && sh /opt/awf/trust/install-node-trust.sh \
     && test -x /usr/bin/docker \
     && rm -rf /usr/local/lib/node_modules/npm \
     && rm -f /usr/local/bin/npm /usr/local/bin/npx /usr/local/bin/corepack
+
+ARG AWF_SOURCE_REVISION=unavailable
 WORKDIR /opt/awf/enclave/mcp-server
+LABEL org.opencontainers.image.revision="${AWF_SOURCE_REVISION}"
 COPY bounded-execution/ /opt/awf/bounded-execution/
 COPY enclave/script-executor/ /opt/awf/enclave/script-executor/
 COPY enclave/agent-executor/ /opt/awf/enclave/agent-executor/

@@ -9,9 +9,13 @@ permissions:
 env:
   GH_TOKEN: ${{ github.token }}
 name: Smoke Enclave Build Test
+# Ubuntu 26.04 sudo-rs ignores --preserve-env, dropping enclave host credentials.
+runs-on: ubuntu-24.04
 engine:
   id: copilot
-  version: 1.0.34
+  version: 1.0.98
+  checksums-sha256: 372f0c8d3d50076455cd19ef080dc59dc2a32401d8b2d4f77ce190c8ab13bc59
+  args: ["--allow-tool", "awf-enclave(enclave_run_script)"]
 network:
   allowed:
     - defaults
@@ -37,11 +41,27 @@ safe-outputs:
     run-success: "🔐🏗️ [{workflow_name}]({run_url}) completed. Enclave build test passed. ✅"
     run-failure: "🔐🏗️ [{workflow_name}]({run_url}) reports {status}. Enclave build compatibility issue detected."
 timeout-minutes: 20
+runtimes:
+  node:
+    version: "24"
 sandbox:
   agent:
     id: awf
     version: v0.28.1
+    command: "sudo --preserve-env awf"
 strict: false
+steps:
+  - name: Install AWF dependencies
+    run: npm ci
+  - name: Build AWF
+    run: npm run build
+  - name: Install local AWF binary
+    run: |
+      sudo tee /usr/local/bin/awf > /dev/null <<EOF
+      #!/bin/bash
+      exec "$(command -v node)" "${GITHUB_WORKSPACE}/dist/cli.js" "\$@"
+      EOF
+      sudo chmod +x /usr/local/bin/awf
 concurrency:
   group: smoke-enclave-build-test
   cancel-in-progress: false
@@ -58,7 +78,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Download agent artifact
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: agent
           path: /tmp/gh-aw-agent

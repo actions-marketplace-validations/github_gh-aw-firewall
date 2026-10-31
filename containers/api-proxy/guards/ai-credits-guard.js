@@ -4,9 +4,14 @@ const { logRequest, sanitizeForLog } = require('../logging');
 const pricingByModel = require('../ai-credits-pricing');
 const { resolveCatalogModel } = require('../models-dev-catalog');
 const { resolveRuntimePricing } = require('../runtime-model-catalog');
+const { getCatalogueLoader } = require('../catalogue-loader');
+const { resolveCentralPricing, fresh } = require('../catalogue-pricing');
+const { resolveApiKey, deriveCopilotApiTarget, isGithubCopilotCatalogTarget } = require('../providers/copilot-auth');
 const { resolveProviderPricingOverlay } = require('../provider-pricing-overlays');
+const { resolveModelPricingCatalog } = require('../model-pricing-catalog');
 const { parsePositiveNumber } = require('./guard-utils');
 const { PROVIDER_ANTHROPIC, PROVIDER_COPILOT } = require('../provider-names');
+const { BUDGET_WARNING_THRESHOLDS } = require('./steering-thresholds');
 
 const TOKENS_PER_MILLION = 1_000_000;
 const DOLLARS_PER_CREDIT = 0.01;
@@ -70,11 +75,37 @@ function roundCredits(value) {
   return Math.round((value + Number.EPSILON) * 1_000_000) / 1_000_000;
 }
 
+function getEffectiveAiCreditsCeiling(config = getAiCreditsConfig()) {
+  return Math.min(config.max ?? HARD_CAP_AI_CREDITS, HARD_CAP_AI_CREDITS);
+}
+
+function updateAiCreditSteeringThresholds() {
+  const config = getAiCreditsConfig();
+  const ceiling = getEffectiveAiCreditsCeiling(config);
+  const configKey = String(ceiling);
+  if (aiCreditsState.steeringConfigKey !== configKey) {
+    aiCreditsState.steeringConfigKey = configKey;
+    aiCreditsState.emittedThresholds.clear();
+    aiCreditsState.uninjectedThresholds.clear();
+  }
+
+  const percentUsed = (aiCreditsState.totalAiCredits / ceiling) * 100;
+  for (const threshold of BUDGET_WARNING_THRESHOLDS) {
+    if (percentUsed >= threshold && !aiCreditsState.emittedThresholds.has(threshold)) {
+      aiCreditsState.emittedThresholds.add(threshold);
+      aiCreditsState.uninjectedThresholds.add(threshold);
+    }
+  }
+}
+
 function createAiCreditsState() {
   return {
     totalAiCredits: 0,
     byModel: {},
     warnedUnknownModels: new Set(),
+    steeringConfigKey: null,
+    emittedThresholds: new Set(),
+    uninjectedThresholds: new Set(),
   };
 }
 
@@ -105,6 +136,7 @@ function getAiCreditsConfig() {
           cachedInput: parsed.cachedInput ?? parsed.input * 0.1,
           cacheWrite: parsed.cacheWrite ?? null,
           output: parsed.output,
+          ...(typeof parsed.reasoning === 'number' ? { reasoning: parsed.reasoning } : {}),
         };
       }
     } catch { /* invalid JSON — leave null */ }
@@ -128,20 +160,43 @@ function getAiCreditsConfig() {
  */
 function canonicalizeModel(model) {
   const bare = model.includes('/') ? model.slice(model.indexOf('/') + 1) : model;
-  const withoutDateSuffix = bare.replace(/(-alpha)?-(\d{4}-\d{2}-\d{2}|\d{8})$/, '');
+  const parameterIndex = bare.indexOf('?');
+  const withoutParameters = parameterIndex === -1 ? bare : bare.slice(0, parameterIndex);
+  const withoutDateSuffix = withoutParameters.replace(/(-alpha)?-(\d{4}-\d{2}-\d{2}|\d{8})$/, '');
   return withoutDateSuffix.replace(/[._]/g, '-');
 }
 
 function resolveModelPricing(model, state = aiCreditsState, provider = undefined, inputTokens = 0, options = {}) {
-  const operatorPricing = provider ? resolveProviderPricingOverlay(provider, model) : null;
+  const pricingModel = model.includes('?') ? model.slice(0, model.indexOf('?')) : model;
+  const operatorPricing = provider
+    ? resolveProviderPricingOverlay(provider, pricingModel, inputTokens)
+    : null;
   if (operatorPricing) return operatorPricing;
 
-  const runtime = provider ? resolveRuntimePricing(provider, model, inputTokens) : null;
+  const catalogPricing = provider
+    ? resolveModelPricingCatalog(provider, pricingModel, inputTokens)
+    : null;
+  if (catalogPricing) return catalogPricing;
+
+  const runtime = provider ? resolveRuntimePricing(provider, pricingModel, inputTokens, options.runtimeCatalog) : null;
+  const capture = Object.hasOwn(options, 'catalogue') ? options.catalogue : getCatalogueLoader().capture();
   if (runtime && ['input', 'cachedInput', 'cacheWrite', 'output']
-    .every(field => Object.hasOwn(runtime.pricing, field))) {
+    .every(field => Object.hasOwn(runtime.pricing, field)) &&
+    (!capture || fresh({ at: runtime.observedAt }, capture.time, capture.maxAge))) {
     return runtime;
   }
-  const fallback = resolveLowerPriorityPricing(model, state, { ...options, provider });
+  const copilotScope = !resolveApiKey(process.env) &&
+    isGithubCopilotCatalogTarget(deriveCopilotApiTarget(process.env));
+  const central = provider && copilotScope
+    ? resolveCentralPricing(provider, pricingModel, inputTokens, capture, { nativeInput: true }) : null;
+  if (central) return central;
+  const fallback = resolveLowerPriorityPricing(pricingModel, state, {
+    ...options,
+    provider,
+    originalModel: model,
+    inputTokens: runtime ? 0 : inputTokens,
+    preferredTier: runtime?.tier,
+  });
   if (!runtime) return fallback;
   const mergedPricing = {};
   for (const field of ['input', 'cachedInput', 'cacheWrite', 'output']) {
@@ -156,9 +211,22 @@ function resolveModelPricing(model, state = aiCreditsState, provider = undefined
   return { ...runtime, pricing: mergedPricing };
 }
 
+function resolveCuratedPricing(pricing, inputTokens, preferredTier) {
+  const longContext = pricing.longContext;
+  const useLongContext = !!longContext && (preferredTier
+    ? preferredTier === 'long_context'
+    : inputTokens > longContext.threshold);
+  if (!useLongContext) {
+    const { longContext: _longContext, ...defaultPricing } = pricing;
+    return { pricing: defaultPricing, source: 'curated', tier: 'default' };
+  }
+  const { threshold: _threshold, ...selectedPricing } = longContext;
+  return { pricing: selectedPricing, source: 'curated', tier: 'long_context' };
+}
+
 function resolveLowerPriorityPricing(model, state, options = {}) {
   if (Object.hasOwn(pricingByModel, model)) {
-    return { pricing: pricingByModel[model], source: 'curated', tier: 'default' };
+    return resolveCuratedPricing(pricingByModel[model], options.inputTokens || 0, options.preferredTier);
   }
 
   const canonical = canonicalizeModel(model);
@@ -166,20 +234,10 @@ function resolveLowerPriorityPricing(model, state, options = {}) {
   // Try canonical form against canonicalized pricing keys
   for (const [configuredModel, pricing] of Object.entries(pricingByModel)) {
     const canonicalKey = canonicalizeModel(configuredModel);
-    if (canonical === canonicalKey) return { pricing, source: 'curated', tier: 'default' };
-  }
-
-  // Prefix match: canonical model starts with a canonical pricing key
-  let prefixMatch = null;
-  for (const [configuredModel, pricing] of Object.entries(pricingByModel)) {
-    const canonicalKey = canonicalizeModel(configuredModel);
-    if (canonical.startsWith(`${canonicalKey}-`)) {
-      if (!prefixMatch || canonicalKey.length > prefixMatch.key.length) {
-        prefixMatch = { key: canonicalKey, pricing };
-      }
+    if (canonical === canonicalKey) {
+      return resolveCuratedPricing(pricing, options.inputTokens || 0, options.preferredTier);
     }
   }
-  if (prefixMatch) return { pricing: prefixMatch.pricing, source: 'curated', tier: 'default' };
 
   const catalogModel = resolveCatalogModel(model);
   if (catalogModel.pricing) {
@@ -198,16 +256,11 @@ function resolveLowerPriorityPricing(model, state, options = {}) {
     };
   }
 
-  // Speculative callers (e.g. filtering a fallback candidate pool) pass quiet:true
+  // Pricing probes pass quiet:true
   // so that probing a model neither emits an operator-facing warning nor marks the
   // model as already-warned — which would suppress the warning if it is genuinely
   // requested later.
-  if (!options.quiet && !state.warnedUnknownModels.has(model)) {
-    logRequest('warn', 'unknown_model_ai_credits_pricing', {
-      model: sanitizeForLog(model),
-    });
-    state.warnedUnknownModels.add(model);
-  }
+  if (!options.quiet) warnMissingModelPricing(options.originalModel || model, state);
 
   // Fall back to configured default pricing if available
   const config = getAiCreditsConfig();
@@ -217,8 +270,8 @@ function resolveLowerPriorityPricing(model, state, options = {}) {
 
   // When the model is the 'unknown' sentinel (response omitted model and
   // request body didn't contain one either), use conservative fallback pricing
-  // so AI credits are never silently lost. This is NOT applied to truly unknown
-  // model names which should still be rejected by checkUnknownModelRejection.
+  // so AI credits are never silently lost. Concrete unpriced models instead
+  // proceed with a warning and no invented pricing.
   if (model === 'unknown') {
     return { pricing: BUILTIN_FALLBACK_PRICING, source: 'builtin_fallback', tier: 'default' };
   }
@@ -229,65 +282,44 @@ function resolveLowerPriorityPricing(model, state, options = {}) {
 /**
  * Side-effect-free check for whether a model has resolvable AI-credits pricing.
  *
- * Mirrors checkUnknownModelRejection's resolution (both the default and the
- * highest selectable pricing tier must resolve) but emits no logs and does not
- * mutate guard state, so it is safe to call across a large pool of speculative
- * candidates that may never be selected.
+ * Both the default and the highest selectable pricing tier must resolve.
+ * Emits no logs and does not mutate guard state.
  *
  * @param {string} model
  * @param {string} [provider]
  * @returns {boolean}
  */
-function isModelPriceable(model, provider = undefined) {
+function isModelPriceable(model, provider = undefined, options = {}) {
   if (!model) return true;
-  const defaultTier = resolveModelPricing(model, aiCreditsState, provider, 0, { quiet: true });
+  const defaultTier = resolveModelPricing(model, aiCreditsState, provider, 0, { ...options, quiet: true });
   if (!defaultTier) return false;
   const highestTier = resolveModelPricing(
     model,
     aiCreditsState,
     provider,
     Number.MAX_SAFE_INTEGER,
-    { quiet: true },
+    { ...options, quiet: true },
   );
   return !!highestTier;
 }
 
-/**
- * Check if a model is unresolvable and should be rejected.
- * Only rejects when maxAiCredits is active and no default pricing is configured.
- *
- * @param {string} model
- * @param {string} [provider]
- * @returns {{ rejected: boolean, model: string, error: object } | null}
- */
-function checkUnknownModelRejection(model, provider = undefined) {
-  const config = getAiCreditsConfig();
-  if (!config.max) return null; // guard not active, don't reject
-  if (!model) return null; // no model in request body, can't check
-  if (config.defaultPricing) return null; // has fallback, don't reject
-  const defaultPricing = resolveModelPricing(model, aiCreditsState, provider);
-  const highestTierPricing = resolveModelPricing(
-    model,
-    aiCreditsState,
-    provider,
-    Number.MAX_SAFE_INTEGER,
-  );
-  if (defaultPricing && highestTierPricing) return null; // every selectable tier resolved
-
-  return {
-    rejected: true,
-    model,
-    error: {
-      type: 'unknown_model_ai_credits',
-      message: `Model "${model}" has no AI credits pricing and no default pricing is configured. ` +
-        'Set apiProxy.defaultAiCreditsPricing in the AWF config (e.g. {"input": 3.0, "output": 15.0}) ' +
-        'to provide a fallback rate, or add the model to the pricing table.',
-      model,
-    },
-  };
+function warnMissingModelPricing(model, state = aiCreditsState) {
+  if (state.warnedUnknownModels.has(model)) return;
+  logRequest('warn', 'unknown_model_ai_credits_pricing', {
+    modelProvided: Boolean(model),
+    message: 'Model pricing is unavailable from the pricing catalogs. ' +
+      'Configured defaultAiCreditsPricing will be used if available; otherwise ' +
+      'unpriced usage is excluded from AI-credit totals and budget enforcement may undercount spending.',
+  });
+  state.warnedUnknownModels.add(model);
 }
 
-function calculateAiCredits(normalizedUsage, model, state = aiCreditsState, provider = undefined) {
+function checkModelPricing(model, provider = undefined, options = {}) {
+  if (model && !isModelPriceable(model, provider, options)) warnMissingModelPricing(model);
+  return null;
+}
+
+function calculateAiCredits(normalizedUsage, model, state = aiCreditsState, provider = undefined, options = {}) {
   const reportedInput = normalizedUsage.input_tokens || 0;
   const cacheReadTokens = normalizedUsage.cache_read_tokens || 0;
   const cacheWriteTokens = normalizedUsage.cache_write_tokens || 0;
@@ -297,8 +329,15 @@ function calculateAiCredits(normalizedUsage, model, state = aiCreditsState, prov
   const totalInputForTier = additiveInput
     ? reportedInput + cacheReadTokens + cacheWriteTokens
     : reportedInput;
-  const pricingResolution = resolveModelPricing(model, state, provider, totalInputForTier);
+  const pricingResolution = resolveModelPricing(model, state, provider, totalInputForTier, options);
   if (!pricingResolution) return null;
+  if (options.catalogue &&
+      !['operator', 'shared_catalog', 'provider', 'central_feed'].includes(pricingResolution.source)) {
+    logRequest('info', 'central_feed_pricing_fallback', {
+      provider, model: sanitizeForLog(model), revision: options.catalogue.revision,
+      reason: 'no_fresh_supported_scoped_tariff', fallback_source: pricingResolution.source,
+    });
+  }
   const { pricing } = pricingResolution;
   const dynamicSelector = getDynamicSelectorDescriptor(model, provider);
 
@@ -321,7 +360,15 @@ function calculateAiCredits(normalizedUsage, model, state = aiCreditsState, prov
   const cacheWriteCredits = pricing.cacheWrite
     ? (cacheWriteTokens * pricing.cacheWrite) / CREDIT_DENOMINATOR
     : 0;
-  const outputCredits = ((normalizedUsage.output_tokens || 0) * pricing.output) / CREDIT_DENOMINATOR;
+  const outputTokens = normalizedUsage.output_tokens || 0;
+  const reasoningTokens = Math.min(
+    Math.max(0, normalizedUsage.reasoning_tokens || 0),
+    Math.max(0, outputTokens),
+  );
+  const reasoningCredits = (reasoningTokens * (pricing.reasoning ?? pricing.output)) / CREDIT_DENOMINATOR;
+  const outputCredits = (
+    (Math.max(0, outputTokens - reasoningTokens) * pricing.output / CREDIT_DENOMINATOR)
+  ) + reasoningCredits;
   const totalCredits = inputCredits + cachedInputCredits + cacheWriteCredits + outputCredits;
 
   return {
@@ -335,6 +382,8 @@ function calculateAiCredits(normalizedUsage, model, state = aiCreditsState, prov
     pricingObservedAt: pricingResolution.observedAt,
     pricingApiVersion: pricingResolution.apiVersion,
     pricingDiscountPercent: pricingResolution.discountPercent,
+    pricingCatalogId: pricingResolution.pricingCatalogId,
+    pricingCatalogVersion: pricingResolution.pricingCatalogVersion,
     accountingPolicy: pricingResolution.accountingPolicy ||
       (dynamicSelector ? 'dynamic_selector_runtime' : model === 'unknown' ? 'unknown_model_fallback' : 'concrete_model'),
     usedFallbackPricing: pricingResolution.usedFallbackPricing === true ||
@@ -345,10 +394,10 @@ function calculateAiCredits(normalizedUsage, model, state = aiCreditsState, prov
   };
 }
 
-function applyAiCreditsUsage(normalizedUsage, model, provider = undefined) {
+function applyAiCreditsUsage(normalizedUsage, model, provider = undefined, options = {}) {
   if (!normalizedUsage) return null;
   const safeModel = model || 'unknown';
-  const calc = calculateAiCredits(normalizedUsage, safeModel, aiCreditsState, provider);
+  const calc = calculateAiCredits(normalizedUsage, safeModel, aiCreditsState, provider, options);
   if (!calc) return null;
 
   if (!Object.hasOwn(aiCreditsState.byModel, safeModel)) {
@@ -360,6 +409,8 @@ function applyAiCreditsUsage(normalizedUsage, model, provider = undefined) {
       totalCredits: 0,
       pricingSource: calc.pricingSource,
       pricingTier: calc.pricingTier,
+      pricingCatalogId: calc.pricingCatalogId,
+      pricingCatalogVersion: calc.pricingCatalogVersion,
       accountingPolicy: calc.accountingPolicy,
       fallbackPricingUsed: calc.usedFallbackPricing,
       dynamicSelector: calc.dynamicSelector,
@@ -374,10 +425,13 @@ function applyAiCreditsUsage(normalizedUsage, model, provider = undefined) {
   modelBucket.totalCredits += calc.totalCredits;
   modelBucket.pricingSource = calc.pricingSource;
   modelBucket.pricingTier = calc.pricingTier;
+  modelBucket.pricingCatalogId = calc.pricingCatalogId;
+  modelBucket.pricingCatalogVersion = calc.pricingCatalogVersion;
   modelBucket.accountingPolicy = calc.accountingPolicy;
   modelBucket.fallbackPricingUsed = calc.usedFallbackPricing;
   modelBucket.dynamicSelector = calc.dynamicSelector;
   aiCreditsState.totalAiCredits += calc.totalCredits;
+  updateAiCreditSteeringThresholds();
 
   process.env.AWF_AI_CREDITS_USED = String(roundCredits(aiCreditsState.totalAiCredits));
 
@@ -390,6 +444,8 @@ function applyAiCreditsUsage(normalizedUsage, model, provider = undefined) {
     totalAiCredits: roundCredits(aiCreditsState.totalAiCredits),
     pricingSource: calc.pricingSource,
     pricingTier: calc.pricingTier,
+    ...(calc.pricingCatalogId ? { pricingCatalogId: calc.pricingCatalogId } : {}),
+    ...(calc.pricingCatalogVersion ? { pricingCatalogVersion: calc.pricingCatalogVersion } : {}),
     accountingPolicy: calc.accountingPolicy,
     fallbackPricingUsed: calc.usedFallbackPricing,
     dynamicSelector: calc.dynamicSelector,
@@ -402,6 +458,9 @@ function applyAiCreditsUsage(normalizedUsage, model, provider = undefined) {
 }
 
 function getAiCreditsReflectState() {
+  const config = getAiCreditsConfig();
+  const effectiveCeiling = getEffectiveAiCreditsCeiling(config);
+  const reflectedTotal = Math.min(aiCreditsState.totalAiCredits, effectiveCeiling);
   const byModel = {};
   for (const [model, usage] of Object.entries(aiCreditsState.byModel)) {
     byModel[model] = {
@@ -412,6 +471,8 @@ function getAiCreditsReflectState() {
       total: roundCredits(usage.totalCredits),
       pricing_source: usage.pricingSource,
       pricing_tier: usage.pricingTier,
+      ...(usage.pricingCatalogId ? { pricing_catalog_id: usage.pricingCatalogId } : {}),
+      ...(usage.pricingCatalogVersion ? { pricing_catalog_version: usage.pricingCatalogVersion } : {}),
       accounting_policy: usage.accountingPolicy || null,
       fallback_pricing_used: usage.fallbackPricingUsed === true,
       dynamic_selector: usage.dynamicSelector || null,
@@ -419,8 +480,33 @@ function getAiCreditsReflectState() {
   }
   return {
     total: roundCredits(aiCreditsState.totalAiCredits),
+    max_ai_credits: config.max,
+    effective_max_ai_credits: effectiveCeiling,
+    percent_used: Math.round((reflectedTotal / effectiveCeiling) * 10000) / 100,
+    thresholds_crossed: [...aiCreditsState.emittedThresholds].sort((a, b) => a - b),
+    thresholds_pending: [...aiCreditsState.uninjectedThresholds].sort((a, b) => a - b),
     by_model: byModel,
   };
+}
+
+const AI_CREDIT_STEERING_MESSAGES = {
+  80: 'You have used 80% of your AI-credit budget. Begin planning to wrap up your current work.',
+  90: 'You have used 90% of your AI-credit budget. Complete your current task and prepare final output.',
+  95: 'You have used 95% of your AI-credit budget. Finalize and submit your work now.',
+  99: 'You have used 99% of your AI-credit budget. You are about to be cut off. Submit immediately.',
+};
+
+function getPendingAiCreditSteeringWarning() {
+  updateAiCreditSteeringThresholds();
+  if (aiCreditsState.uninjectedThresholds.size === 0) return null;
+  const threshold = Math.max(...aiCreditsState.uninjectedThresholds);
+  const text = AI_CREDIT_STEERING_MESSAGES[threshold] ||
+    `You have used ${threshold}% of your AI-credit budget.`;
+  return { threshold, message: `[AWF AI CREDIT WARNING] ${text}` };
+}
+
+function acknowledgeAiCreditSteeringWarning(threshold) {
+  aiCreditsState.uninjectedThresholds.delete(threshold);
 }
 
 function getAiCreditsBlockState() {
@@ -474,7 +560,9 @@ module.exports = {
   getAiCreditsReflectState,
   getAiCreditsBlockState,
   buildAiCreditsLimitError,
-  checkUnknownModelRejection,
+  getPendingAiCreditSteeringWarning,
+  acknowledgeAiCreditSteeringWarning,
+  checkModelPricing,
   isRecognizedDynamicSelector,
   isModelPriceable,
   canonicalizeModel,

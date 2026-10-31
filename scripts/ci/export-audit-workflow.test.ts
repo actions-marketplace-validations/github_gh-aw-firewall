@@ -16,6 +16,7 @@ describe('export audit workflow optimization config', () => {
 
     // Rec 2: max-turns reduced
     expect(source).toContain('max-turns: 6');
+    expect(source).toContain('model: auto');
     expect(source).toContain('HARD LIMIT: You have at most 6 turns total.');
     expect(source).not.toContain('max-turns: 12');
 
@@ -69,6 +70,8 @@ describe('export audit workflow optimization config', () => {
 
     // Rec 2: reduced max-turns
     expect(lock).toContain('GH_AW_MAX_TURNS: 6');
+    expect(lock).toContain('"agent_model":"auto"');
+    expect(lock).toContain('COPILOT_MODEL: auto');
     expect(lock).not.toContain('--max-turns 12');
 
     // Rec 5: consolidated step
@@ -81,6 +84,6 @@ describe('export audit workflow optimization config', () => {
     expect(lock).not.toContain('TypeScript build output:\n```');
 
     // github-mcp-server image reference present
-    expect(lock).toContain('ghcr.io/github/github-mcp-server:v1.11.0');
+    expect(lock).toContain('ghcr.io/github/github-mcp-server:v2.0.3');
   });
 });

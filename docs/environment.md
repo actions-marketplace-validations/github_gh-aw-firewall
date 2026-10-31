@@ -1,5 +1,8 @@
 # Environment Variables
 
+For mount destinations, service identities, host modes and runtime-specific
+sharing, see the [Filesystem Sharing Contract](filesystem-sharing-contract.md).
+
 ## Usage
 
 ```bash
@@ -50,6 +53,8 @@ Using `--env-all` passes all host environment variables to the container, which 
 
 `--env-all` is not a safe way to troubleshoot authentication. Do not expose Actions OIDC request variables to the agent to support HTTP MCP `auth.type: github-oidc`: gh-aw launches mcpg separately from a runner-owned step. [github/gh-aw#50053](https://github.com/github/gh-aw/issues/50053), which tracked that boundary and existing-lock compatibility, is resolved by [github/gh-aw#50054](https://github.com/github/gh-aw/pull/50054). The [Auth Doctor Updater workflow](../.github/workflows/auth-doctor-updater.md) audits this guidance without running credential probes.
 
+**Unmounted `RUNNER_TEMP` paths:** `--env-all` drops any host variable whose value is an absolute path strictly inside `$RUNNER_TEMP` that no agent mount covers (for example setup-uv's `UV_CACHE_DIR=$RUNNER_TEMP/setup-uv-cache` and `UV_PYTHON_INSTALL_DIR=$RUNNER_TEMP/uv-python-dir`), logging each at debug level. Tools then fall back to their defaults under the allowlisted `$HOME/.cache` and `$HOME/.local`. Paths under mounted subtrees such as `$RUNNER_TEMP/gh-aw` are kept, and an explicit `--env VAR=...` still overrides the filter.
+
 **Proxy variables:** `HTTP_PROXY`, `HTTPS_PROXY`, `http_proxy`, `https_proxy`, `NO_PROXY`, `no_proxy`, `ALL_PROXY`, and `FTP_PROXY` (all case variants) from the host are **excluded from container passthrough** when using `--env-all`. The firewall sets its own proxy variables pointing to Squid inside the container. However, host proxy variables **are read** for upstream proxy auto-detection — if the host has `https_proxy`/`http_proxy` set, AWF configures Squid to chain outbound traffic through that corporate proxy (see [Upstream Proxy Support](#upstream-corporate-proxy-support)).
 
 ## `--env-file` Support
@@ -98,6 +103,43 @@ sudo -E awf --allow-domains github.com 'copilot --prompt "..."'
 - Working with untrusted code
 - In production/CI environments
 
+## Provider-neutral API key (API proxy)
+
+Set `AWF_AGENT_API_KEY` and `AWF_AGENT_API_PROVIDER` in the **host environment**
+to supply a BYO-endpoint key without changing its secret name when switching
+engines. The API proxy is always enabled; the deprecated `--enable-api-proxy`
+flag is not needed. AWF resolves the key before starting the sidecar; only the
+selected provider receives it.
+
+| `AWF_AGENT_API_PROVIDER` | Native variable (takes precedence when non-empty) |
+|---|---|
+| `openai` (Codex/OpenAI-compatible clients) | `OPENAI_API_KEY` |
+| `anthropic` (Claude) | `ANTHROPIC_API_KEY` |
+| `copilot` (Copilot BYOK) | `COPILOT_PROVIDER_API_KEY` |
+| `gemini` | `GEMINI_API_KEY` |
+| `vertex` | `GOOGLE_API_KEY` |
+
+```bash
+export AWF_AGENT_API_PROVIDER=openai
+export AWF_AGENT_API_KEY="$AGENT_API_KEY"
+sudo -E awf --allow-domains api.openai.com 'codex exec "..."'
+```
+
+Provider names are case-insensitive. A non-empty neutral key requires an explicit
+supported provider; AWF does not infer it from the command or endpoint, and does
+not distribute it to other providers. Endpoint configuration is unchanged.
+For Copilot this is a **provider API key**, not a `COPILOT_GITHUB_TOKEN`.
+
+The API proxy cannot be disabled. Both `AWF_AGENT_API_KEY` and the compiler's
+`AGENT_API_KEY` source variable are excluded from the agent environment,
+including `--env-all`, `--env`, and `--env-file` passthrough. Supply the key on
+the host, not through agent environment flags. The agent receives the existing
+provider-specific placeholders and proxy URLs.
+
+The workflow-level `AGENT_API_KEY` secret declaration and mapping for the selected
+`engine.id` belong to the gh-aw compiler; this AWF alias does not change compiler
+validation or reusable workflow secret declarations.
+
 ## `COPILOT_GITHUB_TOKEN` and Classic PAT Compatibility
 
 When `COPILOT_GITHUB_TOKEN` is set in the host environment, AWF injects it into the agent container so the Copilot CLI can authenticate against the GitHub Copilot API.
@@ -121,7 +163,7 @@ Copilot CLI 1.0.21 introduced a startup model validation step: when `COPILOT_MOD
 ```
 
 **Remediation options:**
-1. Replace the classic PAT with a **fine-grained PAT** or **OAuth token** (these are accepted by the `/models` endpoint).
+1. Replace the classic PAT with a **fine-grained PAT** or **OAuth token** (these are accepted by the `/models` endpoint). Since [PR #8038](https://github.com/github/gh-aw-firewall/pull/8038), fine-grained PATs (`github_pat_*`) always authenticate to every Copilot target (github.com, GHEC, GHES, Business) with the standard `Bearer` prefix. Classic PATs/OAuth tokens use `token` on enterprise and business targets, while GHEC data-residency targets use `Bearer` — see [docs/auth-matrix.md](auth-matrix.md#auth-header-prefix-rules).
 2. Remove `COPILOT_MODEL` from the agent environment to skip model validation entirely.
 
 ## Anthropic WIF environment notes
@@ -142,6 +184,15 @@ If both are set in the same runtime, the API key can silently shadow WIF/OIDC au
 In AWF API-proxy mode this is mitigated by placeholder values (`sk-ant-placeholder-key-for-credential-isolation`) in the
 agent container, but avoid setting a real `ANTHROPIC_API_KEY` alongside WIF variables in the
 same process.
+
+## Gemini CLI compatibility (API proxy)
+
+| Gemini CLI version | Status with `--enable-api-proxy` | Notes |
+|--------------------|----------------------------------|-------|
+| ≤ 0.43.x | Supported | `GOOGLE_GEMINI_BASE_URL` selects API-key auth directly. |
+| ≥ 0.44.0 (incl. 0.55.1) | Supported | Without a pinned auth type the CLI maps `GOOGLE_GEMINI_BASE_URL` to its unsupported `gateway` auth type and exits 41 with `Invalid auth method selected.` ([gemini-cli#27550](https://github.com/google-gemini/gemini-cli/issues/27550)). AWF pins `security.auth.selectedType` to `gemini-api-key` via `GEMINI_CLI_SYSTEM_SETTINGS_PATH`, so these versions run normally and no CLI downgrade is needed. |
+
+The pinned settings file lives at `/etc/awf/gemini-cli/settings.json` inside the Compose agent's chroot, in a root-owned, read-only named volume initialized before agent startup. Gemini requires secure ownership and permissions on every ancestor; settings beneath the writable runner home are rejected. The home remains writable and the host's `~/.gemini` directory is never modified by this system-settings staging. The file is not staged for non-Compose backends, Vertex AI (`GOOGLE_GENAI_USE_VERTEXAI=true`), or Google-account (`GOOGLE_GENAI_USE_GCA=true`) runs, whose auth types the CLI resolves before the `gateway` branch. See [api-proxy-sidecar.md](api-proxy-sidecar.md#gemini-cli-exits-41-with-invalid-auth-method-selected).
 
 ## Internal Environment Variables
 
@@ -190,6 +241,10 @@ If you see instead:
 
 the runner did not set `GITHUB_PATH`, and the tool's bin directory must already be in `$PATH` at AWF launch time.
 
+## Token Usage Log in GitHub Actions
+
+When AWF preserves an API-proxy token usage log in GitHub Actions, it exports its runner-visible path as `AWF_TOKEN_USAGE_LOG` via `$GITHUB_ENV`. Later workflow steps can read this variable to locate `token-usage.jsonl`; it is only set when the log file exists. See [ARC/DinD token usage guidance](arc-dind.md#locating-api-proxy-token-usage-logs).
+
 ## Debugging Environment Variables
 
 The following environment variables control debugging behavior:
@@ -229,8 +284,14 @@ Any variable present in the host environment with the `OTEL_` prefix is passed t
 export OTEL_SERVICE_NAME=my-agent
 export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com
 export OTEL_EXPORTER_OTLP_HEADERS="Authorization=Bearer $MY_OTEL_TOKEN"
-sudo -E awf --allow-domains otel.example.com -- agent-command
+sudo -E awf -- agent-command
 ```
+
+### Automatic OTLP endpoint allowlisting
+
+AWF automatically allows the OTLP collector endpoint when `OTEL_EXPORTER_OTLP_ENDPOINT` (or a per-signal `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` / `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT`) is set. Values are resolved from `--env` first, then `--env-file`, then the host environment, so you no longer need to pass `--allow-domains` for the collector. A debug log line (`--log-level debug`) records the allowed host and port.
+
+Only the **exact hostname and endpoint port** parsed from the endpoint URL are allowed (no wildcard/subdomain expansion). Only `http://`/`https://` URLs are considered — malformed URLs, dangerous ports, and schemes AWF doesn't recognize (e.g. a bare gRPC `host:port` with no `http(s)://` prefix) are skipped and must still be configured separately if reachable over HTTP(S).
 
 ### Security: one-shot token protection for OTEL credentials
 
@@ -245,10 +306,11 @@ The following OTEL variables often carry bearer tokens or other credentials and 
 
 ### Network requirements
 
-- **OTLP/HTTP (`http/protobuf`, default):** Traffic goes through the Squid proxy on ports 80/443. Add the OTLP collector domain to `--allow-domains`:
+- **OTLP/HTTP (`http/protobuf`, default):** Traffic goes through the Squid proxy on ports 80/443. The collector domain is [auto-allowed](#automatic-otlp-endpoint-allowlisting) from `OTEL_EXPORTER_OTLP_ENDPOINT` / `_TRACES_ENDPOINT` / `_METRICS_ENDPOINT` / `_LOGS_ENDPOINT`, so no `--allow-domains` flag is normally required:
 
   ```bash
-  awf --allow-domains otel.example.com -- agent-command
+  export OTEL_EXPORTER_OTLP_ENDPOINT=https://otel.example.com
+  awf -- agent-command
   ```
 
 - **OTLP/gRPC (port 4317):** gRPC clients typically do not respect `HTTP_PROXY` env vars, and port 4317 is not covered by AWF's iptables DNAT rules (only 80/443). Traffic to port 4317 hits the default DROP rule and is blocked. Use `http/protobuf` protocol instead:
@@ -372,6 +434,84 @@ container:
 
 > **See also:** [docs/arc-dind.md](arc-dind.md) for a complete ARC/DinD configuration guide, including sysroot staging, tool-cache guidance, and end-to-end examples.
 
+### `--mount` and read-only vs. writable output paths
+
+A `--mount <host_path>:<container_path>[:ro|rw]` entry only grants the access
+level given for **that specific mount**. Mounting a directory `:ro` so a tool
+can read staged inputs from it does **not** make a subdirectory of that same
+path writable — Docker/runc treats each `--mount` as an independent bind
+mount, so a tool that tries to write its `--output` (or any other file) inside
+a `:ro`-mounted tree will fail even though the path "looks" present.
+
+If a tool needs to both read from and write under a shared parent directory
+(a common pattern for ARC/DinD staging under `${RUNNER_TEMP}/gh-aw`), mount
+the writable subpath explicitly as `:rw` in addition to the `:ro` parent:
+
+```bash
+# Every --mount host path must exist first: AWF aborts with
+# "Host path does not exist" before the command runs otherwise.
+mkdir -p /tmp/gh-aw/inputs /tmp/gh-aw/my-tool
+
+awf --mount /tmp/gh-aw/inputs:/tmp/gh-aw/inputs:ro \
+    --mount /tmp/gh-aw/my-tool:/tmp/gh-aw/my-tool:rw \
+    --allow-domains github.com \
+    -- my-tool --output /tmp/gh-aw/my-tool/result.json
+```
+
+When one mount is nested inside another, Docker applies bind mounts in
+destination order, so the more specific `rw` mount for the subdirectory takes
+precedence over a broader `ro` mount of its ancestor.
+
+Also double-check that the path a tool **writes** to and the path a later
+step (or artifact-upload action) **reads** from are the same path once
+`--docker-host-path-prefix` translation is applied — a producer/consumer path
+mismatch (e.g. writing under `${RUNNER_TEMP}/gh-aw/...` but reading from
+`/tmp/gh-aw/...`, which `--docker-host-path-prefix` does not alias) fails
+silently: no error is raised, but the expected output file never appears where
+the consumer looks for it. See
+[docs/arc-dind.md](arc-dind.md#staging-additional-cli-tools-not-just-the-invoking-engine-binary)
+for the full staging + rw-mount pattern, using a threat-detection tool as a
+worked example.
+
+### `--mount` does not grant engine file scope
+
+Mount visibility, host permissions, and engine file scope are separate checks.
+Neither `:ro` nor `:rw` grants an engine permission to read a mounted directory.
+The workload user still needs filesystem read/traverse permission, and engines
+such as Copilot require their own scope grant (for example, `--add-dir`).
+AWF passes the command through unchanged; it does not add engine scope flags.
+
+For example, mount staged inputs read-only and grant Copilot the
+**sandbox-visible destination**, not a different host source path:
+
+```bash
+# Stage the required input files in this directory before invoking AWF.
+mkdir -p "${RUNNER_TEMP}/gh-aw/threat-detection"
+awf --mount "${RUNNER_TEMP}/gh-aw/threat-detection:/tmp/gh-aw/threat-detection:ro" \
+    --allow-domains github.com,api.githubcopilot.com \
+    -- copilot --add-dir /tmp/gh-aw/threat-detection \
+       --prompt "Analyze the staged inputs in /tmp/gh-aw/threat-detection"
+```
+
+This illustrates a direct Copilot invocation, not the `threat-detect` interface.
+When a wrapper launches the engine, it must grant scope to that subprocess;
+adding a mount or granting scope to a separate agent invocation is insufficient.
+
+AWF validates mount syntax and host source existence, but has no input-specific
+readability preflight. A host-side check (possibly running as root) cannot prove
+access under the sandbox user's identity or the engine's file policy.
+Inside the sandbox, `test -r` on each required file and `test -x` on its parent
+directories are preliminary checks only: the detector must successfully open
+and consume every required input through its actual engine/tool path.
+Missing or unreadable inputs, engine permission denials, or a missing/invalid
+verdict must fail detection closed, never produce a clean verdict.
+An empty directory or a zero engine exit status is not evidence of analysis.
+
+The detector scope grant and fail-closed verdict handling belong to `gh-aw` /
+`threat-detect` ([github/gh-aw#72897](https://github.com/github/gh-aw/issues/72897)),
+not AWF's mount layer. See also the
+[ARC/DinD ownership and verification guidance](arc-dind.md#agent-logs-threat-detection-and-safe-output-ownership).
+
 ### Security: procfs and credential isolation
 
 AWF mounts a container-scoped procfs at `/host/proc` with `hidepid=2` to prevent the agent from reading other processes' environment variables. This is critical because:
@@ -379,6 +519,44 @@ AWF mounts a container-scoped procfs at `/host/proc` with `hidepid=2` to prevent
 - PID 1 (the entrypoint) may briefly hold authentication tokens before `unset_sensitive_tokens()` clears them
 - Without `hidepid=2`, an agent could race to read `/proc/1/environ` and extract credentials
 - The `/dev/fd` → `/proc/self/fd` symlink provides an indirect path to procfs that `hidepid=2` also blocks
+
+### UID/GID remapping and host-side steps that share `/tmp/gh-aw`
+
+AWF's agent container remaps its internal `awfuser` UID/GID to match the
+invoking host user (`setup_user_identity()` in
+[`entrypoint.sh`](../containers/agent/entrypoint.sh)) so that files the agent
+creates on bind-mounted host paths — including the shared scratch tree used by
+gh-aw features like `tools.cache-memory` (`/tmp/gh-aw`) — are normally owned by
+that same host user.
+
+However, a later **host-side** step that runs after the agent container has
+already exited (for example gh-aw's post-agent `validateMemoryStep`, which
+writes a validation marker under `/tmp/gh-aw/memory-validation/*.ok`) can still
+run under a slightly different effective identity than the one AWF remapped
+to inside the container (e.g. when AWF is invoked as native root without
+`sudo`, where the real host UID cannot be recovered from `SUDO_UID`/`SUDO_GID`
+and AWF falls back to a default unprivileged UID/GID). If that identity
+doesn't exactly match the UID that owns the newly created directories, the
+host-side step fails with `EACCES: permission denied`.
+
+To reduce this class of failure, AWF's entrypoint:
+
+- Sets `umask 0002` for the user command, so new files/directories the agent
+  creates default to being group-writable.
+- Adds group write/execute permissions to the `/tmp/gh-aw` handoff root and
+  the known host-side `memory-validation` handoff directory (as root, from
+  outside the chroot) right after the agent command exits — whether it
+  succeeded, failed, or was signaled — so a host-side step that shares the same
+  primary group as the mapped agent user can still write into the required
+  handoff directories. This intentionally does **not** recurse through the
+  whole `/tmp/gh-aw` tree or make it world-writable, to avoid widening access
+  to unrelated payload-bearing files on multi-user self-hosted runners.
+
+If a host-side step still cannot write into `/tmp/gh-aw` after the agent
+exits (for example because the host step's group also doesn't match), invoke
+`awf` with `sudo` rather than as native root so the real host UID/GID can be
+recovered from `SUDO_UID`/`SUDO_GID`, or adjust the failing step to run as the
+same user/group that invoked `awf`.
 
 ### Limitation
 

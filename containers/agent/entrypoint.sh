@@ -2,6 +2,13 @@
 set -e
 
 configure_output_routing() {
+if [ "${AWF_CAPTURE_COMMAND_OUTPUT:-}" = "1" ]; then
+  # Preserve the container streams for command bytes and keep AWF setup
+  # diagnostics out of both captured streams.
+  exec 3>&1 4>&2
+  exec >/dev/null 2>&1
+  return
+fi
 if [ "${AWF_COMMAND_STDOUT_ONLY:-}" != "1" ]; then
   return
 fi
@@ -12,7 +19,9 @@ exec 1>&2
 }
 
 run_command_with_stdout() {
-if [ "${AWF_COMMAND_STDOUT_ONLY:-}" = "1" ]; then
+if [ "${AWF_CAPTURE_COMMAND_OUTPUT:-}" = "1" ]; then
+  "$@" >&3 2>&4 3>&- 4>&-
+elif [ "${AWF_COMMAND_STDOUT_ONLY:-}" = "1" ]; then
   "$@" >&3 3>&-
 else
   "$@"
@@ -143,6 +152,7 @@ if [ "${AWF_SSL_BUMP_ENABLED}" = "true" ]; then
     echo "[entrypoint] CA certificates updated for SSL Bump"
     echo "[entrypoint] NODE_EXTRA_CA_CERTS set to $NODE_EXTRA_CA_CERTS"
     echo "[entrypoint] ⚠️  WARNING: HTTPS traffic will be intercepted for URL inspection"
+    sh /opt/awf/trust/install-system-trust.sh
   else
     echo "[entrypoint][WARN] SSL Bump enabled but CA certificate not found"
   fi
@@ -502,6 +512,74 @@ unset_sensitive_tokens() {
   done
 }
 
+# Space-separated list of gh-aw handoff subdirectory names; names must not
+# contain spaces because relax_gh_aw_shared_permissions iterates by word.
+GH_AW_HOST_HANDOFF_DIRS="memory-validation"
+
+# Relax permissions on host-shared gh-aw scratch handoff directories after the
+# agent command has finished.
+#
+# AWF remaps the agent's UID/GID to match the host user (see
+# setup_user_identity), so new files the agent creates under /tmp/gh-aw
+# ordinarily belong to that same host user. However this function runs as a
+# defense-in-depth measure for cases where the effective UID/GID still ends
+# up mismatched from whatever identity a later host-side step runs as (for
+# example gh-aw's post-agent validateMemoryStep, which writes a validation
+# marker under /tmp/gh-aw/memory-validation after the container has exited).
+# Without this, that step can fail with EACCES even though the directory
+# tree looks otherwise fine.
+#
+# We only add the group-write bit (not world-writable), and only to the shared
+# handoff root plus known host-side handoff subdirectories, to avoid materially
+# widening access on multi-user self-hosted runners or payload-bearing audit
+# files elsewhere in the gh-aw tree. Combined with the ownership transfer
+# already performed before the command ran, this covers the common case where
+# the host step shares the same primary group as the mapped agent user.
+#
+# This must run here (as root, still in the container's own filesystem view)
+# rather than after the `chroot ... capsh` invocation in run_chroot_command,
+# because that invocation ends with `exec capsh`, which replaces the chroot
+# shell's process image entirely — any code placed after it in
+# run_chroot_command would never execute.
+relax_gh_aw_shared_permissions() {
+  local gh_aw_dir=""
+  if [ -e /host/tmp/gh-aw ] || [ -L /host/tmp/gh-aw ]; then
+    gh_aw_dir="/host/tmp/gh-aw"
+  elif [ -e /tmp/gh-aw ] || [ -L /tmp/gh-aw ]; then
+    gh_aw_dir="/tmp/gh-aw"
+  else
+    return 0
+  fi
+
+  if ! relax_gh_aw_handoff_dir "${gh_aw_dir}"; then
+    return 0
+  fi
+
+  local handoff_subdir
+  for handoff_subdir in ${GH_AW_HOST_HANDOFF_DIRS}; do
+    relax_gh_aw_handoff_dir "${gh_aw_dir}/${handoff_subdir}"
+  done
+  return 0
+}
+
+relax_gh_aw_handoff_dir() {
+  local handoff_dir="$1"
+  if [ ! -e "${handoff_dir}" ]; then
+    return 0
+  fi
+  if [ ! -d "${handoff_dir}" ] || [ -L "${handoff_dir}" ]; then
+    echo "[entrypoint][WARN] Skipping unsafe gh-aw handoff path ${handoff_dir}" >&2
+    return 1
+  fi
+  if chmod g+rwx "${handoff_dir}" 2>/dev/null; then
+    echo "[entrypoint] Relaxed ${handoff_dir} group permissions for host-side post-processing" >&2
+    return 0
+  else
+    echo "[entrypoint][WARN] Failed to relax ${handoff_dir} group permissions" >&2
+    return 1
+  fi
+}
+
 # Run a command with signal handling, one-shot token protection, and clean exit.
 # Usage: run_agent_with_token_protection <command> [args...]
 # The command is launched in the background so that sensitive tokens can be unset
@@ -522,6 +600,7 @@ run_agent_with_token_protection() {
       wait "$AGENT_PID" 2>/dev/null || true
     fi
 
+    relax_gh_aw_shared_permissions
     exit "$EXIT_CODE"
   }
   trap 'cleanup_and_exit TERM' TERM
@@ -545,9 +624,10 @@ run_agent_with_token_protection() {
   unset_sensitive_tokens
 
   # Wait for agent command to complete and capture its exit code
-  wait $AGENT_PID
-  EXIT_CODE=$?
+  EXIT_CODE=0
+  wait "$AGENT_PID" || EXIT_CODE=$?
   trap - TERM INT
+  relax_gh_aw_shared_permissions
   exit $EXIT_CODE
 }
 
@@ -658,6 +738,93 @@ copy_preload_libs() {
       echo "[entrypoint][ERROR] Could not create /run/awf-lib directory" >&2
       echo "[entrypoint][ERROR] Refusing to start without one-shot token protection" >&2
       exit 1
+    fi
+  fi
+}
+
+copy_browser_libs() {
+  # Stage the Ubuntu 22.04 Chromium/Playwright runtime payload baked into the image
+  # (containers/agent/Dockerfile: browser-libs stage) so it is visible inside the
+  # chroot. Installing the packages into the image's /usr is not sufficient on
+  # its own: AWF_CHROOT_ENABLED=true chroots to /host, and buildSystemMounts()
+  # bind-mounts the runner's own /usr, /lib, etc. over the image's, shadowing
+  # anything installed in this layer.
+  #
+  # The Dockerfile records the manifest of .so files owned by those packages
+  # (including their transitive dependencies, e.g. fontconfig/freetype/harfbuzz)
+  # at /usr/local/share/awf/browser-libs.manifest. We copy each one, preserving
+  # its original directory structure, under /run/awf-lib/browser-libs -- which
+  # lives on the container's own writable rootfs (not bind-mounted) -- and point
+  # LD_LIBRARY_PATH at the resulting directories. Keep the runner's existing
+  # libraries: overriding them with older GLib, etc. can break newer host tools.
+  #
+  # Sets BROWSER_LD_LIBRARY_PATH (empty string if unavailable or nothing to stage).
+  BROWSER_LD_LIBRARY_PATH=""
+  MANIFEST="/usr/local/share/awf/browser-libs.manifest"
+  SOURCE_ROOT="/usr/local/share/awf/browser-libs"
+  if [ -s "$MANIFEST" ]; then
+    STAGE_ROOT="/host/run/awf-lib/browser-libs"
+    if mkdir -p "$STAGE_ROOT" 2>/dev/null; then
+      CHECK_MANIFEST="${STAGE_ROOT}/.manifest"
+      if ! cp "$MANIFEST" "$CHECK_MANIFEST" 2>/dev/null; then
+        echo "[entrypoint][WARN] Could not prepare browser runtime library lookup; Chromium/Playwright browsers may fail to launch" >&2
+        return
+      fi
+      if ! RUNNER_LIBS="$(chroot /host /bin/sh -c '
+        while IFS= read -r lib; do
+          if [ -e "$lib" ] || [ -L "$lib" ]; then
+            printf "path:%s\n" "$lib"
+          fi
+        done < "$1"
+        /sbin/ldconfig -p 2>/dev/null | while IFS= read -r line; do
+          set -f
+          set -- $line
+          if [ "$3" = "=>" ] && [ -f "$4" ] && [ -r "$4" ]; then
+            printf "name:%s\n" "$1"
+          fi
+        done
+      ' sh "/run/awf-lib/browser-libs/.manifest" 2>/dev/null)"; then
+        rm -f "$CHECK_MANIFEST"
+        echo "[entrypoint][WARN] Could not inspect runner browser libraries; Chromium/Playwright browsers may fail to launch" >&2
+        return
+      fi
+      rm -f "$CHECK_MANIFEST"
+      RUNNER_LIBS="
+${RUNNER_LIBS}
+"
+      LIB_DIRS=""
+      while IFS= read -r lib; do
+        [ -z "$lib" ] && continue
+        [ -f "${SOURCE_ROOT}${lib}" ] || continue
+        # Keep exact-path libraries (including plugins and masks), and avoid
+        # overriding a runner library resolved by soname from another directory.
+        case "$RUNNER_LIBS" in
+          *"
+path:$lib
+"*|*"
+name:${lib##*/}
+"*) continue ;;
+        esac
+        dest="${STAGE_ROOT}${lib}"
+        dest_dir="$(dirname "$dest")"
+        if mkdir -p "$dest_dir" 2>/dev/null && cp -L "${SOURCE_ROOT}${lib}" "$dest" 2>/dev/null; then
+          rel_dir="$(dirname "$lib")"
+          case " $LIB_DIRS " in
+            *" $rel_dir "*) ;;
+            *) LIB_DIRS="$LIB_DIRS $rel_dir" ;;
+          esac
+        else
+          echo "[entrypoint][WARN] Could not stage browser runtime library $lib" >&2
+        fi
+      done < "$MANIFEST"
+      if [ -n "$LIB_DIRS" ]; then
+        for rel_dir in $LIB_DIRS; do
+          BROWSER_LD_LIBRARY_PATH="${BROWSER_LD_LIBRARY_PATH:+$BROWSER_LD_LIBRARY_PATH:}/run/awf-lib/browser-libs${rel_dir}"
+        done
+        echo "[entrypoint] Chromium/Playwright runtime libraries staged for chroot at ${STAGE_ROOT}"
+      fi
+    else
+      echo "[entrypoint][WARN] Could not create ${STAGE_ROOT}; Chromium/Playwright browsers may fail to launch" >&2
     fi
   fi
 }
@@ -1006,99 +1173,69 @@ copy_awf_ca_cert() {
 }
 
 copy_system_ca_bundle() {
-  # Detect and copy the host system CA bundle to a chroot-accessible path.
-  # On Amazon Linux / RHEL-family systems, the CA bundle often lives under
-  # /etc/pki/. This function finds the system bundle and, when it is not already
-  # accessible in the chroot, copies it to /run/awf-lib/ so TLS works regardless
-  # of distro.
-  #
-  # In SSL Bump mode, the AWF CA must remain the active trust bundle for MITM
-  # proxy validation. We only append the system bundle to that staged AWF CA.
-  SYSTEM_CA_CHROOT=""
-
-  if [ "${AWF_SSL_BUMP_ENABLED}" = "true" ]; then
-    if [ -z "$AWF_CA_CHROOT" ] || [ ! -f "/host${AWF_CA_CHROOT}" ]; then
-      echo "[entrypoint][WARN] SSL Bump enabled but chroot AWF CA bundle is unavailable — preserving existing TLS env vars"
-      return
-    fi
-
-    # SSL Bump already configured TLS env vars; detect system bundle and append
-    # it to the AWF CA so tools trust both the AWF proxy CA AND the upstream CAs.
-    local SYSTEM_BUNDLE=""
-    for candidate in \
-      /host/etc/ssl/certs/ca-certificates.crt \
-      /host/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-      /host/etc/pki/tls/certs/ca-bundle.crt \
-      /host/etc/pki/tls/cert.pem \
-      /host/etc/ssl/cert.pem; do
-      if [ -s "$candidate" ]; then
-        SYSTEM_BUNDLE="$candidate"
-        break
-      fi
-    done
-    if [ -n "$SYSTEM_BUNDLE" ]; then
-      # Append system bundle to the AWF CA cert so both are trusted
-      if { printf '\n'; cat "$SYSTEM_BUNDLE"; } >> "/host${AWF_CA_CHROOT}" 2>/dev/null; then
-        echo "[entrypoint] System CA bundle ($SYSTEM_BUNDLE) appended to AWF CA cert"
-      fi
-    fi
-    return
-  fi
-
-  # No SSL Bump — detect and expose the system CA bundle for chroot.
-  local SYSTEM_BUNDLE=""
-  for candidate in \
-    /host/etc/ssl/certs/ca-certificates.crt \
-    /host/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem \
-    /host/etc/pki/tls/certs/ca-bundle.crt \
-    /host/etc/pki/tls/cert.pem \
-    /host/etc/ssl/cert.pem; do
-    if [ -s "$candidate" ]; then
-      SYSTEM_BUNDLE="$candidate"
-      break
-    fi
+  # Never point TLS clients straight at a host bundle or hashed CA directory.
+  # Build a private store before covering mounted trust paths in this namespace.
+  local trust="/host/run/awf-lib/trust"
+  local inputs=() candidate
+  local directories=(
+    /host/etc/ssl/certs
+    /host/etc/pki/ca-trust/extracted/pem
+    /host/etc/pki/tls/certs
+  )
+  for candidate in /host/etc/ssl/certs /host/etc/pki/tls/certs \
+    /host/etc/ssl/cert.pem /host/etc/pki/tls/cert.pem \
+    /host/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem; do
+    [ ! -e "$candidate" ] || inputs+=("$candidate")
   done
-
-  if [ -z "$SYSTEM_BUNDLE" ]; then
-    echo "[entrypoint][WARN] No system CA bundle found — TLS may fail inside chroot"
-    return
-  fi
-
-  # Check if the bundle is already accessible inside the chroot via existing mounts.
-  # AWF mounts the common CA roots under /etc/ssl, /etc/ca-certificates, and the
-  # RHEL/Amazon Linux CA roots under /etc/pki/ca-trust/extracted and /etc/pki/tls/certs.
-  local CHROOT_RELATIVE="${SYSTEM_BUNDLE#/host}"
-  case "$CHROOT_RELATIVE" in
-    /etc/ssl/*|/etc/ca-certificates/*|/etc/pki/ca-trust/extracted/*|/etc/pki/tls/certs/*)
-      # Already accessible via existing bind mounts
-      export SSL_CERT_FILE="$CHROOT_RELATIVE"
-      export NODE_EXTRA_CA_CERTS="$CHROOT_RELATIVE"
-      export REQUESTS_CA_BUNDLE="$CHROOT_RELATIVE"
-      export CURL_CA_BUNDLE="$CHROOT_RELATIVE"
-      export GIT_SSL_CAINFO="$CHROOT_RELATIVE"
-      echo "[entrypoint] System CA bundle found at $CHROOT_RELATIVE (already accessible in chroot)"
-      return
-      ;;
-  esac
-
-  # Bundle is not accessible in chroot. Copy it.
-  if mkdir -p /host/run/awf-lib 2>/dev/null; then
-    if cp "$SYSTEM_BUNDLE" /host/run/awf-lib/system-ca-certificates.crt 2>/dev/null && \
-       [ -s /host/run/awf-lib/system-ca-certificates.crt ]; then
-      local CA_PATH="/run/awf-lib/system-ca-certificates.crt"
-      SYSTEM_CA_CHROOT="$CA_PATH"
-      export SSL_CERT_FILE="$CA_PATH"
-      export NODE_EXTRA_CA_CERTS="$CA_PATH"
-      export REQUESTS_CA_BUNDLE="$CA_PATH"
-      export CURL_CA_BUNDLE="$CA_PATH"
-      export GIT_SSL_CAINFO="$CA_PATH"
-      echo "[entrypoint] System CA bundle copied from $SYSTEM_BUNDLE to $CA_PATH"
+  if [ -n "${AWF_CA_CHROOT:-}" ]; then
+    inputs+=("/host${AWF_CA_CHROOT}")
+  elif [ -n "${NODE_EXTRA_CA_CERTS:-}" ]; then
+    if [ -f "/host${NODE_EXTRA_CA_CERTS}" ]; then
+      inputs+=("/host${NODE_EXTRA_CA_CERTS}")
     else
-      echo "[entrypoint][WARN] Could not copy system CA bundle to chroot — TLS may fail"
+      inputs+=("${NODE_EXTRA_CA_CERTS}")
     fi
-  else
-    echo "[entrypoint][WARN] Could not create /host/run/awf-lib for system CA bundle"
   fi
+  if [ "${#inputs[@]}" -eq 0 ]; then
+    echo "[entrypoint][ERROR] No CA store available for AWF trust policy" >&2
+    exit 1
+  fi
+  mkdir -p "$trust"
+  sh /opt/awf/trust/filter-ca-store.sh "$trust" "${inputs[@]}"
+  cp /opt/awf/trust/node-trust.cjs "$trust/node-trust.cjs"
+  if [ -e /host/etc/ssl/certs/java/cacerts ]; then
+    mkdir -p "$trust/certs/java"
+    cp -L /host/etc/ssl/certs/java/cacerts "$trust/certs/java/cacerts"
+  fi
+  # The /run staging root is container-local; none of these operations writes
+  # through the read-only host /etc bind mounts.
+  for candidate in "${directories[@]}"; do
+    [ ! -d "$candidate" ] || {
+      mount --bind "$trust/certs" "$candidate"
+      mount -o remount,ro,bind "$candidate"
+    }
+  done
+  for candidate in /host/etc/ssl/cert.pem /host/etc/pki/tls/cert.pem; do
+    [ ! -f "$candidate" ] || {
+      mount --bind "$trust/ca-certificates.crt" "$candidate"
+      mount -o remount,ro,bind "$candidate"
+    }
+  done
+  # Standard CAfile names must also work independently of environment settings.
+  # The overlaid directories no longer contain their original bundle files.
+  for candidate in ca-certificates.crt ca-bundle.crt ca-bundle.pem tls-ca-bundle.pem cert.pem; do
+    cp "$trust/ca-certificates.crt" "$trust/certs/$candidate"
+  done
+  chmod -R a-w "$trust"
+  SYSTEM_CA_CHROOT="/run/awf-lib/trust/ca-certificates.crt"
+  export SSL_CERT_FILE="$SYSTEM_CA_CHROOT"
+  export SSL_CERT_DIR="/run/awf-lib/trust/certs"
+  export NODE_EXTRA_CA_CERTS="$SYSTEM_CA_CHROOT"
+  export REQUESTS_CA_BUNDLE="$SYSTEM_CA_CHROOT"
+  export CURL_CA_BUNDLE="$SYSTEM_CA_CHROOT"
+  export GIT_SSL_CAINFO="$SYSTEM_CA_CHROOT"
+  export NODE_OPTIONS="${NODE_OPTIONS:+${NODE_OPTIONS} }--require=/run/awf-lib/trust/node-trust.cjs"
+  echo "[entrypoint] Filtered host CA trust staged at $SYSTEM_CA_CHROOT (host store unchanged)"
 }
 
 check_chroot_prereqs() {
@@ -1511,6 +1648,7 @@ run_chroot_command() {
   mount_host_cgroupfs
   check_chroot_prereqs
   copy_preload_libs
+  copy_browser_libs
   copy_agent_helper_scripts
   copy_dind_runner_binary
   ensure_usr_local_bin_shims
@@ -1576,8 +1714,8 @@ run_chroot_command() {
     CLEANUP_CMD="${CLEANUP_CMD}; sed -i '/^[0-9.]\\+[[:space:]]\\+host\\.docker\\.internal\$/d' /etc/hosts 2>/dev/null || true"
     echo "[entrypoint] host.docker.internal will be removed from /etc/hosts on exit"
   fi
-  # Clean up /run/awf-lib if anything was copied (one-shot-token, CA cert, key helper)
-  if [ -n "${ONE_SHOT_TOKEN_LIB}" ] || [ -n "${AWF_CA_CHROOT}" ] || [ -n "${SYSTEM_CA_CHROOT}" ] || [ -n "${CHROOT_KEY_HELPER}" ] || [ -n "${STAGED_RUNNER_BINARY_CHROOT}" ]; then
+  # Clean up /run/awf-lib if anything was copied (one-shot-token, CA cert, key helper, browser libs)
+  if [ -n "${ONE_SHOT_TOKEN_LIB}" ] || [ -n "${AWF_CA_CHROOT}" ] || [ -n "${SYSTEM_CA_CHROOT}" ] || [ -n "${CHROOT_KEY_HELPER}" ] || [ -n "${STAGED_RUNNER_BINARY_CHROOT}" ] || [ -n "${BROWSER_LD_LIBRARY_PATH}" ]; then
     CLEANUP_CMD="${CLEANUP_CMD}; rm -rf /run/awf-lib 2>/dev/null || true"
   fi
   # NOTE: the /usr/local/bin overlay is torn down by cleanup_usr_local_bin_overlay(),
@@ -1633,10 +1771,18 @@ run_chroot_command() {
     LD_PRELOAD_CMD="export LD_PRELOAD=${ONE_SHOT_TOKEN_LIB};"
   fi
 
+  # Build LD_LIBRARY_PATH command so Chromium/Playwright can resolve the
+  # staged browser runtime libraries (see copy_browser_libs above).
+  LD_LIBRARY_PATH_CMD=""
+  if [ -n "${BROWSER_LD_LIBRARY_PATH}" ]; then
+    LD_LIBRARY_PATH_CMD="export LD_LIBRARY_PATH=${BROWSER_LD_LIBRARY_PATH}\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH};"
+  fi
+
   run_command_with_stdout run_agent_with_token_protection chroot /host /bin/bash -c "
     cd '${CHROOT_WORKDIR}' 2>/dev/null || cd / 2>/dev/null || true
     trap '${CLEANUP_CMD}' EXIT
     ${LD_PRELOAD_CMD}
+    ${LD_LIBRARY_PATH_CMD}
     exec capsh --drop=${CAPS_TO_DROP} ${CAPSH_IDENTITY_ARGS} -- -c 'exec ${SCRIPT_FILE}'
   "
 }
@@ -1697,6 +1843,19 @@ warn_codex_auto_model
 log_environment_details
 determine_capabilities_to_drop
 log_execution_context "$@"
+if [ -n "${AWF_AGENT_RUNTIME_START_FILE:-}" ] && [ ! -f "$AWF_AGENT_RUNTIME_START_FILE" ]; then
+  runtime_dir="$(dirname "$AWF_AGENT_RUNTIME_START_FILE")"
+  runtime_started_at_ms="$(date +%s%3N)"
+  if mkdir -p "$runtime_dir" &&
+    [[ "$runtime_started_at_ms" =~ ^[0-9]+$ ]] &&
+    printf '%s\n' "$runtime_started_at_ms" > "$AWF_AGENT_RUNTIME_START_FILE" &&
+    chmod 0444 "$AWF_AGENT_RUNTIME_START_FILE" &&
+    chmod 0555 "$runtime_dir"; then
+    echo "[entrypoint] Agent runtime start recorded for timeout steering"
+  else
+    echo "[entrypoint][WARN] Could not record agent runtime start for timeout steering"
+  fi
+fi
 if [ "${AWF_CHROOT_ENABLED}" = "true" ]; then
   run_chroot_command "$@"
 else

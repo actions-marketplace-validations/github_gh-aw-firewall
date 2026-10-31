@@ -1,6 +1,14 @@
 import { getLocalDockerEnv } from '../docker-host';
 import type { CloudHypervisorOptions, WrapperConfig } from '../types';
+import { CLOUD_HYPERVISOR_MOUNT_POLICIES } from '../types/runtime-options';
 import { assertGithubHostedRunnerEligibility } from './host-eligibility';
+import {
+  isCloudHypervisorAgentAcceptanceWorkflow,
+  isCloudHypervisorScriptAcceptanceWorkflow,
+} from '../enclave/cloud-hypervisor-script-acceptance';
+import { validatePublicEnclaveDebug } from '../enclave/public-debug';
+import { isCloudHypervisorConformanceAcceptanceWorkflow } from '../enclave/cloud-hypervisor-conformance-acceptance';
+import { validateRunSandboxBackend } from '../enclave/run-backend';
 
 /**
  * Explicit, fail-closed compatibility guards for the Cloud Hypervisor
@@ -13,10 +21,47 @@ import { assertGithubHostedRunnerEligibility } from './host-eligibility';
  * supported.
  */
 
+export function isPrimaryCloudHypervisorRuntime(
+  config: Pick<WrapperConfig, 'containerRuntime'>,
+): boolean {
+  return config.containerRuntime === 'cloud-hypervisor';
+}
+
+export function usesCloudHypervisorEnclaveRuntime(
+  config: Pick<WrapperConfig, 'enclaves'>,
+): boolean {
+  const executors = config.enclaves?.executors;
+  return Boolean(
+    (executors?.script.enabled && executors.script.runtime === 'cloud-hypervisor')
+    || (executors?.agent.enabled && executors.agent.runtime === 'cloud-hypervisor'),
+  );
+}
+
+export function requiresCloudHypervisorInfrastructure(
+  config: Pick<WrapperConfig, 'containerRuntime' | 'enclaves'>,
+): boolean {
+  return isPrimaryCloudHypervisorRuntime(config) || usesCloudHypervisorEnclaveRuntime(config);
+}
+
+function usesCloudHypervisorAgentRuntime(config: Pick<WrapperConfig, 'enclaves'>): boolean {
+  const agent = config.enclaves?.executors.agent;
+  return Boolean(agent?.enabled && agent.runtime === 'cloud-hypervisor');
+}
+
 export function assertCloudHypervisorSelection(config: WrapperConfig): void {
-  if (config.cloudHypervisor && config.containerRuntime !== 'cloud-hypervisor') {
+  assertUnifiedWorkloadBackend(config);
+  const debugErrors = validatePublicEnclaveDebug(config);
+  if (debugErrors.length) throw new Error(debugErrors.join('; '));
+  const required = requiresCloudHypervisorInfrastructure(config);
+  if (config.cloudHypervisor && !required) {
     throw new Error(
-      'Cloud Hypervisor options require --container-runtime cloud-hypervisor',
+      'Cloud Hypervisor options require either --container-runtime cloud-hypervisor '
+      + 'or an enclaves[].runtime of "cloud-hypervisor"',
+    );
+  }
+  if (required && !config.cloudHypervisor) {
+    throw new Error(
+      'Cloud Hypervisor workload selection requires top-level cloudHypervisor runtime configuration',
     );
   }
 }
@@ -30,34 +75,72 @@ export function assertCloudHypervisorRuntimeCompatibility(
       'Cloud Hypervisor workload execution requires explicit --cloud-hypervisor-preview opt-in',
     );
   }
+  if (!CLOUD_HYPERVISOR_MOUNT_POLICIES.includes(cloudHypervisor.mountPolicy)) {
+    throw new Error(
+      'Cloud Hypervisor mount policy must be "workspace-only" or "workspace-and-tool-cache"',
+    );
+  }
   if (!config.networkIsolation || config.legacySecurity) {
     throw new Error('Cloud Hypervisor preview requires strict --network-isolation security');
   }
-  if (!config.enableApiProxy) {
+  if (
+    (isPrimaryCloudHypervisorRuntime(config) || usesCloudHypervisorAgentRuntime(config))
+    && !config.enableApiProxy
+  ) {
     throw new Error('Cloud Hypervisor preview requires API proxy credential isolation');
   }
   assertCloudHypervisorPreSecurityCompatibility(config);
-  assertGithubHostedRunnerEligibility();
-  if (!cloudHypervisor.kernelPath || !cloudHypervisor.rootfsPath || !cloudHypervisor.supervisorPath) {
+  if (!cloudHypervisor.kernelPath ||
+      (isPrimaryCloudHypervisorRuntime(config) && !cloudHypervisor.rootfsPath) ||
+      !cloudHypervisor.supervisorPath) {
     throw new Error(
-      'Cloud Hypervisor preview requires explicit kernel, rootfs, and guest supervisor artifacts',
+      isPrimaryCloudHypervisorRuntime(config)
+        ? 'Cloud Hypervisor preview requires explicit kernel, rootfs, and guest supervisor artifacts'
+        : 'Cloud Hypervisor enclave preview requires explicit kernel and guest supervisor artifacts',
     );
   }
-  const digests = cloudHypervisor.sha256;
-  if (
-    !digests?.cloudHypervisor ||
-    !digests.virtiofsd ||
-    !digests.kernel ||
-    !digests.rootfs ||
-    !digests.supervisor
+  if (cloudHypervisor.developmentAllowUnattestedArtifacts) {
+    if (!isPrimaryCloudHypervisorRuntime(config)) {
+      throw new Error('Cloud Hypervisor enclaves require attested common artifacts');
+    }
+    if (
+      process.env.AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS !== '1'
+    ) {
+      throw new Error(
+        'Cloud Hypervisor development artifact bypass requires ' +
+        'AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS=1',
+      );
+    }
+    const digests = cloudHypervisor.sha256;
+    if (
+      !digests?.cloudHypervisor ||
+      !digests.virtiofsd ||
+      !digests.kernel ||
+      !digests.rootfs ||
+      !digests.supervisor
+    ) {
+      throw new Error(
+        'Cloud Hypervisor development artifact bypass requires SHA-256 digests for all five artifacts',
+      );
+    }
+  } else if (
+    !cloudHypervisor.artifactManifestPath ||
+    !cloudHypervisor.artifactManifestBundlePath ||
+    !cloudHypervisor.artifactReleaseTag
   ) {
     throw new Error(
-      'Cloud Hypervisor preview requires SHA-256 digests for cloud-hypervisor, virtiofsd, kernel, rootfs, and supervisor',
+      'Cloud Hypervisor preview requires an artifact manifest, attestation bundle, and expected release tag',
+    );
+  } else if (cloudHypervisor.sha256) {
+    throw new Error(
+      'Caller-supplied Cloud Hypervisor SHA-256 values are accepted only by the explicit development artifact bypass',
     );
   }
+  assertGithubHostedRunnerEligibility();
 }
 
 export function assertCloudHypervisorPreSecurityCompatibility(config: WrapperConfig): void {
+  assertUnifiedWorkloadBackend(config);
   if (config.networkIsolation === false) {
     throw new Error('Cloud Hypervisor preview cannot disable --network-isolation');
   }
@@ -71,18 +154,29 @@ export function assertCloudHypervisorPreSecurityCompatibility(config: WrapperCon
   if (config.enableHostAccess || config.allowHostPorts || config.allowHostServicePorts) {
     throw new Error('Cloud Hypervisor preview does not support host access');
   }
-  if (config.volumeMounts?.length) {
+  const primaryCloudHypervisor = isPrimaryCloudHypervisorRuntime(config);
+  if (primaryCloudHypervisor && config.volumeMounts?.length) {
     throw new Error('Cloud Hypervisor preview does not support additional host volume mounts');
   }
-  if (config.difcProxyHost || config.enclaves?.enabled) {
+  if (config.difcProxyHost) {
+    throw new Error('Cloud Hypervisor preview does not yet support DIFC proxies');
+  }
+  if (
+    primaryCloudHypervisor
+    && config.enclaves?.enabled
+    && !isCloudHypervisorScriptAcceptanceWorkflow(config)
+    && !isCloudHypervisorAgentAcceptanceWorkflow(config)
+    && !isCloudHypervisorConformanceAcceptanceWorkflow(config)
+  ) {
     throw new Error(
-      'Cloud Hypervisor preview does not yet support DIFC proxies or enclaves',
+      'Cloud Hypervisor primary-agent execution with enclaves is reserved until the '
+      + 'real end-to-end isolation acceptance completes; no runtime fallback is permitted',
     );
   }
-  if (config.dnsOverHttps) {
+  if (primaryCloudHypervisor && config.dnsOverHttps) {
     throw new Error('Cloud Hypervisor preview does not support DNS-over-HTTPS');
   }
-  if (config.tty) {
+  if (primaryCloudHypervisor && config.tty) {
     throw new Error('Cloud Hypervisor preview guest supervisor does not support --tty');
   }
   const dockerHost = config.awfDockerHost ?? getLocalDockerEnv().DOCKER_HOST;
@@ -93,8 +187,15 @@ export function assertCloudHypervisorPreSecurityCompatibility(config: WrapperCon
   }
 }
 
+function assertUnifiedWorkloadBackend(config: WrapperConfig): void {
+  const errors = config.enclaves
+    ? validateRunSandboxBackend(config.containerRuntime, config.enclaves)
+    : [];
+  if (errors.length) throw new Error(errors.join('; '));
+}
+
 export function requireCloudHypervisorConfig(config: WrapperConfig): CloudHypervisorOptions {
-  if (config.containerRuntime !== 'cloud-hypervisor' || !config.cloudHypervisor) {
+  if (!requiresCloudHypervisorInfrastructure(config) || !config.cloudHypervisor) {
     throw new Error('Cloud Hypervisor backend resolved without Cloud Hypervisor runtime configuration');
   }
   return config.cloudHypervisor;

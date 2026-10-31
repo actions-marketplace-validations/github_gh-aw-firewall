@@ -2,6 +2,7 @@ export interface MicrovmNetworkHostTools {
   readonly ip: string;
   readonly nft: string;
   readonly sysctl: string;
+  readonly flock: string;
 }
 
 /**
@@ -28,6 +29,11 @@ export interface MicrovmControlPeer {
 export interface MicrovmNetworkPlanOptions {
   readonly infrastructureBridge: string;
   readonly enableApiProxy: boolean;
+  /** Dedicated, closed enclave topology; never combined with primary peers. */
+  readonly enclaveAgent?: {
+    readonly apiProxyPort: number;
+    readonly githubDataPlane: boolean;
+  };
   readonly tapOwnerUid: number;
   readonly tapOwnerGid: number;
   readonly controlPeer?: MicrovmControlPeer;
@@ -47,13 +53,26 @@ export interface MicrovmNetworkPlanOptions {
    * This defaults to `false`; Cloud Hypervisor opts in explicitly.
    */
   readonly tapVnetHdr?: boolean;
+  /** Skip TAP creation for VMM network backends that use host sockets. */
+  readonly createTap?: boolean;
+}
+
+export interface MicrovmNetworkPlanAllocation {
+  readonly resourceToken: string;
+  readonly subnetIndex: number;
+  readonly infrastructureIp?: string;
+  readonly reservationPath?: string;
 }
 
 export interface MicrovmNetworkPlan {
+  readonly mode?: 'enclave-agent';
   readonly runId: string;
+  readonly resourceToken: string;
+  readonly reservationPath?: string;
   readonly namespaceName: string;
   readonly netnsPath: string;
   readonly nftTableName: string;
+  readonly hostForwardRuleComment: string;
   readonly infrastructureBridge: string;
   readonly hostVethName: string;
   readonly namespaceVethName: string;
@@ -69,6 +88,7 @@ export interface MicrovmNetworkPlan {
   readonly tapOwnerUid: number;
   readonly tapOwnerGid: number;
   readonly tapVnetHdr: boolean;
+  readonly tapEnabled?: boolean;
   readonly allowedEndpoints: readonly MicrovmAllowedEndpoint[];
   readonly networkInterface: MicrovmTapInterface;
 }
@@ -88,6 +108,15 @@ export interface MicrovmNetworkLifecycle {
    * `cleanup()`). Not required by every implementer/mock.
    */
   captureDiagnostics?(): Promise<string>;
+}
+
+export interface MicrovmNetworkResourceObserver {
+  resourceCreated(resource: 'netns' | 'hostVeth' | 'namespaceVeth' | 'tap'): Promise<void>;
+}
+
+export interface MicrovmNetworkReservation {
+  readonly plan: MicrovmNetworkPlan;
+  release(): Promise<void>;
 }
 
 export interface MicrovmNetworkCommandOptions {

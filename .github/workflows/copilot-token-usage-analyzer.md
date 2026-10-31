@@ -30,9 +30,10 @@ safe-outputs:
     title-prefix: "\U0001F4CA Copilot Token Usage Report"
     labels: [token-usage-report]
     close-older-issues: true
-model: gpt-5.4-mini
+model: auto
 engine:
   id: copilot
+  version: "1.0.98"
 max-ai-credits: 2500
 timeout-minutes: 15
 steps:

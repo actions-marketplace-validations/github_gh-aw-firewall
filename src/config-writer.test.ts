@@ -10,6 +10,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import execa from 'execa';
 import { writeConfigs } from './config-writer';
+import { generateDockerCompose } from './compose-generator';
 import { isOpenSslAvailable } from './ssl-bump';
 import { getRealUserHome, isNativeRootWithoutSudo } from './host-identity';
 import {
@@ -71,6 +72,67 @@ describe('writeConfigs', () => {
       await writeConfigs(buildWriteConfig(tempDir));
 
       expect(isOpenSslAvailable).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('network subnet override', () => {
+    it('passes effective API proxy upstreams to both Squid and the policy manifest', async () => {
+      await writeConfigs(buildWriteConfig(tempDir, {
+        enableApiProxy: true,
+        openaiApiTarget: 'http://gateway.example:11434',
+        anthropicApiTarget: 'https://secure.example:8443',
+      }));
+      const { generateSquidConfig, generatePolicyManifest } = jest.requireMock('./squid-config');
+      const expected = expect.objectContaining({
+        apiProxyUpstreams: [
+          { hostname: 'gateway.example', port: 11434 },
+          { hostname: 'secure.example', port: 8443 },
+        ],
+      });
+      expect(generateSquidConfig).toHaveBeenCalledWith(expected);
+      expect(generatePolicyManifest).toHaveBeenCalledWith(expected);
+    });
+
+    it('does not add upstream exceptions when API proxy is disabled', async () => {
+      await writeConfigs(buildWriteConfig(tempDir, { openaiApiTarget: 'gateway.example:11434' }));
+      const { generateSquidConfig, generatePolicyManifest } = jest.requireMock('./squid-config');
+      expect(generateSquidConfig.mock.calls[0][0].apiProxyUpstreams).toBeUndefined();
+      expect(generatePolicyManifest.mock.calls[0][0].apiProxyUpstreams).toBeUndefined();
+    });
+
+    it('redacts secret-derived upstream hosts from the policy audit artifact', async () => {
+      const { generatePolicyManifest } = jest.requireMock('./squid-config');
+      generatePolicyManifest.mockReturnValueOnce({ upstream: 'private.example', port: 8443 });
+      await writeConfigs(buildWriteConfig(tempDir, {
+        enableApiProxy: true,
+        openaiApiTarget: 'private.example:8443',
+        sensitiveAllowedDomains: ['https://private.example'],
+      }));
+      const manifest = fs.readFileSync(path.join(tempDir, 'audit', 'policy-manifest.json'), 'utf8');
+      expect(manifest).not.toContain('private.example');
+      expect(manifest).toContain('[REDACTED]');
+    });
+
+    it('relocates the awf-net subnet and sidecar IPs passed to compose generation', async () => {
+      await writeConfigs(buildWriteConfig(tempDir, { networkSubnet: '10.88.0.0/24' }));
+
+      expect((generateDockerCompose as jest.Mock).mock.calls[0][1]).toEqual({
+        subnet: '10.88.0.0/24',
+        squidIp: '10.88.0.10',
+        agentIp: '10.88.0.20',
+        proxyIp: '10.88.0.30',
+        dohProxyIp: '10.88.0.40',
+        cliProxyIp: '10.88.0.50',
+      });
+    });
+
+    it('keeps the policy default when no override is given', async () => {
+      await writeConfigs(buildWriteConfig(tempDir));
+
+      expect((generateDockerCompose as jest.Mock).mock.calls[0][1]).toMatchObject({
+        subnet: '172.30.0.0/24',
+        squidIp: '172.30.0.10',
+      });
     });
   });
 
@@ -185,7 +247,7 @@ describe('writeConfigs', () => {
       const actualStatSync = jest.requireActual<typeof import('fs')>('fs').statSync;
       (fs.statSync as jest.Mock).mockImplementation((targetPath: fs.PathLike) => {
         const stat = actualStatSync(targetPath);
-        return String(targetPath) === canonicalWorkspaceDir
+        return String(targetPath) === canonicalWorkspaceDir || String(targetPath) === tempDir
           ? Object.assign(stat, { uid: 0, gid: 0 })
           : stat;
       });
@@ -448,6 +510,57 @@ describe('writeConfigs', () => {
       expect(fs.existsSync(path.join(auditDir, 'squid.conf'))).toBe(true);
       expect(fs.existsSync(path.join(auditDir, 'docker-compose.redacted.yml'))).toBe(true);
       expect(fs.existsSync(path.join(auditDir, 'policy-manifest.json'))).toBe(true);
+      const sensitivePathAudit = JSON.parse(
+        fs.readFileSync(path.join(auditDir, 'sensitive-paths.json'), 'utf8'),
+      );
+      expect(sensitivePathAudit.runtime).toBe('docker');
+      expect(sensitivePathAudit.maskedPaths.map((entry: { id: string }) => entry.id))
+        .toEqual(['mcp-logs', 'work-directory', 'firewall-logs', 'firewall-audit']);
+      expect(sensitivePathAudit.maskedPaths[0].targets)
+        .toEqual(['/tmp/gh-aw/mcp-logs', '/host/tmp/gh-aw/mcp-logs']);
+      expect(sensitivePathAudit.exemptions[0].path).toBe('/tmp/gh-aw/mcp-payloads');
+    });
+
+    it('records NVX sensitive paths as deferred rather than applied', async () => {
+      const auditDir = path.join(tempDir, 'nvx-audit');
+
+      await writeConfigs(
+        buildWriteConfig(tempDir, {
+          auditDir,
+          containerRuntime: 'nvx',
+          nvx: {
+            previewEnabled: true,
+            mountPolicy: 'workspace-only',
+            memoryMib: 512,
+            memoryMaxBytes: 512 * 1024 * 1024,
+            pidsMax: 128,
+          },
+        }),
+      );
+
+      const sensitivePathAudit = JSON.parse(
+        fs.readFileSync(path.join(auditDir, 'sensitive-paths.json'), 'utf8'),
+      );
+      expect(sensitivePathAudit).toMatchObject({
+        runtime: 'nvx',
+        enforcement: 'deferred',
+        maskedPaths: [],
+        deferredPaths: [
+          {
+            id: 'mcp-logs',
+            path: '/tmp/gh-aw/mcp-logs',
+            reason: expect.stringContaining('pre-filter tool-call payloads'),
+          },
+          {
+            id: 'firewall-logs',
+            path: '/tmp/gh-aw/sandbox/firewall/logs',
+          },
+          {
+            id: 'firewall-audit',
+            path: '/tmp/gh-aw/sandbox/firewall/audit',
+          },
+        ],
+      });
     });
   });
 

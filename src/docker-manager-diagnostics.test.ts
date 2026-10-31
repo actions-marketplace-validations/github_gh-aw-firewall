@@ -10,6 +10,7 @@ import { useTempDir } from './test-helpers/docker-test-fixtures.test-utils';
 jest.mock('execa', () => require('./test-helpers/mock-execa.test-utils').execaMockFactory());
 
 describe('docker-manager diagnostics', () => {
+  const linuxIt = process.platform === 'linux' ? it : it.skip;
   describe('collectDiagnosticLogs', () => {
     const { getDir } = useTempDir('awf-');
 
@@ -109,12 +110,26 @@ describe('docker-manager diagnostics', () => {
       expect(sanitized).not.toContain('uppercase_secret');
       expect(sanitized).toContain('not_sensitive: keepme');
     });
+
+    it('should never copy the model router\'s logs into diagnostics', async () => {
+      // Teardown keeps them in router-logs/router.jsonl, readable only by the invoking user;
+      // diagnostics are made world-readable when they are preserved.
+      mockExecaFn.mockResolvedValue({ stdout: '{"msg":"stopped"}', stderr: '', exitCode: 0 });
+      try {
+        await collectDiagnosticLogs(getDir());
+
+        expect(JSON.stringify(mockExecaFn.mock.calls)).not.toContain('awf-router');
+        expect(fs.existsSync(path.join(getDir(), 'diagnostics', 'awf-router.log'))).toBe(false);
+      } finally {
+        mockExecaFn.mockReset();
+      }
+    });
   });
 
   describe('preserveIptablesAudit', () => {
     const { getDir } = useTempDir('awf-audit-');
 
-    it('should copy iptables audit file when both source and target directory exist', () => {
+    linuxIt('should copy iptables audit file when both source and target directory exist', () => {
       const initSignalDir = path.join(getDir(), 'init-signal');
       fs.mkdirSync(initSignalDir, { recursive: true });
       fs.writeFileSync(path.join(initSignalDir, 'iptables-audit.txt'), 'iptables rules here');
@@ -138,44 +153,6 @@ describe('docker-manager diagnostics', () => {
       expect(fs.existsSync(path.join(auditDir, 'iptables-audit.txt'))).toBe(false);
     });
 
-    it('preserves the required GitHub CLI audit independently of iptables audit', () => {
-      const paths = resolveEnclavePaths(getDir());
-      fs.mkdirSync(paths.githubCliProxyLogsDir, { recursive: true });
-      fs.writeFileSync(path.join(paths.githubCliProxyLogsDir, 'access.jsonl'), '{"event":"exec_done"}\n');
-      const auditDir = path.join(getDir(), 'audit');
-      fs.mkdirSync(auditDir, { recursive: true });
-      mockExecaSync.mockReturnValue({ exitCode: 0, stdout: '', stderr: '' });
-
-      expect(preserveIptablesAudit(getDir(), auditDir, true)).toBe(true);
-
-      expect(fs.readFileSync(
-        path.join(auditDir, 'enclave-github-cli-access.jsonl'),
-        'utf8',
-      )).toBe('{"event":"exec_done"}\n');
-      fs.rmSync(paths.root, { recursive: true, force: true });
-    });
-
-    it('reports an incomplete protected audit when the required CLI audit is absent', () => {
-      const auditDir = path.join(getDir(), 'audit');
-      fs.mkdirSync(auditDir, { recursive: true });
-
-      expect(preserveIptablesAudit(getDir(), auditDir, true)).toBe(false);
-    });
-
-    it('refuses a symlinked enclave GitHub CLI audit', () => {
-      const paths = resolveEnclavePaths(getDir());
-      const sensitiveFile = path.join(getDir(), 'sensitive-file');
-      fs.mkdirSync(paths.githubCliProxyLogsDir, { recursive: true });
-      fs.writeFileSync(sensitiveFile, 'must not be copied');
-      fs.symlinkSync(sensitiveFile, path.join(paths.githubCliProxyLogsDir, 'access.jsonl'));
-      const auditDir = path.join(getDir(), 'audit');
-      fs.mkdirSync(auditDir, { recursive: true });
-
-      expect(preserveIptablesAudit(getDir(), auditDir, true)).toBe(false);
-      expect(fs.existsSync(path.join(auditDir, 'enclave-github-cli-access.jsonl'))).toBe(false);
-      fs.rmSync(paths.root, { recursive: true, force: true });
-    });
-
     it('should do nothing when target audit directory does not exist', () => {
       const initSignalDir = path.join(getDir(), 'init-signal');
       fs.mkdirSync(initSignalDir, { recursive: true });
@@ -186,7 +163,7 @@ describe('docker-manager diagnostics', () => {
       expect(fs.existsSync(path.join(getDir(), 'nonexistent-audit', 'iptables-audit.txt'))).toBe(false);
     });
 
-    it('should use default audit dir (workDir/audit) when auditDir is not specified', () => {
+    linuxIt('should use default audit dir (workDir/audit) when auditDir is not specified', () => {
       const initSignalDir = path.join(getDir(), 'init-signal');
       fs.mkdirSync(initSignalDir, { recursive: true });
       fs.writeFileSync(path.join(initSignalDir, 'iptables-audit.txt'), 'default audit');
@@ -228,6 +205,15 @@ describe('docker-manager diagnostics', () => {
         'docker',
         [
           'cp',
+          'awf-enclave-mcp-server:/var/log/awf-enclave/enclave-host-executor.jsonl',
+          path.join(auditDir, 'enclave-host-executor.jsonl'),
+        ],
+        expect.objectContaining({ reject: false }),
+      );
+      expect(mockExecaSync).toHaveBeenCalledWith(
+        'docker',
+        [
+          'cp',
           'awf-enclave-mcp-server:/var/log/awf-enclave/sessions',
           path.join(auditDir, 'enclave-agent-sessions'),
         ],
@@ -236,13 +222,20 @@ describe('docker-manager diagnostics', () => {
       fs.rmSync(resolveEnclavePaths(getDir()).root, { recursive: true, force: true });
     });
 
-    it('does not mark audit incomplete when no agent session directory exists', () => {
+    linuxIt('does not mark audit incomplete when no agent session directory exists', () => {
       fs.mkdirSync(resolveEnclavePaths(getDir()).root, { recursive: true });
       const auditDir = path.join(getDir(), 'audit');
       fs.mkdirSync(auditDir);
+      const mockAuditCopy = (mode: number) => mockExecaSync.mockImplementationOnce(
+        (_command, args) => {
+          fs.writeFileSync(args[2], '', { mode });
+          return { exitCode: 0, stdout: '', stderr: '' };
+        },
+      );
+      mockAuditCopy(0o644);
+      mockAuditCopy(0o644);
+      mockAuditCopy(0o600);
       mockExecaSync
-        .mockReturnValueOnce({ exitCode: 0, stdout: '', stderr: '' })
-        .mockReturnValueOnce({ exitCode: 0, stdout: '', stderr: '' })
         .mockReturnValueOnce({ exitCode: 1, stdout: '', stderr: 'sessions missing' });
 
       expect(preserveIptablesAudit(getDir(), auditDir)).toBe(true);

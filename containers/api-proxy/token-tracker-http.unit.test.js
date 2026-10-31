@@ -69,6 +69,61 @@ describe('createChunkHandler', () => {
     expect(state.partialLine).toBe('');
   });
 
+  test('streaming: message_delta input/cache counts override message_start placeholders (OpenRouter)', () => {
+    const state = makeStreamingState();
+    const handle = createChunkHandler(state, { requestId: 'r-or', provider: 'anthropic' });
+
+    handle('event: message_start\ndata: ' + JSON.stringify({
+      type: 'message_start',
+      message: {
+        model: 'deepseek/deepseek-v4.1-flash',
+        usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: null, cache_read_input_tokens: null },
+      },
+    }) + '\n\n');
+    handle('event: message_delta\ndata: ' + JSON.stringify({
+      type: 'message_delta',
+      usage: {
+        input_tokens: 18,
+        output_tokens: 20,
+        output_tokens_details: { thinking_tokens: 16 },
+        cache_creation_input_tokens: null,
+        cache_read_input_tokens: 2816,
+      },
+    }) + '\n\n');
+
+    expect(state.streamingUsage).toEqual({
+      input_tokens: 18,
+      output_tokens: 20,
+      cache_read_input_tokens: 2816,
+      reasoning_tokens: 16,
+    });
+    expect(state.observedCacheReadTokens).toBe(2816);
+  });
+
+  test('streaming: zero message_delta input/cache counts do not erase message_start values', () => {
+    const state = makeStreamingState();
+    const handle = createChunkHandler(state, { requestId: 'r-anth', provider: 'anthropic' });
+
+    handle('data: ' + JSON.stringify({
+      type: 'message_start',
+      message: {
+        model: 'claude-sonnet-4',
+        usage: { input_tokens: 500, cache_creation_input_tokens: 100, cache_read_input_tokens: 400 },
+      },
+    }) + '\n\n');
+    handle('data: ' + JSON.stringify({
+      type: 'message_delta',
+      usage: { input_tokens: 0, output_tokens: 42, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+    }) + '\n\n');
+
+    expect(state.streamingUsage).toEqual({
+      input_tokens: 500,
+      cache_creation_input_tokens: 100,
+      cache_read_input_tokens: 400,
+      output_tokens: 42,
+    });
+  });
+
   test('streaming: preserves incomplete trailing line as partialLine', () => {
     const state = makeStreamingState();
     const handle = createChunkHandler(state, { requestId: 'r2', provider: 'anthropic' });
@@ -195,12 +250,13 @@ describe('finalizeHttpTracking', () => {
   }
 
   test('skips non-2xx responses without updating metrics', () => {
-    const opts = makeOpts();
+    const opts = makeOpts({ onUsageMissing: jest.fn() });
     const state = makeState();
 
     finalizeHttpTracking(state, makeProxyRes(401), opts);
 
     expect(opts.metrics.increment).not.toHaveBeenCalled();
+    expect(opts.onUsageMissing).toHaveBeenCalledTimes(1);
   });
 
   test('calls onSpanEnd with status code when response is non-2xx', () => {
@@ -256,6 +312,29 @@ describe('finalizeHttpTracking', () => {
 
     expect(onSpanEnd).toHaveBeenCalledWith(200);
     expect(opts.metrics.increment).not.toHaveBeenCalled();
+  });
+
+  test('fails closed and reports known usage when a successful response has partial token usage', () => {
+    const onUsage = jest.fn();
+    const onUsageMissing = jest.fn();
+    const opts = makeOpts({ onUsage, onUsageMissing });
+    const body = JSON.stringify({ usage: { prompt_tokens: 10 } });
+    const state = makeState({
+      chunks: [Buffer.from(body)],
+      bufferedBytes: body.length,
+      totalBytes: body.length,
+    });
+
+    finalizeHttpTracking(state, makeProxyRes(200), opts);
+
+    expect(onUsage).toHaveBeenCalledWith(
+      expect.objectContaining({ input_tokens: 10 }),
+      'openai',
+    );
+    expect(onUsageMissing).toHaveBeenCalledTimes(1);
+    expect(onUsageMissing.mock.invocationCallOrder[0]).toBeLessThan(
+      onUsage.mock.invocationCallOrder[0],
+    );
   });
 
   test('non-streaming: skips metric update when overflow is set', () => {
@@ -557,19 +636,32 @@ describe('buildAndWriteTokenRecord', () => {
   test('merges budgetResult fields when provided', () => {
     buildAndWriteTokenRecord(normalizedUsage, baseParams({
       budgetResult: {
-        effective_tokens_this_response: 130,
-        effective_tokens_total: 2000,
-        model_multiplier: 1.0,
         ai_credits_this_response: 0.002,
         ai_credits_total: 0.05,
       },
     }));
 
     const record = mockStream.writtenRecords[0];
-    expect(record.effective_tokens_this_response).toBe(130);
-    expect(record.effective_tokens_total).toBe(2000);
     expect(record.ai_credits_this_response).toBe(0.002);
     expect(record.ai_credits_total).toBe(0.05);
+  });
+
+  test('records the fallback model details when a fallback model served the request', () => {
+    buildAndWriteTokenRecord(normalizedUsage, baseParams({
+      model: 'gpt-4.1',
+      modelFallback: { requested_model: 'gpt-5', model: 'gpt-4.1', attempt: 1, reason: 'upstream_5xx', status: 503 },
+    }));
+
+    const record = mockStream.writtenRecords[0];
+    expect(record.model).toBe('gpt-4.1');
+    expect(record.model_fallback).toEqual({
+      requested_model: 'gpt-5', model: 'gpt-4.1', attempt: 1, reason: 'upstream_5xx', status: 503,
+    });
+  });
+
+  test('omits model_fallback when no fallback occurred', () => {
+    buildAndWriteTokenRecord(normalizedUsage, baseParams());
+    expect(mockStream.writtenRecords[0]).not.toHaveProperty('model_fallback');
   });
 
   test('handles null billingInfo and undefined budgetResult gracefully', () => {
@@ -588,4 +680,3 @@ describe('buildAndWriteTokenRecord', () => {
     }))).not.toThrow();
   });
 });
-

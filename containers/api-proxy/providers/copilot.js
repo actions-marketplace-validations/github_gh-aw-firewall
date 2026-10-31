@@ -20,7 +20,10 @@
 const {
   normalizeBasePath,
   composeBodyTransforms,
+  getTargetScheme,
+  stripTargetScheme,
 } = require('../proxy-utils');
+const { parseBodyAsObject } = require('../body-utils');
 const { createOidcAwareProviderAdapter } = require('../adapter-factory');
 const { sanitizeNullToolCallTypes } = require('../body-transform');
 const {
@@ -33,12 +36,13 @@ const {
   resolveApiKey,
   resolveCopilotAuthToken,
   deriveCopilotApiTarget,
-  copilotTargetRequiresGitHubTokenPrefix,
+  getGitHubTokenAuthPrefix,
   isGithubCopilotCatalogTarget,
 } = require('./copilot-auth');
-const { bearerAuthHeaders, withCopilotIntegration } = require('./auth-headers');
+const { bearerAuthHeaders, tokenAuthHeaders, buildAuthHeaderFn, withCopilotIntegration } = require('./auth-headers');
 const { URL } = require('url');
 const { COPILOT_ENV } = require('../provider-env-constants');
+const { attachCopilotAuthDiagnostic } = require('../copilot-auth-diagnostics');
 
 const COPILOT_MODELS_API_VERSION = '2026-07-01';
 const COPILOT_LEGACY_AUTO_API_VERSION = '2025-07-16';
@@ -64,6 +68,24 @@ function getDefaultAutoApiVersion(req, pathname, rawTarget) {
   return undefined;
 }
 
+function omitUnsupportedAutoModel(body, req, rawTarget) {
+  if (!isGithubCopilotCatalogTarget(rawTarget)) return null;
+
+  let pathname;
+  try {
+    pathname = new URL(req.url, 'http://localhost').pathname;
+  } catch {
+    return null;
+  }
+  if (pathname !== '/chat/completions' && pathname !== '/v1/chat/completions') return null;
+
+  const parsed = parseBodyAsObject(body);
+  if (!parsed || parsed.model !== 'auto') return null;
+
+  delete parsed.model;
+  return Buffer.from(JSON.stringify(parsed), 'utf8');
+}
+
 /**
  * Create the GitHub Copilot provider adapter.
  *
@@ -76,7 +98,14 @@ function createCopilotAdapter(env, deps = {}) {
   // resolveApiKey filters out the AWF placeholder so it is never used as a real BYOK credential.
   const apiKey = resolveApiKey(env);
   const staticAuthToken = resolveCopilotAuthToken(env);
-  const integrationId = env.COPILOT_INTEGRATION_ID || 'agentic-workflows';
+  const integrationId = (env.COPILOT_INTEGRATION_ID || '').trim()
+    || (env.GITHUB_COPILOT_INTEGRATION_ID || '').trim()
+    || 'agentic-workflows';
+  const integrationIdSource = (env.COPILOT_INTEGRATION_ID || '').trim()
+    ? 'copilot_integration_id'
+    : (env.GITHUB_COPILOT_INTEGRATION_ID || '').trim()
+      ? 'github_copilot_integration_id'
+      : 'default';
   const rawTarget = deriveCopilotApiTarget(env);
   const basePath = normalizeBasePath(env[COPILOT_ENV.API_BASE_PATH]);
 
@@ -120,9 +149,22 @@ function createCopilotAdapter(env, deps = {}) {
   const byokBodyFieldTransform = (apiKey && Object.keys(byokExtraBodyFields).length > 0)
     ? (body) => injectByokExtraBodyFields(body, byokExtraBodyFields)
     : null;
-  const bodyTransform = composeBodyTransforms(sanitizedBodyTransform, byokBodyFieldTransform);
-  const requiresGitHubTokenPrefix = copilotTargetRequiresGitHubTokenPrefix(rawTarget, env);
-  const authPrefix = (requiresGitHubTokenPrefix && !apiKey) ? 'token' : 'Bearer';
+  // NOTE: Codex custom-tool translation (`translateCodexCustomToolsForCopilot`)
+  // is deliberately NOT part of this chain. It does not follow the
+  // `Buffer | null` body-transform contract — it returns
+  // `{ body, compatibility }` — so composing it here would hand a plain object
+  // to the request pipeline (yielding `Content-Length: undefined` and an empty
+  // upstream body). It is applied separately, with its compatibility metadata
+  // threaded through the request/retry context, in body-handler.js.
+  const bodyTransform = composeBodyTransforms(
+    composeBodyTransforms(sanitizedBodyTransform, byokBodyFieldTransform),
+    (body, req) => omitUnsupportedAutoModel(body, req, rawTarget)
+  );
+  // Fine-grained PATs require ****** every Copilot target. OAuth and classic
+  // PATs retain the target-dependent token prefix required by Enterprise hosts.
+  const githubTokenAuthPrefix = getGitHubTokenAuthPrefix(githubToken, rawTarget, env);
+  const authPrefix = apiKey ? 'Bearer' : githubTokenAuthPrefix;
+  const inferenceCredentialSource = apiKey ? 'provider_api_key' : githubToken ? 'github_token' : 'none';
   // Pre-computed models path used by getModelsFetchConfig and getReflectionInfo.
   // For BYOK/custom providers the base path prefix is included (e.g. /api/v1/models
   // for COPILOT_PROVIDER_BASE_URL=https://openrouter.ai/api/v1).
@@ -140,15 +182,14 @@ function createCopilotAdapter(env, deps = {}) {
    * @returns {{ url: string, opts: { method: string, headers: Record<string,string> } } & Record<string, unknown>}
    */
  function buildCopilotModelsRequest(extra = {}) {
-   const prefix = requiresGitHubTokenPrefix ? 'token' : 'Bearer';
    return {
-     url: `https://${rawTarget}/models`,
+     url: `${getTargetScheme(rawTarget)}://${stripTargetScheme(rawTarget)}/models`,
      opts: {
        method: 'GET',
-       headers: withCopilotIntegration({
-         'Authorization': prefix + ' ' + githubToken,
-         'X-GitHub-Api-Version': COPILOT_MODELS_API_VERSION,
-       }, integrationId),
+       headers: withCopilotIntegration(
+         tokenAuthHeaders(githubTokenAuthPrefix, githubToken, { 'X-GitHub-Api-Version': COPILOT_MODELS_API_VERSION }),
+         integrationId
+       ),
      },
      modelMetadataFormat: 'copilot',
      apiVersion: COPILOT_MODELS_API_VERSION,
@@ -163,10 +204,10 @@ function createCopilotAdapter(env, deps = {}) {
     env,
     oidcAuthOptions: { staticAuthToken: authToken, skipWhen: !!staticAuthToken },
     buildOidcHeaders: (token) => withCopilotIntegration(bearerAuthHeaders(token), integrationId),
-    buildStaticHeaders: () => withCopilotIntegration({
-      ...(apiKey ? byokExtraHeaders : {}),
-      'Authorization': authPrefix + ' ' + authToken,
-    }, integrationId),
+    buildStaticHeaders: () => withCopilotIntegration(
+      buildAuthHeaderFn({ prefix: authPrefix })(authToken, apiKey ? byokExtraHeaders : undefined),
+      integrationId
+    ),
     createAdapterMethodsOptions: ({ oidcConfigured, authProvider }) => ({
       apiKey: authToken,
       rawTarget,
@@ -176,6 +217,13 @@ function createCopilotAdapter(env, deps = {}) {
       modelsPath,
       reflectionConfigured: !!authToken || oidcConfigured,
       reflectionModelsPath: modelsPath,
+      reflectionExtra: {
+        credential_kind: apiKey ? 'byok' : githubToken && githubToken.startsWith('github_pat_') ? 'fine_grained_pat' : githubToken ? 'github_token' : 'none',
+        selected_scheme: authPrefix,
+        inference_credential_source: inferenceCredentialSource,
+        inference_selected_scheme: authPrefix,
+        integration_id_source: integrationIdSource,
+      },
       getValidationProbe() {
         if (oidcConfigured) {
           return { skip: true, reason: `OIDC auth (${authProvider}); validation via token acquisition` };
@@ -191,7 +239,7 @@ function createCopilotAdapter(env, deps = {}) {
           };
         }
 
-        if (rawTarget !== 'api.githubcopilot.com') {
+        if (!isGithubCopilotCatalogTarget(rawTarget)) {
           return { skip: true, reason: `Custom target ${rawTarget}; validation skipped` };
         }
 
@@ -203,10 +251,10 @@ function createCopilotAdapter(env, deps = {}) {
         if (oidcConfigured) return null;
         if (!authToken) return null;
 
-        // Standard Copilot API (api.githubcopilot.com):
+        // GitHub-hosted Copilot endpoints:
         // The /models endpoint only accepts GitHub OAuth tokens (COPILOT_GITHUB_TOKEN).
         // Skip startup model fetch when only a BYOK API key is configured.
-        if (rawTarget === 'api.githubcopilot.com') {
+        if (isGithubCopilotCatalogTarget(rawTarget)) {
           if (!githubToken) return null;
           return buildCopilotModelsRequest({ cacheKey: 'copilot' });
         }
@@ -217,7 +265,7 @@ function createCopilotAdapter(env, deps = {}) {
         // Skip the fetch when no BYOK key is configured.
         if (!apiKey) return null;
         return {
-          url: `https://${rawTarget}${modelsPath}`,
+          url: `${getTargetScheme(rawTarget)}://${stripTargetScheme(rawTarget)}${modelsPath}`,
           opts: {
             method: 'GET',
             headers: bearerAuthHeaders(apiKey),
@@ -247,10 +295,16 @@ function createCopilotAdapter(env, deps = {}) {
       missingCredentialMessage: 'COPILOT_GITHUB_TOKEN or COPILOT_PROVIDER_API_KEY not configured in api-proxy sidecar',
       unavailableWhen: () => oidcConfigured ? { message: `Copilot OIDC token (${authProvider}) not yet available in api-proxy sidecar` } : null,
       extra: {
+        getRoutingProviderIdentity: () => (
+          !oidcConfigured && githubToken && !apiKey && isGithubCopilotCatalogTarget(rawTarget)
+            ? 'github-copilot'
+            : null
+        ),
         // Exposed for introspection / testing
         _githubToken: githubToken,
         _apiKey: apiKey,
         _integrationId: integrationId,
+        _integrationIdSource: integrationIdSource,
         _rawTarget: rawTarget,
         _basePath: basePath,
         _oidcProvider: oidcProvider,
@@ -278,10 +332,20 @@ function createCopilotAdapter(env, deps = {}) {
       // BYOK API keys use 'Bearer' regardless of target.
       // Standard api.githubcopilot.com and GHEC (*.ghe.com) also use 'Bearer' for all credentials.
       const isModelsPath = reqPathname === '/models' || reqPathname.startsWith('/models/');
-      if (isModelsPath && req.method === 'GET' && githubToken) {
+      const useGithubToken = isModelsPath && req.method === 'GET' && githubToken;
+      attachCopilotAuthDiagnostic(req, {
+        env,
+        source: useGithubToken ? 'github_token' : inferenceCredentialSource,
+        token: useGithubToken ? githubToken : staticAuthToken,
+        rawTarget, basePath, integrationIdSource,
+      });
+      if (useGithubToken) {
         // /models always uses the GitHub OAuth token (not BYOK key)
-        const prefix = requiresGitHubTokenPrefix ? 'token' : 'Bearer';
-        return withCopilotIntegration({ 'Authorization': prefix + ' ' + githubToken }, integrationId);
+        return withCopilotIntegration(tokenAuthHeaders(
+          githubTokenAuthPrefix,
+          githubToken,
+          isGithubCopilotCatalogTarget(rawTarget) ? { 'X-GitHub-Api-Version': COPILOT_MODELS_API_VERSION } : undefined
+        ), integrationId);
       }
 
       const headers = resolveHeaders();

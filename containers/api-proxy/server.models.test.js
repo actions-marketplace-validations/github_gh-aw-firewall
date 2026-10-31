@@ -16,6 +16,74 @@ const {
 const { buildModelsJson: buildModelsPayload } = require('./model-discovery');
 const { composeBodyTransforms } = require('./proxy-utils');
 
+async function resolveDetectionAlias(models, maxCredits, defaultPricing) {
+  const previous = {
+    aliases: process.env.AWF_MODEL_ALIASES,
+    maxCredits: process.env.AWF_MAX_AI_CREDITS,
+    defaultPricing: process.env.AWF_DEFAULT_AI_CREDITS_PRICING,
+    fallback: process.env.AWF_MODEL_FALLBACK,
+    anthropicKey: process.env.ANTHROPIC_API_KEY,
+  };
+  process.env.AWF_MODEL_ALIASES = JSON.stringify({
+    models: {
+      detection: ['small'],
+      small: ['mini'],
+      mini: ['haiku', 'gpt-5-mini', 'gpt-5-nano', 'gemini-flash-lite'],
+      haiku: ['copilot/*haiku*', 'anthropic/*haiku*'],
+      'gpt-5-mini': ['copilot/gpt-5*mini*', 'openai/gpt-5*mini*'],
+      'gpt-5-nano': ['copilot/gpt-5*nano*', 'openai/gpt-5*nano*'],
+      'gemini-flash-lite': ['copilot/gemini-*flash*lite*', 'gemini/gemini-*flash*lite*'],
+    },
+  });
+  if (maxCredits === undefined) delete process.env.AWF_MAX_AI_CREDITS;
+  else process.env.AWF_MAX_AI_CREDITS = maxCredits;
+  if (defaultPricing === undefined) delete process.env.AWF_DEFAULT_AI_CREDITS_PRICING;
+  else process.env.AWF_DEFAULT_AI_CREDITS_PRICING = defaultPricing;
+  process.env.AWF_MODEL_FALLBACK = JSON.stringify({ enabled: false });
+  process.env.ANTHROPIC_API_KEY = 'test-key';
+  const stdoutSpy = jest.spyOn(process.stdout, 'write').mockImplementation(() => true);
+
+  try {
+    let isolatedServer;
+    let checkModelPricing;
+    jest.isolateModules(() => {
+      isolatedServer = require('./server');
+      ({ checkModelPricing } = require('./guards/ai-credits-guard'));
+    });
+    isolatedServer.resetModelCacheState();
+    isolatedServer.cachedModels.anthropic = models;
+    const req = {};
+    const transform = isolatedServer.makeModelBodyTransform('anthropic');
+    const rewritten = await transform(Buffer.from(JSON.stringify({
+      model: 'detection',
+      messages: [],
+    })), req);
+    const records = stdoutSpy.mock.calls
+      .map(([line]) => String(line).trim())
+      .filter(Boolean)
+      .map(line => JSON.parse(line));
+    const resolvedModel = JSON.parse(rewritten.toString('utf8')).model;
+    return {
+      resolvedModel,
+      candidates: req.awfModelCandidates,
+      records,
+      pricingCheck: checkModelPricing(resolvedModel, 'anthropic'),
+    };
+  } finally {
+    stdoutSpy.mockRestore();
+    for (const [key, value] of Object.entries({
+      AWF_MODEL_ALIASES: previous.aliases,
+      AWF_MAX_AI_CREDITS: previous.maxCredits,
+      AWF_DEFAULT_AI_CREDITS_PRICING: previous.defaultPricing,
+      AWF_MODEL_FALLBACK: previous.fallback,
+      ANTHROPIC_API_KEY: previous.anthropicKey,
+    })) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
 describe('makeModelBodyTransform', () => {
   beforeEach(() => {
     resetModelCacheState();
@@ -25,15 +93,16 @@ describe('makeModelBodyTransform', () => {
     resetModelCacheState();
   });
 
-  it('should return null when MODEL_ALIASES is not configured', () => {
-    // When AWF_MODEL_ALIASES is not set, MODEL_ALIASES is null and
-    // makeModelBodyTransform returns null (no transform applied).
+  it('should leave ordinary models unchanged when MODEL_ALIASES is not configured', async () => {
     if (MODEL_ALIASES) {
       // If the env var happens to be set in this test environment, skip.
       return;
     }
     const transform = makeModelBodyTransform('copilot');
-    expect(transform).toBeNull();
+    await expect(transform(
+      Buffer.from('{"model":"gpt-4o"}'),
+      { method: 'POST', url: '/chat/completions' },
+    )).resolves.toBeNull();
   });
 
   it('should rewrite model field in POST body when aliases are configured', () => {
@@ -168,6 +237,45 @@ describe('makeModelBodyTransform', () => {
       if (prevCopilotToken === undefined) delete process.env.COPILOT_GITHUB_TOKEN;
       else process.env.COPILOT_GITHUB_TOKEN = prevCopilotToken;
     }
+  });
+
+  it('resolves detection to the highest-versioned Haiku regardless of pricing with the AI-credit guard active', async () => {
+    const result = await resolveDetectionAlias([
+      'claude-haiku-4-5-20251001',
+      'claude-haiku-9-9',
+    ], '400');
+    expect(result.resolvedModel).toBe('claude-haiku-9-9');
+    expect(result.candidates).toEqual(['claude-haiku-9-9']);
+    expect(result.pricingCheck).toBeNull();
+    expect(result.records.some(record =>
+      record.event === 'model_resolution' &&
+      record.message.includes('claude-haiku-9-9') &&
+      record.message.includes('"haiku"') &&
+      record.message.includes('no AI-credit price on this provider')
+    )).toBe(false);
+  });
+
+  it('allows the highest-versioned alias candidate when none is priced', async () => {
+    const result = await resolveDetectionAlias(['claude-haiku-8-8', 'claude-haiku-9-9'], '400');
+    expect(result.resolvedModel).toBe('claude-haiku-9-9');
+    expect(result.candidates).toEqual(['claude-haiku-9-9']);
+    expect(result.pricingCheck).toBeNull();
+  });
+
+  it.each([
+    ['guard off', undefined, undefined],
+    ['default pricing configured', '400', JSON.stringify({ input: 1, output: 1 })],
+  ])('keeps highest-version alias resolution without price filtering when %s', async (_label, maxCredits, defaultPricing) => {
+    const result = await resolveDetectionAlias([
+      'claude-haiku-4-5-20251001',
+      'claude-haiku-9-9',
+    ], maxCredits, defaultPricing);
+    expect(result.resolvedModel).toBe('claude-haiku-9-9');
+    expect(result.candidates).toEqual(['claude-haiku-9-9']);
+    expect(result.records.some(record =>
+      record.event === 'model_resolution' &&
+      record.message.includes('no AI-credit price on this provider')
+    )).toBe(false);
   });
 
   it('should write structured model alias diagnostics to token-diag.jsonl', async () => {
@@ -603,6 +711,36 @@ describe('writeModelsJson', () => {
     expect(data).toHaveProperty('model_aliases');
   });
 
+  it('should persist the same filtered aliases as the in-memory snapshot', () => {
+    const previousAliases = process.env.AWF_MODEL_ALIASES;
+    const previousOpenAiKey = process.env.OPENAI_API_KEY;
+    process.env.AWF_MODEL_ALIASES = JSON.stringify({
+      models: {
+        available: ['openai/gpt-4o'],
+        unavailable: ['openai/gpt-5'],
+      },
+    });
+    process.env.OPENAI_API_KEY = 'test-key';
+
+    try {
+      let isolatedServer;
+      jest.isolateModules(() => { isolatedServer = require('./server'); });
+      isolatedServer.cachedModels.openai = ['gpt-4o'];
+
+      const snapshot = isolatedServer.buildModelsJson();
+      isolatedServer.writeModelsJson(tmpDir);
+      const persisted = JSON.parse(fs.readFileSync(path.join(tmpDir, 'models.json'), 'utf8'));
+
+      expect(persisted.model_aliases).toEqual(snapshot.model_aliases);
+      expect(persisted.model_aliases).toEqual({ available: ['openai/gpt-4o'] });
+    } finally {
+      if (previousAliases === undefined) delete process.env.AWF_MODEL_ALIASES;
+      else process.env.AWF_MODEL_ALIASES = previousAliases;
+      if (previousOpenAiKey === undefined) delete process.env.OPENAI_API_KEY;
+      else process.env.OPENAI_API_KEY = previousOpenAiKey;
+    }
+  });
+
   it('should create the directory if it does not exist', () => {
     const nestedDir = path.join(tmpDir, 'sub', 'dir');
     writeModelsJson(nestedDir);
@@ -670,5 +808,14 @@ describe('composeBodyTransforms', () => {
     const composed = composeBodyTransforms(asyncUpper, exclaim);
     const out = await composed(Buffer.from('hello'));
     expect(out.toString()).toBe('HELLO!');
+  });
+
+  it('forwards request context to every composed transform', () => {
+    const req = { url: '/v1/alpha/search' };
+    const first = jest.fn(() => null);
+    const second = jest.fn(() => null);
+    composeBodyTransforms(first, second)(Buffer.from('hello'), req);
+    expect(first).toHaveBeenCalledWith(expect.any(Buffer), req);
+    expect(second).toHaveBeenCalledWith(expect.any(Buffer), req);
   });
 });

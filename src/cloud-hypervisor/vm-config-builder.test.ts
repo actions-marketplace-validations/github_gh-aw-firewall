@@ -1,46 +1,12 @@
 import type { MicrovmNetworkPlan } from '../microvm/network';
-import type { CloudHypervisorOptions } from '../types/runtime-options';
 import { createCloudHypervisorRunPaths } from './manager-types';
 import { buildCloudHypervisorVmConfig } from './vm-config-builder';
-
-function config(overrides: Partial<CloudHypervisorOptions> = {}): CloudHypervisorOptions {
-  return {
-    previewEnabled: true,
-    cloudHypervisorBinary: '/opt/cloud-hypervisor',
-    kernelPath: '/opt/vmlinux',
-    rootfsPath: '/opt/rootfs.ext4',
-    supervisorPath: '/opt/awf-supervisor',
-    vcpuCount: 2,
-    memoryMib: 512,
-    apiTimeoutMs: 1,
-    ...overrides,
-  };
-}
+import { createCloudHypervisorOptions as config } from './test-fixtures.test-utils';
+import { createTestNetworkPlan } from './manager.test-utils';
+import { CLOUD_HYPERVISOR_ENCLAVE_RESOURCE_PROFILES } from './workload-profile';
 
 function networkPlan(): MicrovmNetworkPlan {
-  return {
-    runId: 'run',
-    namespaceName: 'ns',
-    netnsPath: '/var/run/netns/ns',
-    nftTableName: 'table',
-    infrastructureBridge: 'awfbr0',
-    hostVethName: 'host',
-    namespaceVethName: 'namespace',
-    tapName: 'tap',
-    infrastructureIp: '172.30.0.20',
-    infrastructureCidr: '172.30.0.0/24',
-    hostGatewayIp: '172.30.0.1',
-    guestSubnet: '100.64.0.0/30',
-    guestIp: '100.64.0.2',
-    guestGatewayIp: '100.64.0.1',
-    guestPrefixLength: 30,
-    guestMac: '02:00:00:00:00:01',
-    tapOwnerUid: 1000,
-    tapOwnerGid: 1000,
-    tapVnetHdr: true,
-    allowedEndpoints: [],
-    networkInterface: { iface_id: 'eth0', host_dev_name: 'tap', guest_mac: '02:00:00:00:00:01' },
-  };
+  return createTestNetworkPlan();
 }
 
 describe('buildCloudHypervisorVmConfig', () => {
@@ -57,6 +23,114 @@ describe('buildCloudHypervisorVmConfig', () => {
     expect(vmConfig).not.toHaveProperty('vsock');
     expect(vmConfig.payload).not.toHaveProperty('cmdline');
     expect(vmConfig.landlock_enable).toBe(true);
+  });
+
+  it('plans a NIC-less, workspace-less script guest without primary network assumptions', () => {
+    const vmConfig = buildCloudHypervisorVmConfig({
+      config: config(),
+      paths,
+      guestConfig: {
+        exports: [{
+          tag: 'seed',
+          source: '/seed',
+          target: '/seed',
+          mode: 'ro',
+        }],
+        supervisorBinaryPath: '/opt/awf-supervisor',
+        supervisorSha256: 'a'.repeat(64),
+        workspaceMount: null,
+      },
+    });
+
+    expect(vmConfig).not.toHaveProperty('net');
+    expect(vmConfig.payload.cmdline).not.toContain('awf.workspace-mount=');
+    expect(vmConfig.payload.cmdline).not.toContain('awf.guest-ip=');
+    expect(vmConfig.payload.cmdline).toContain('awf.network-mode=none');
+    expect(vmConfig.payload.cmdline).not.toContain('awf.scratch-mib=');
+    expect(vmConfig.payload.cmdline).toContain('init=/usr/sbin/awf-supervisor');
+    expect(vmConfig.landlock_rules).not.toEqual(expect.arrayContaining([
+      expect.objectContaining({ path: '/dev/net/tun' }),
+    ]));
+  });
+
+  it.each(['script', 'agent'] as const)('applies only the closed %s enclave VM budget and boots its rootfs read-only', (role) => {
+    const resources = CLOUD_HYPERVISOR_ENCLAVE_RESOURCE_PROFILES[role];
+    const vmConfig = buildCloudHypervisorVmConfig({
+      config: config({ vcpuCount: 8, memoryMib: 4096, scratchMib: 512 }),
+      paths,
+      guestConfig: {
+        exports: [{
+          tag: 'enclave-seed',
+          source: '/seed',
+          target: '/input-seed',
+          mode: 'ro',
+        }],
+        supervisorBinaryPath: '/opt/awf-supervisor',
+        supervisorSha256: 'a'.repeat(64),
+        workspaceMount: null,
+        enclaveResources: resources,
+      },
+      enclaveResources: resources,
+    });
+
+    expect(vmConfig.cpus).toEqual({ boot_vcpus: 1, max_vcpus: 1 });
+    expect(vmConfig.memory.size).toBe(768 * 1024 * 1024);
+    expect(vmConfig.disks[0].readonly).toBe(true);
+    expect(vmConfig.payload.cmdline).toContain(`awf.enclave-role=${role}`);
+    expect(vmConfig.payload.cmdline).not.toContain('awf.scratch-mib=');
+    expect(vmConfig.payload.cmdline).toContain('init=/usr/sbin/awf-supervisor');
+    expect(vmConfig.payload.cmdline).toContain(' ro ');
+    expect(vmConfig.payload.cmdline).not.toContain(' rw ');
+  });
+
+  it('rejects a caller-increased enclave VM budget', () => {
+    const trusted = CLOUD_HYPERVISOR_ENCLAVE_RESOURCE_PROFILES.script;
+    const resources = { ...trusted, memoryMiB: trusted.memoryMiB + 1 };
+    expect(() => buildCloudHypervisorVmConfig({
+      config: config(),
+      paths,
+      guestConfig: {
+        exports: [{
+          tag: 'enclave-seed',
+          source: '/seed',
+          target: '/input-seed',
+          mode: 'ro',
+        }],
+        supervisorBinaryPath: '/opt/awf-supervisor',
+        supervisorSha256: 'a'.repeat(64),
+        workspaceMount: null,
+        enclaveResources: resources,
+      },
+      enclaveResources: resources,
+    })).toThrow(/closed guest resource profile/);
+  });
+
+  it('boots the primary through trusted scratch init without requiring a new supervisor protocol', () => {
+    const vmConfig = buildCloudHypervisorVmConfig({
+      config: config({ scratchMib: 96 }),
+      paths,
+      networkPlan: networkPlan(),
+      guestConfig: {
+        exports: [{ tag: 'workspace', source: '/workspace', target: '/workspace', mode: 'rw' }],
+        supervisorBinaryPath: '/opt/awf-supervisor',
+        supervisorSha256: 'a'.repeat(64),
+      },
+    });
+    expect(vmConfig.payload.cmdline).toContain('init=/usr/sbin/awf-scratch-init');
+    expect(vmConfig.payload.cmdline).not.toContain('awf.scratch-mib=');
+  });
+
+  it.each([0, -1, 1.5, Infinity, 4294967296])('rejects unsafe direct scratch configuration %s', (scratchMib) => {
+    expect(() => buildCloudHypervisorVmConfig({
+      config: config({ scratchMib }),
+      paths,
+      guestConfig: {
+        exports: [{ tag: 'seed', source: '/seed', target: '/seed', mode: 'ro' }],
+        workspaceMount: null,
+        supervisorBinaryPath: '/opt/awf-supervisor',
+        supervisorSha256: 'a'.repeat(64),
+      },
+    })).toThrow(/scratch MiB/);
   });
 
   it('adds virtio-fs, vsock and supervisor cmdline with a guest config', () => {
@@ -83,6 +157,7 @@ describe('buildCloudHypervisorVmConfig', () => {
         },
         socketPath: '/run/virtiofs.sock',
         logPath: '/run/virtiofs.log',
+        evidencePath: '/run/virtiofs-confinement.json',
       }],
     });
 
@@ -97,6 +172,7 @@ describe('buildCloudHypervisorVmConfig', () => {
       'cmdline',
       expect.stringContaining('awf.virtiofs=workspace:L3dvcmtzcGFjZQ:rw'),
     );
+    expect(vmConfig.payload.cmdline).not.toContain('awf.network-mode=none');
   });
 
   it('encodes a policy-narrowed workspace mode only alongside its host mount plan', () => {
@@ -142,7 +218,7 @@ describe('buildCloudHypervisorVmConfig', () => {
 
     expect(vmConfig.cpus).toEqual({ boot_vcpus: 4, max_vcpus: 4 });
     expect(vmConfig.memory.size).toBe(1024 * 1024 * 1024);
-    expect(vmConfig.net[0]).toMatchObject({
+    expect(vmConfig.net?.[0]).toMatchObject({
       offload_tso: false,
       offload_ufo: false,
       offload_csum: false,

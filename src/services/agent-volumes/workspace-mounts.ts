@@ -3,7 +3,8 @@ import * as path from 'path';
 import { logger } from '../../logger';
 import { WrapperConfig } from '../../types';
 import { INIT_SIGNAL_DIR, LEGACY_INIT_SIGNAL_DIR } from '../../constants';
-import { applyHostPathPrefixToVolumes } from '../host-path-prefix';
+import { applyHostPathPrefixToVolumes, isSharedDockerHostPathPrefix } from '../host-path-prefix';
+import { hiddenHostRoots, mountedChrootRoots } from '../agent-path-policy';
 import {
   extractCommandBinaryName,
   shouldUseDockerHostStaging,
@@ -60,7 +61,83 @@ export function buildWorkspaceMounts(params: WorkspaceMountsParams): string[] {
     }
   }
 
+  mounts.push(...buildContainerWorkDirMounts({ config, workspaceDir, effectiveHome }));
+
   return mounts;
+}
+
+interface ContainerWorkDirMountsParams {
+  config: WrapperConfig;
+  workspaceDir: string;
+  effectiveHome: string;
+}
+
+function isAtOrBelow(candidate: string, root: string): boolean {
+  if (root === '/') {
+    return true;
+  }
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+/**
+ * Mounts the configured `--container-workdir` when no other mount already
+ * exposes it inside the chroot.
+ *
+ * The entrypoint falls back to `/` when the requested working directory is
+ * missing, which leaves agents (notably the codex engine) repeatedly trying to
+ * `cd` into a workspace path that does not exist and re-discovering their
+ * context until they abort. Mounting the directory — or warning explicitly when
+ * that is not possible — keeps the in-container CWD equal to the host path the
+ * engine was told to use. See github/gh-aw-firewall#8015.
+ */
+export function buildContainerWorkDirMounts(params: ContainerWorkDirMountsParams): string[] {
+  const { config, effectiveHome } = params;
+  const configuredWorkDir = config.containerWorkDir;
+  if (!configuredWorkDir || !path.isAbsolute(configuredWorkDir)) {
+    return [];
+  }
+
+  const workDir = path.posix.normalize(configuredWorkDir).replace(/\/+$/, '') || '/';
+  // The empty chroot home volume and the filesystem root always exist.
+  if (workDir === '/' || workDir === effectiveHome) {
+    return [];
+  }
+
+  // Credential paths are checked first: a hidden path must never be mounted
+  // just because a broader tool-directory mount appears to cover it.
+  if (hiddenHostRoots(effectiveHome).some((root) =>
+    isAtOrBelow(workDir, root) || isAtOrBelow(root, workDir)
+  )) {
+    logger.warn(
+      `Container working directory ${workDir} is inside a host path that AWF deliberately hides from ` +
+      'the sandbox; it will not be mounted and the agent will start in / instead'
+    );
+    return [];
+  }
+
+  if (mountedChrootRoots(config, params.workspaceDir, effectiveHome).some((root) => isAtOrBelow(workDir, root))) {
+    return [];
+  }
+
+  if (!isExistingDirectory(workDir)) {
+    logger.warn(
+      `Container working directory ${workDir} does not exist on the host and is not covered by any ` +
+      'mount; the agent will start in / instead'
+    );
+    return [];
+  }
+
+  logger.debug(`Mounting container working directory ${workDir} (not covered by another mount)`);
+  return [`${workDir}:${workDir}:rw`, `${workDir}:/host${workDir}:rw`];
+}
+
+function isExistingDirectory(candidate: string): boolean {
+  try {
+    return fs.statSync(candidate).isDirectory();
+  } catch {
+    return false;
+  }
 }
 
 function resolveBinaryPath(binaryName: string, commandExecutable: string): string | undefined {
@@ -114,12 +191,12 @@ export function buildCustomVolumeMounts(
   debug(`Adding ${volumeMounts.length} custom volume mount(s)`);
 
   // Custom mount sources always use the runner's filesystem view. Translate
-  // them even when a source already starts with the daemon-side prefix; this
-  // is required when both are /tmp/gh-aw in ARC/DinD safeoutputs workflows.
+  // sources already under daemon-only prefixes (such as /tmp/gh-aw), but keep
+  // paths under the shared /tmp prefix unchanged.
   const translatedMounts = applyHostPathPrefixToVolumes(
     volumeMounts,
     dockerHostPathPrefix,
-    { translateAlreadyPrefixedPaths: true },
+    { translateAlreadyPrefixedPaths: !isSharedDockerHostPathPrefix(dockerHostPathPrefix) },
   );
 
   return translatedMounts.map((mount, index) => {

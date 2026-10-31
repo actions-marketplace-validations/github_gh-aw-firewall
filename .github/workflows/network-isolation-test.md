@@ -5,9 +5,12 @@ on:
 permissions:
   copilot-requests: write
   contents: read
-model: claude-haiku-4-5
+model: auto
 engine:
   id: copilot
+  args:
+    - --allow-url=api.github.com
+    - --allow-url=example.com
 network:
   allowed:
     - defaults

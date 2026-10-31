@@ -17,7 +17,7 @@ export function buildLocalInstallSteps(indent: string): string {
 
   return [
     `${stepIndent}- name: Setup Node.js`,
-    `${runIndent}uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0`,
+    `${runIndent}uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0`,
     `${runIndent}with:`,
     `${scriptIndent}node-version: '24'`,
     `${scriptIndent}package-manager-cache: false`,
@@ -47,6 +47,33 @@ export function buildLocalInstallSteps(indent: string): string {
     `${scriptIndent}EOF`,
     `${scriptIndent}sudo chmod +x /usr/local/bin/awf`,
   ].join('\n') + '\n';
+}
+
+export function buildBranchEnclaveInstallSteps(indent: string, includeMain = false): string {
+  const condition = "github.event_name == 'workflow_dispatch' && github.repository == 'github/gh-aw-firewall' && github.ref_type == 'branch'"
+    + (includeMain ? '' : " && github.ref != 'refs/heads/main'");
+  const scriptIndent = `${indent}    `;
+  const wrapper = [
+    'args=()',
+    'awf_options=true',
+    String.raw`for arg in "\$@"; do`,
+    String.raw`  if [ "\$awf_options" = true ] && [ "\$arg" = "--skip-pull" ]; then`,
+    '    continue',
+    '  fi',
+    String.raw`  if [ "\$arg" = "--" ]; then awf_options=false; fi`,
+    String.raw`  args+=("\$arg")`,
+    'done',
+    'exec "${NODE_BIN}" "${WORKSPACE_PATH}/dist/cli.js" --build-local "\\${args[@]}"',
+  ].map(line => scriptIndent + line).join('\n');
+  return buildLocalInstallSteps(indent)
+    .split('\n')
+    .flatMap(line => line.startsWith(`${indent}- name:`)
+      ? [line, `${indent}  if: ${condition}`] : [line])
+    .join('\n')
+    .replace(
+      `${scriptIndent}exec "\${NODE_BIN}" "\${WORKSPACE_PATH}/dist/cli.js" "\\$@"`,
+      wrapper,
+    );
 }
 
 // Builds the replacement step that copies session state from the AWF-managed
@@ -142,13 +169,14 @@ export function buildScanInjectionStep(indent: string): string {
     `${ri}CACHE_DIR="\${GH_AW_CACHE_DIR:-/tmp/gh-aw/cache-memory}"\n` +
     `${ri}# Quarantine files containing instruction-shaped content to prevent\n` +
     `${ri}# cross-run agent-context instruction injection via cache-memory.\n` +
-    `${ri}# Require a colon after the keyword to reduce false positives on\n` +
-    `${ri}# legitimate files (e.g. '## System Requirements', 'Override: false').\n` +
+    `${ri}# Require a colon after textual keywords to reduce false positives on\n` +
+    `${ri}# legitimate files (e.g. '## System Requirements', 'Override: false');\n` +
+    `${ri}# also match the explicit '<system>' instruction tag.\n` +
     `${ri}INJECTION_PATTERN='^(New instruction:|SYSTEM:|Ignore (all |previous |prior )instructions?:|<system>)'\n` +
     `${ri}QUARANTINE_DIR="\${GH_AW_CACHE_DIR:-/tmp/gh-aw/cache-memory}/.quarantine"\n` +
     `${ri}mapfile -t SUSPICIOUS_FILES < <(\n` +
     `${ri}  find "$CACHE_DIR" -not -path '*/.git/*' -not -path '*/.quarantine/*' -type f \\\n` +
-    `${ri}    -exec grep -lEi "$INJECTION_PATTERN" {} \\; 2>/dev/null || true\n` +
+    `${ri}    -exec grep -lE "$INJECTION_PATTERN" {} + 2>/dev/null || true\n` +
     `${ri})\n` +
     `${ri}if [ \${#SUSPICIOUS_FILES[@]} -gt 0 ]; then\n` +
     `${ri}  mkdir -p "$QUARANTINE_DIR"\n` +

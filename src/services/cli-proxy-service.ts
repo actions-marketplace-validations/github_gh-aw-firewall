@@ -3,6 +3,7 @@ import { EXTERNAL_BRIDGE_NAME, NETWORK_SUBNET, SQUID_PORT } from '../config/netw
 import { isValidIPv4, isValidIPv6 } from '../domain-utils';
 import { parseDifcProxyHost } from '../host-env';
 import { assignImageSource } from '../image-tag';
+import { getSafeHostGid, getSafeHostUid } from '../host-identity';
 import { logger } from '../logger';
 import { WrapperConfig, CLI_PROXY_PORT } from '../types';
 import { NetworkConfig, ImageBuildConfig } from './squid-service';
@@ -23,6 +24,7 @@ interface CliProxyBuildResult {
 }
 
 export const CLI_PROXY_EGRESS_SERVICE_NAME = 'cli-proxy-egress';
+export const CLI_PROXY_AUTH_PLACEHOLDER = 'awf-cli-proxy-placeholder';
 
 interface CliProxyServiceParams {
   config: WrapperConfig;
@@ -91,11 +93,16 @@ export function normalizeLoopbackDifcHost(host: string): string {
  * search-domain-resolved DNS label would be misclassified and remain
  * unreachable — that host must be given a dotted name (or a literal IP
  * outside `awf-net`'s subnet) to be recognized as external.
+ *
+ * `subnet` defaults to the fixed policy `NETWORK_SUBNET`, but callers must
+ * pass the effective (possibly `--network-subnet`-relocated) subnet so an IP
+ * literal inside a relocated `awf-net` is still recognized as an attached
+ * sibling rather than misclassified as external.
  */
-export function isExternalDifcProxyHost(host: string): boolean {
+export function isExternalDifcProxyHost(host: string, subnet: string = NETWORK_SUBNET): boolean {
   const normalized = host.trim().toLowerCase();
   if (!normalized) return false;
-  if (isValidIPv4(normalized)) return !isIPv4InCidr(normalized, NETWORK_SUBNET);
+  if (isValidIPv4(normalized)) return !isIPv4InCidr(normalized, subnet);
   if (isValidIPv6(normalized)) return true;
   // Dotted names (host.docker.internal, difc.example.com) resolve outside the
   // Compose project; bare labels are Docker service/container names.
@@ -122,7 +129,8 @@ export function buildCliProxyService(params: CliProxyServiceParams): CliProxyBui
   // network attachment classification).
   const { host: parsedDifcProxyHost, port: difcProxyPort } = parseDifcProxyHost(config.difcProxyHost);
   const difcProxyHost = normalizeLoopbackDifcHost(parsedDifcProxyHost);
-  const needsEgressRelay = !!config.networkIsolation && isExternalDifcProxyHost(difcProxyHost);
+  const needsEgressRelay =
+    !!config.networkIsolation && isExternalDifcProxyHost(difcProxyHost, networkConfig.subnet);
   const cliProxyUpstreamHost = needsEgressRelay ? CLI_PROXY_EGRESS_SERVICE_NAME : difcProxyHost;
 
   // --- CLI proxy HTTP server (Node.js + gh CLI) ---
@@ -131,6 +139,7 @@ export function buildCliProxyService(params: CliProxyServiceParams): CliProxyBui
   // so that gh CLI's GH_HOST=localhost:${difcProxyPort} matches the cert's SAN.
   const cliProxyService: any = {
     container_name: CLI_PROXY_CONTAINER_NAME,
+    user: `${getSafeHostUid()}:${getSafeHostGid()}`,
     networks: {
       'awf-net': {
         ipv4_address: cliProxyIp,
@@ -138,6 +147,7 @@ export function buildCliProxyService(params: CliProxyServiceParams): CliProxyBui
     },
     // Enable host.docker.internal resolution for connecting to host DIFC proxy
     extra_hosts: { 'host.docker.internal': 'host-gateway' },
+    dns_search: [], // Disable inherited DNS search domains so Docker peer names resolve directly
     volumes: applyHostPathPrefixToVolumes(
       [
         // Log directory for HTTP server logs
@@ -159,12 +169,15 @@ export function buildCliProxyService(params: CliProxyServiceParams): CliProxyBui
       https_proxy: `http://${networkConfig.squidIp}:${SQUID_PORT}`,
       // Pass GITHUB_REPOSITORY for GH_REPO default in entrypoint
       ...(process.env.GITHUB_REPOSITORY && { GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY }),
-      // The gh CLI inside the cli-proxy needs a GitHub token to authenticate API
-      // requests. The token is safe here: the cli-proxy container is inside the
-      // firewall perimeter and not accessible to the agent. The DIFC proxy on the
-      // host provides write-control via its guard policy.
-      ...(process.env.GH_TOKEN && { GH_TOKEN: process.env.GH_TOKEN }),
-      ...(process.env.GITHUB_TOKEN && !process.env.GH_TOKEN && { GH_TOKEN: process.env.GITHUB_TOKEN }),
+      // gh requires a token to construct requests, but the local HTTP shim strips
+      // this non-secret placeholder so the external DIFC proxy uses its own token.
+      GH_TOKEN: CLI_PROXY_AUTH_PLACEHOLDER,
+      ...(config.maxGithubApiPointsRest !== undefined && {
+        AWF_MAX_GITHUB_API_POINTS_REST: String(config.maxGithubApiPointsRest),
+      }),
+      ...(config.maxGithubApiPointsGraphql !== undefined && {
+        AWF_MAX_GITHUB_API_POINTS_GRAPHQL: String(config.maxGithubApiPointsGraphql),
+      }),
       // Prevent curl/node from routing localhost or host.docker.internal through Squid
       ...buildNoProxyEnv(['host.docker.internal']),
     },
@@ -188,7 +201,8 @@ export function buildCliProxyService(params: CliProxyServiceParams): CliProxyBui
         : {}),
     },
     // Security hardening and resource limits to prevent DoS attacks
-    ...buildContainerSecurityHardening({ memLimit: '256m', pidsLimit: 50, cpuShares: 256 }),
+    // Go's gh CLI uses multiple OS threads per call; leave headroom for parallel calls.
+    ...buildContainerSecurityHardening({ memLimit: '256m', pidsLimit: 256, cpuShares: 256 }),
     stop_grace_period: '2s',
   };
 

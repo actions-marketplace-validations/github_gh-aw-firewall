@@ -23,14 +23,39 @@
 const { sanitizeNullToolCallTypes, injectSteeringMessage, injectStreamOptions } = require('./body-transform');
 const { sanitizeForLog, logRequest } = require('./logging');
 const metrics = require('./metrics');
-const { getAndClearPendingSteeringMessage } = require('./guards/effective-token-guard');
-const { getAndClearPendingTimeoutSteeringMessage } = require('./guards/timeout-steering');
+const {
+  getPendingTimeoutSteeringWarning,
+  acknowledgeTimeoutSteeringWarning,
+} = require('./guards/timeout-steering');
+const {
+  getPendingAiCreditSteeringWarning,
+  acknowledgeAiCreditSteeringWarning,
+} = require('./guards/ai-credits-guard');
+const { translateCodexCustomToolsForCopilot } = require('./codex-compat');
+const { endpointForPath, translateCopilotWireApi } = require('./wire-api-compat');
+const { stripRedundantModelPrefixInBody } = require('./model-body-rewriter');
+const { parseBodyAsObject } = require('./body-utils');
+const { recoverRequestModel } = require('./model-recovery');
 
 /** Maximum request body size: 10 MB to prevent DoS via large payloads. */
 const MAX_BODY_SIZE = 10 * 1024 * 1024;
 
 /** When false, token-budget warnings are never injected into request bodies. */
 const isSteeringEnabled = () => process.env.AWF_ENABLE_TOKEN_STEERING === 'true';
+
+/**
+ * True when the request targets an OpenAI Chat Completions route
+ * (e.g. /chat/completions, /v1/chat/completions), ignoring query strings,
+ * fragments, and trailing slashes.
+ *
+ * @param {unknown} url
+ * @returns {boolean}
+ */
+function isChatCompletionsRequest(url) {
+  if (typeof url !== 'string') return false;
+  const path = url.split('?')[0].split('#')[0].replace(/\/+$/, '');
+  return path.endsWith('/chat/completions');
+}
 
 // ── Sleep abstraction (overridable in tests to avoid real setTimeout delays) ──
 
@@ -144,7 +169,7 @@ function createBodyHandler({ handleRequestError, otel }) {
    * Transforms applied in order:
    *   1. `bodyTransform` — optional caller-supplied transform
    *   2. `sanitizeNullToolCallTypes` — strips/normalizes null tool-call types
-   *   3. `injectSteeringMessage` — timeout + token-budget steering (when enabled)
+   *   3. `injectSteeringMessage` — timeout + token/credit steering (when enabled)
    *   4. `injectStreamOptions` — adds `stream_options.include_usage`
    *
    * @param {Buffer} body
@@ -152,15 +177,72 @@ function createBodyHandler({ handleRequestError, otel }) {
    * @param {import('http').IncomingMessage} req
    * @param {string} requestId
    * @param {((body: Buffer) => (Buffer | null | Promise<Buffer | null>)) | null} bodyTransform
-   * @returns {Promise<Buffer>}
+   * @returns {Promise<{ body: Buffer, codexCompatibility: { customTools: Set<string> } | null, wireApiCompatibility: object | null, wireApiSourceBody: Buffer | null }>}
    */
   async function transformRequestBody(body, provider, req, requestId, bodyTransform) {
-    if (bodyTransform && (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH')) {
-      const transformed = await bodyTransform(body, req);
-      if (transformed) body = transformed;
+    let codexCompatibility = null;
+    let wireApiCompatibility = null;
+    let wireApiSourceBody = null;
+    let steering = null;
+    const isWritableMethod = req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH';
+
+    // Normalize a redundant "<provider>/" prefix (e.g. "openai/gpt-6-sol", used by
+    // harnesses such as Pi and Codex) unconditionally — independent of whether
+    // AWF_MODEL_ALIASES is configured — so the literal prefixed model string
+    // never reaches the upstream API, which would otherwise reject it as
+    // unrecognized. NOTE: when AWF_MODEL_ALIASES *is* configured, the
+    // `bodyTransform` step below (backed by model-resolver.js's `resolveModel`)
+    // independently strips the same redundant prefix as part of its own
+    // resolution logic (see `stripRedundantProviderPrefix` usage in
+    // model-resolver.js). Both call sites share the `stripRedundantProviderPrefix`
+    // helper in model-utils.js; keep them in sync if that normalization changes.
+    if (isWritableMethod) {
+      const requestedModel = parseBodyAsObject(body)?.model;
+      if (typeof requestedModel === 'string') req.awfRequestedModelSelector = requestedModel;
+      const prefixStripped = stripRedundantModelPrefixInBody(body, provider);
+      if (prefixStripped) body = prefixStripped;
     }
 
-    if (req.method === 'POST' || req.method === 'PUT' || req.method === 'PATCH') {
+    if (bodyTransform && isWritableMethod) {
+      const transformed = await bodyTransform(body, req);
+      // Body transforms must honour the `Buffer | null` contract. A non-Buffer
+      // result would otherwise flow through as the request body, yielding an
+      // invalid `Content-Length` and an empty upstream request (rejected with
+      // an opaque upstream 400), so ignore it and keep the untransformed body.
+      if (transformed !== null) {
+        if (Buffer.isBuffer(transformed)) {
+          body = transformed;
+        } else {
+          logRequest('warn', 'request_transform_ignored', {
+            request_id: requestId,
+            provider,
+            reason: 'body_transform_returned_non_buffer',
+          });
+        }
+      }
+    }
+
+    // Adapt Codex's Responses `custom`/freeform tool dialect (e.g.
+    // `apply_patch`) into the function-tool dialect Copilot accepts. The
+    // resulting compatibility metadata must be threaded explicitly through
+    // the request/retry context by the caller (see proxy-request.js and
+    // upstream-http.js) rather than recovered from the body later. Chat
+    // Completions requests use a different custom-tool shape and must pass
+    // through unchanged.
+    if (provider === 'copilot' && isWritableMethod && !isChatCompletionsRequest(req.url)) {
+      const translated = translateCodexCustomToolsForCopilot(body);
+      if (translated) {
+        body = translated.body;
+        codexCompatibility = translated.compatibility;
+      }
+    }
+
+    if (isWritableMethod) {
+      const recovered = recoverRequestModel(body, provider, req, requestId, logRequest);
+      if (recovered) body = recovered;
+    }
+
+    if (isWritableMethod) {
       const sanitized = sanitizeNullToolCallTypes(body);
       if (sanitized) {
         body = sanitized.body;
@@ -173,20 +255,38 @@ function createBodyHandler({ handleRequestError, otel }) {
       }
     }
 
-    if (isSteeringEnabled() && (req.method === 'POST' || req.method === 'PUT')) {
+    const allowSteering = req.awfRequestContext?.purpose !== 'routing_classification';
+    if (allowSteering && isSteeringEnabled() && (req.method === 'POST' || req.method === 'PUT')) {
       const steeringMessages = [
-        { type: 'timeout', message: getAndClearPendingTimeoutSteeringMessage() },
-        { type: 'token', message: getAndClearPendingSteeringMessage() },
+        {
+          type: 'timeout',
+          priority: 3,
+          warning: getPendingTimeoutSteeringWarning(),
+          acknowledge: acknowledgeTimeoutSteeringWarning,
+        },
+        {
+          type: 'ai_credit',
+          priority: 2,
+          warning: getPendingAiCreditSteeringWarning(),
+          acknowledge: acknowledgeAiCreditSteeringWarning,
+        },
       ];
-      for (const { type, message } of steeringMessages) {
-        if (!message) continue;
-        const steered = injectSteeringMessage(body, provider, message);
+      const nextWarning = steeringMessages
+        .filter(candidate => candidate.warning)
+        .sort((a, b) =>
+          b.warning.threshold - a.warning.threshold || b.priority - a.priority
+        )[0];
+      if (nextWarning) {
+        const steered = injectSteeringMessage(body, provider, nextWarning.warning.message, req.url);
         if (steered) {
           body = steered;
-          logRequest('info', `${type}_steering`, {
+          steering = { type: nextWarning.type, threshold: nextWarning.warning.threshold };
+          nextWarning.acknowledge(nextWarning.warning.threshold);
+          logRequest('info', `${nextWarning.type}_steering`, {
             request_id: requestId,
             provider,
-            message,
+            threshold: nextWarning.warning.threshold,
+            message: nextWarning.warning.message,
           });
         }
       }
@@ -200,7 +300,18 @@ function createBodyHandler({ handleRequestError, otel }) {
       }
     }
 
-    return body;
+    if (provider === 'copilot' && req.method === 'POST' && endpointForPath(req.url) &&
+        !req.awfRecoveryAttempts) {
+      wireApiSourceBody = Buffer.from(body);
+      const translated = translateCopilotWireApi(body, req.url);
+      if (translated) {
+        body = translated.body;
+        wireApiCompatibility = translated.compatibility;
+        req.awfRouting?.onEndpointTranslation?.(wireApiCompatibility);
+      }
+    }
+
+    return { body, codexCompatibility, wireApiCompatibility, wireApiSourceBody, steering };
   }
 
   return { collectRequestBody, transformRequestBody };

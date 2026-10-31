@@ -1,7 +1,9 @@
 import execa from 'execa';
 import { logger } from './logger';
 import { getLocalDockerEnv } from './docker-host';
+import { getSafeHostGid, getSafeHostUid } from './host-identity';
 import { SQUID_CONTAINER_NAME } from './constants';
+import { stopRouterAndSaveLogs } from './routing/router-log-capture';
 
 /**
  * Runs `docker compose down -v -t 1` with the standard AWF options.
@@ -20,44 +22,83 @@ export async function runComposeDown(
 }
 
 /**
- * Fixes squid log file permissions inside the running container before shutdown.
+ * Fixes squid log file ownership and permissions inside the running container.
  *
- * Squid writes logs as its internal proxy user (UID 13). After `docker compose
- * down`, those files on the host are owned by UID 13, and the runner user
- * (e.g. UID 1001) cannot chmod them without sudo. This is especially
- * problematic on ARC/DinD topologies where the docker-based rootless repair in
+ * Squid writes logs as its internal proxy user (UID 13). On the host those
+ * files are then owned by UID 13, so the runner user (e.g. UID 1001) can
+ * neither read them (`EACCES` when inspecting `access.log` for blocked-domain
+ * diagnostics) nor chmod them during artifact preservation (`chmod -R a+rX ...
+ * Operation not permitted`). This is especially problematic on ARC/DinD
+ * topologies where the docker-based rootless repair in
  * `fixArtifactPermissionsForRootless()` also fails because path translation is
  * not applied to the bind-mount or the squid image is unavailable after compose
  * down with `--pull never`.
  *
- * Running `chmod -R a+rX` as root inside the still-running container fixes the
- * permissions on the bind-mounted log volume before it is unmounted, ensuring
- * that `awf logs summary` and artifact uploads can read the files.
+ * Running `chown`/`chmod` as root inside the still-running container fixes both
+ * ownership and permissions on the bind-mounted log volume, ensuring that log
+ * inspection, `awf logs summary`, and artifact uploads can read the files.
  *
- * Tolerant: silently continues if the container is not running.
+ * The repair is intentionally NOT recursive: when `--proxy-logs-dir` is set,
+ * `/var/log/squid` is the same host directory that also holds the nested
+ * `api-proxy-logs/` (and `cli-proxy-logs/`) subdirectories (see
+ * `src/log-paths.ts`). A recursive chmod would widen permissions on
+ * payload-bearing API-proxy diagnostics (e.g. `token-tracker-audit.jsonl`,
+ * created at mode 0600) before `preserveCleanupArtifacts()` gets a chance to
+ * apply its own directory-scoped repair. Only the directory itself and its
+ * direct log files are touched here.
+ *
+ * Tolerant: silently continues if the container is not running. Never throws,
+ * so the caller's exit code is unaffected by diagnostic log handling.
  */
-async function fixSquidLogPermissionsBeforeShutdown(): Promise<void> {
+export async function fixSquidLogPermissions(): Promise<void> {
+  const uid = getSafeHostUid();
+  const gid = getSafeHostGid();
   try {
     const result = await execa(
       'docker',
-      ['exec', '--user', 'root', SQUID_CONTAINER_NAME, 'chmod', '-R', 'a+rX', '/var/log/squid'],
+      [
+        'exec',
+        '--user',
+        'root',
+        '-e',
+        `TUID=${uid}`,
+        '-e',
+        `TGID=${gid}`,
+        SQUID_CONTAINER_NAME,
+        'sh',
+        '-c',
+        'chown "$TUID:$TGID" /var/log/squid 2>/dev/null; chmod a+rX /var/log/squid 2>/dev/null; ' +
+          'find /var/log/squid -maxdepth 1 -type f -exec chown "$TUID:$TGID" {} \\; -exec chmod a+rX {} \\; 2>/dev/null',
+      ],
       { env: getLocalDockerEnv(), reject: false },
     );
     if (result.exitCode !== 0) {
       logger.debug(
-        `Pre-shutdown squid log chmod exited with code ${result.exitCode}: ${result.stderr || '(no stderr)'}`,
+        `Squid log permission repair exited with code ${result.exitCode}: ${result.stderr || '(no stderr)'}`,
       );
     }
   } catch {
     // Container not running or docker not available — not an error.
-    logger.debug('Pre-shutdown squid log chmod skipped (container not available)');
+    logger.debug('Squid log permission repair skipped (container not available)');
   }
+}
+
+interface StopContainersOptions {
+  /**
+   * Where to save the model router's logs. Set it only when this run's compose
+   * file has a router service.
+   */
+  routerLogsDir?: string;
 }
 
 /**
  * Stops and removes Docker Compose services
  */
-export async function stopContainers(workDir: string, keepContainers: boolean): Promise<void> {
+export async function stopContainers(
+  workDir: string,
+  keepContainers: boolean,
+  { routerLogsDir }: StopContainersOptions = {},
+): Promise<void> {
   if (keepContainers) {
     logger.info('Keeping containers running (--keep-containers enabled)');
     return;
@@ -65,9 +106,14 @@ export async function stopContainers(workDir: string, keepContainers: boolean): 
 
   logger.info('Stopping containers...');
 
-  // Fix squid log permissions before compose down so log files are readable
-  // after shutdown (e.g. for `awf logs summary` and artifact upload).
-  await fixSquidLogPermissionsBeforeShutdown();
+  // Fix squid log ownership/permissions before compose down so log files are
+  // readable after shutdown (e.g. for `awf logs summary` and artifact upload).
+  await fixSquidLogPermissions();
+
+  // Compose down would stop the router last and then remove it with its logs.
+  if (routerLogsDir) {
+    await stopRouterAndSaveLogs(workDir, routerLogsDir);
+  }
 
   try {
     await runComposeDown(workDir);

@@ -14,6 +14,11 @@ import {
   type GuestReadyFrame,
   type GuestResultFrame,
 } from './guest-protocol';
+import { WorkflowCommandFilter } from './workflow-command-filter';
+import { writeWithBackpressure } from '../stream-utils';
+import {
+  GuestTransportError, classifyGuestRejection, type GuestExecutionDiagnostics, type GuestExecutionFailureReason,
+} from './execution-diagnostics';
 
 const GUEST_VSOCK_HANDSHAKE_LIMIT = 128;
 
@@ -37,6 +42,10 @@ export interface GuestExecutionRequest {
   readonly requestId?: string;
   readonly stdout?: Writable;
   readonly stderr?: Writable;
+  readonly rawStdout?: Writable;
+  readonly rawStderr?: Writable;
+  readonly filterWorkflowCommands?: boolean;
+  readonly onDiagnostics?: (value: GuestExecutionDiagnostics) => void;
 }
 
 export interface GuestExecutionResult {
@@ -50,11 +59,18 @@ interface PendingExecution {
   readonly requestId: string;
   readonly stdout?: Writable;
   readonly stderr?: Writable;
+  readonly rawStdout?: Writable;
+  readonly rawStderr?: Writable;
+  readonly stdoutFilter?: WorkflowCommandFilter;
+  readonly stderrFilter?: WorkflowCommandFilter;
   readonly resolve: (result: GuestExecutionResult) => void;
   readonly reject: (error: Error) => void;
   hostTimedOut: boolean;
   timeout?: NodeJS.Timeout;
   cancellation?: NodeJS.Timeout;
+  readonly startedAt: number;
+  readonly diagnostics: GuestExecutionDiagnostics;
+  readonly onDiagnostics?: (value: GuestExecutionDiagnostics) => void;
 }
 
 export class GuestExecutionError extends Error {
@@ -62,6 +78,20 @@ export class GuestExecutionError extends Error {
     super(`guest ${frame.code}: ${frame.message}`);
     this.name = 'GuestExecutionError';
   }
+}
+
+export function guestExecutionFailureReason(error: unknown): GuestExecutionFailureReason | undefined {
+  if (error instanceof GuestTransportError) return error.reason;
+  if (error instanceof GuestExecutionError) return 'guest-rejected';
+  if (error instanceof GuestProtocolError) return 'guest-protocol-error';
+  return undefined;
+}
+
+function socketFailure(error: NodeJS.ErrnoException): GuestTransportError {
+  const code = error.code;
+  return new GuestTransportError('guest-socket-error', 'guest socket failed',
+    code === 'ECONNRESET' || code === 'ECONNREFUSED' || code === 'EPIPE'
+      || code === 'ETIMEDOUT' || code === 'ENOENT' || code === 'EACCES' ? code : undefined);
 }
 
 /**
@@ -107,7 +137,7 @@ export class MicrovmVsockClient {
     const socket = net.createConnection({ path: this.options.socketPath });
     this.socket = socket;
     socket.on('data', (chunk: Buffer) => this.onData(chunk));
-    socket.on('error', (error) => this.fail(error));
+    socket.on('error', (error) => this.fail(socketFailure(error)));
     socket.on('close', () => this.onClose());
     await withTimeout(
       new Promise<void>((resolve, reject) => {
@@ -164,14 +194,31 @@ export class MicrovmVsockClient {
         requestId,
         stdout: request.stdout,
         stderr: request.stderr,
+        rawStdout: request.rawStdout,
+        rawStderr: request.rawStderr,
+        stdoutFilter: request.filterWorkflowCommands && request.stdout
+          ? new WorkflowCommandFilter()
+          : undefined,
+        stderrFilter: request.filterWorkflowCommands && request.stderr
+          ? new WorkflowCommandFilter()
+          : undefined,
         resolve,
         reject,
         hostTimedOut: false,
+        startedAt: performance.now(),
+        onDiagnostics: request.onDiagnostics,
+        diagnostics: {
+          phase: 'sending', elapsedMs: 0, framesReceived: 0, stdoutBytes: 0,
+          stderrBytes: 0, pendingFrameBytes: 0, resultReceived: false,
+        },
       };
       this.pending = pending;
+      this.publishExecution(pending, 'sending');
       if (request.timeoutMs !== undefined) {
         pending.timeout = setTimeout(() => {
           pending.hostTimedOut = true;
+          pending.diagnostics.timedOut = true;
+          this.publishExecution(pending, 'host-timeout');
           void this.send({
             version: GUEST_PROTOCOL_VERSION,
             type: 'cancel',
@@ -180,19 +227,15 @@ export class MicrovmVsockClient {
           }).catch((error) => this.fail(toError(error)));
           pending.cancellation = setTimeout(() => {
             if (this.pending !== pending) return;
-            this.completePending({
-              version: GUEST_PROTOCOL_VERSION,
-              type: 'result',
-              requestId,
-              exitCode: 124,
-              signal: null,
-              timedOut: true,
-            });
-            this.socket?.destroy();
+            void this.completeTimedOutPending(pending);
           }, this.cancellationGraceMs);
         }, request.timeoutMs);
       }
-      void this.send(frame).catch((error) => this.fail(toError(error)));
+      void this.send(frame).then(() => {
+        if (this.pending !== pending) return;
+        pending.diagnostics.sendCompletedMs = Math.max(0, Math.round(performance.now() - pending.startedAt));
+        this.publishExecution(pending, 'sent');
+      }).catch((error) => this.fail(toError(error)));
     });
   }
 
@@ -221,6 +264,7 @@ export class MicrovmVsockClient {
 
   cancel(reason = 'host cancellation', requestId = this.pending?.requestId): Promise<void> {
     if (!requestId) return Promise.reject(new Error('No active guest request'));
+    if (this.pending?.requestId === requestId) this.publishExecution(this.pending, 'cancel');
     return this.send({
       version: GUEST_PROTOCOL_VERSION,
       type: 'cancel',
@@ -294,15 +338,23 @@ export class MicrovmVsockClient {
       this.frameReadTimeout = undefined;
       if (this.decoder.pendingBytes > 0) {
         this.frameReadTimeout = setTimeout(() => {
-          this.fail(new Error(
-            `guest frame read timed out after ${this.readTimeoutMs}ms`,
-          ));
+          this.fail(new GuestTransportError('guest-read-timeout',
+            `guest frame read timed out after ${this.readTimeoutMs}ms`));
         }, this.readTimeoutMs);
       }
     }).catch((error) => this.fail(toError(error)));
   }
 
   private async handleFrame(frame: GuestProtocolFrame): Promise<void> {
+    const pending = this.pending;
+    if (pending) {
+      pending.diagnostics.framesReceived += 1;
+      pending.diagnostics.lastFrameType = frame.type;
+      if (pending.diagnostics.firstResponseMs === undefined) {
+        pending.diagnostics.firstResponseMs = Math.max(0, Math.round(performance.now() - pending.startedAt));
+        this.publishExecution(pending, 'first-response');
+      }
+    }
     if (frame.type === 'ready') {
       if (this.ready) throw new GuestProtocolError('invalid_frame', 'Duplicate ready frame');
       this.ready = frame;
@@ -321,12 +373,30 @@ export class MicrovmVsockClient {
     }
     if (frame.type === 'stdout' || frame.type === 'stderr') {
       const pending = this.requirePending(frame.requestId);
+      const data = Buffer.from(frame.data, 'base64');
+      pending.diagnostics[frame.type === 'stdout' ? 'stdoutBytes' : 'stderrBytes'] += data.length;
       const destination = frame.type === 'stdout' ? pending.stdout : pending.stderr;
-      if (destination) await writeWithBackpressure(destination, Buffer.from(frame.data, 'base64'));
+      const rawDestination = frame.type === 'stdout' ? pending.rawStdout : pending.rawStderr;
+      const filter = frame.type === 'stdout' ? pending.stdoutFilter : pending.stderrFilter;
+      try {
+        if (rawDestination) await writeWithBackpressure(rawDestination, data);
+        if (destination) {
+          const presented = filter?.push(data) ?? data;
+          if (presented.length > 0) await writeWithBackpressure(destination, presented);
+        }
+      } catch {
+        throw new GuestTransportError('guest-output-failed', 'guest output failed');
+      }
       return;
     }
     if (frame.type === 'result') {
-      this.requirePending(frame.requestId);
+      const pending = this.requirePending(frame.requestId);
+      pending.diagnostics.resultReceived = true;
+      pending.diagnostics.exitCode = frame.exitCode;
+      pending.diagnostics.signal = frame.signal === null || Object.prototype.hasOwnProperty.call(osConstants.signals, frame.signal)
+        || /^SIG(?:[1-9]|[1-5][0-9]|6[0-4])$/.test(frame.signal) ? frame.signal : null;
+      pending.diagnostics.timedOut = frame.timedOut;
+      await this.flushPendingOutput(pending);
       this.completePending(frame);
       return;
     }
@@ -353,6 +423,8 @@ export class MicrovmVsockClient {
 
   private completePending(frame: GuestResultFrame): void {
     const pending = this.requirePending(frame.requestId);
+    if (pending.hostTimedOut) pending.diagnostics.timedOut = true;
+    this.publishExecution(pending, 'result');
     clearTimeout(pending.timeout);
     clearTimeout(pending.cancellation);
     this.pending = undefined;
@@ -365,6 +437,7 @@ export class MicrovmVsockClient {
       });
       return;
     }
+
     pending.resolve({
       requestId: frame.requestId,
       exitCode: frame.exitCode ?? 128 + signalNumber(frame.signal),
@@ -373,12 +446,63 @@ export class MicrovmVsockClient {
     });
   }
 
+  private async flushPendingOutput(pending: PendingExecution): Promise<void> {
+    const streams = [
+      [pending.stdout, pending.stdoutFilter],
+      [pending.stderr, pending.stderrFilter],
+    ] as const;
+    for (const [destination, filter] of streams) {
+      if (!destination || !filter) continue;
+      const trailing = filter.finish();
+      try {
+        if (trailing.length > 0) await writeWithBackpressure(destination, trailing);
+      } catch {
+        throw new GuestTransportError('guest-output-failed', 'guest output failed');
+      }
+    }
+  }
+
+  private async completeTimedOutPending(pending: PendingExecution): Promise<void> {
+    try {
+      await this.flushPendingOutput(pending);
+      if (this.pending !== pending) return;
+      this.completePending({
+        version: GUEST_PROTOCOL_VERSION,
+        type: 'result',
+        requestId: pending.requestId,
+        exitCode: 124,
+        signal: null,
+        timedOut: true,
+      });
+      this.socket?.destroy();
+    } catch (error) {
+      this.fail(toError(error));
+    }
+  }
+
   private rejectPending(error: Error): void {
     if (!this.pending) return;
-    clearTimeout(this.pending.timeout);
-    clearTimeout(this.pending.cancellation);
     const pending = this.pending;
+    pending.diagnostics.failureReason = guestExecutionFailureReason(error);
+    if (error instanceof GuestTransportError) pending.diagnostics.socketCode = error.socketCode;
+    if (error instanceof GuestExecutionError) {
+      pending.diagnostics.protocolCode = error.frame.code;
+      pending.diagnostics.rejectionStage = classifyGuestRejection(error.frame.message);
+    }
+    if (error instanceof GuestProtocolError) pending.diagnostics.protocolCode = error.code;
+    this.publishExecution(pending, 'failed');
+    clearTimeout(pending.timeout);
+    clearTimeout(pending.cancellation);
     this.pending = undefined;
+    void this.finishRejectedPending(pending, error);
+  }
+
+  private async finishRejectedPending(pending: PendingExecution, error: Error): Promise<void> {
+    try {
+      await this.flushPendingOutput(pending);
+    } catch {
+      // Preserve the transport/protocol error that terminated the request.
+    }
     pending.reject(error);
   }
 
@@ -389,21 +513,27 @@ export class MicrovmVsockClient {
     return this.writeRaw(encodeGuestFrame(frame));
   }
 
+  private publishExecution(pending: PendingExecution, phase: GuestExecutionDiagnostics['phase']): void {
+    pending.diagnostics.phase = phase;
+    pending.diagnostics.elapsedMs = Math.max(0, Math.round(performance.now() - pending.startedAt));
+    pending.diagnostics.pendingFrameBytes = this.decoder.pendingBytes;
+    pending.onDiagnostics?.({ ...pending.diagnostics });
+  }
+
   private writeRaw(data: Buffer): Promise<void> {
     const socket = this.socket;
     if (!socket || socket.destroyed || !socket.writable) {
-      return Promise.reject(new Error('guest connection is not writable'));
+      return Promise.reject(new GuestTransportError('guest-not-writable', 'guest connection is not writable'));
     }
     return new Promise<void>((resolve, reject) => {
       const timeout = setTimeout(() => {
-        reject(new Error(
-          `guest write timed out after ${this.writeTimeoutMs}ms`,
-        ));
+        reject(new GuestTransportError('guest-write-timeout',
+          `guest write timed out after ${this.writeTimeoutMs}ms`));
         socket.destroy();
       }, this.writeTimeoutMs);
       socket.write(data, (error) => {
         clearTimeout(timeout);
-        if (error) reject(error);
+        if (error) reject(socketFailure(error));
         else resolve();
       });
     });
@@ -422,7 +552,7 @@ export class MicrovmVsockClient {
 
   private onClose(): void {
     if (this.pending) {
-      this.rejectPending(new Error(
+      this.rejectPending(new GuestTransportError('guest-disconnected',
         `guest disconnected while request ${this.pending.requestId} was running`,
       ));
     }
@@ -431,14 +561,6 @@ export class MicrovmVsockClient {
       this.readyWaiter = undefined;
     }
   }
-}
-
-async function writeWithBackpressure(destination: Writable, data: Buffer): Promise<void> {
-  if (destination.write(data)) return;
-  await new Promise<void>((resolve, reject) => {
-    destination.once('drain', resolve);
-    destination.once('error', reject);
-  });
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: string): Promise<T> {

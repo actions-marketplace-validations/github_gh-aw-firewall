@@ -116,6 +116,12 @@ const RUNTIME_REGISTRY: Readonly<Record<string, RuntimeCapabilities>> = {
     needsStaticDns: false,
     usesIptables: false,
   },
+  nvx: {
+    executionModel: 'microvm',
+    dockerRuntime: undefined,
+    needsStaticDns: false,  // NVX manages its own guest DNS resolver
+    usesIptables: false,    // NVX manages its own network namespace/egress
+  },
 };
 
 /**

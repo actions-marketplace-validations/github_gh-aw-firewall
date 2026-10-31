@@ -119,6 +119,33 @@ describe('custom runtime image manifest', () => {
     expect(resolveDohProxyImage(config())).toBe('cloudflare/cloudflared:latest');
   });
 
+  it('defaults the router to the AWF registry and image tag', () => {
+    expect(resolveRuntimeImage(
+      config(),
+      'router',
+      'ghcr.io/github/gh-aw-firewall',
+      parseImageTag('latest'),
+    )).toBe('ghcr.io/github/gh-aw-firewall/router:latest');
+    expect(resolveRuntimeImage(
+      config(),
+      'router',
+      'registry.example.com/mirror',
+      parseImageTag('0.28.61'),
+    )).toBe('registry.example.com/mirror/router:0.28.61');
+    expect(resolveRuntimeImage(
+      config(),
+      'router',
+      'ghcr.io/github/gh-aw-firewall',
+      parseImageTag(`0.28.61,router=${digest}`),
+    )).toBe(`ghcr.io/github/gh-aw-firewall/router:0.28.61@${digest}`);
+    expect(resolveRuntimeImage(
+      config({ router: image('router') }),
+      'router',
+      'ghcr.io/github/gh-aw-firewall',
+      parseImageTag('latest'),
+    )).toBe(image('router'));
+  });
+
   it('records non-Compose consumers in the audit manifest', () => {
     const manifest = {
       ...config({ squid: image('squid'), dindStaging: image('agent') }),

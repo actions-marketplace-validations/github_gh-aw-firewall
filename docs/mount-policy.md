@@ -1,5 +1,8 @@
 # Sandbox Mount Policy
 
+For component identities, host permissions, final mounts and backend-specific
+exports, see the [Filesystem Sharing Contract](filesystem-sharing-contract.md).
+
 AWF exposes a curated slice of the host filesystem to the agent. The **allow
 lists** (what gets mounted in) and **deny lists** (what must stay out) used to be
 hand-maintained in several TypeScript modules, one per runtime, which let them
@@ -19,6 +22,12 @@ production call site for this runtime. `MicrovmWorkspaceImage`
 `credentials.entries`, but it has no production call site today; it is
 exercised only by its own tests.
 
+Mount visibility does not grant engine file scope. A mounted input directory
+still requires host read/traverse permissions and any engine-specific grant,
+such as Copilot's `--add-dir`. See
+[`--mount` does not grant engine file scope](environment.md#--mount-does-not-grant-engine-file-scope)
+for an example and fail-closed input verification guidance.
+
 ## What the policy contains
 
 | Section | Kind | Applies to | Consumed by |
@@ -33,6 +42,24 @@ exercised only by its own tests.
 The `system.*` section is compose-only: sbx gets its system libraries from a
 guest image, not from host mounts. Cloud Hypervisor also boots from a guest
 image and is not driven by this config at all.
+
+## Host work-directory permissions
+
+The host work directory (`--work-dir`) holds generated configuration, including
+`docker-compose.yml`, which can contain credentials. When the initial
+runner/daemon filesystem probe creates a missing work directory, it requests
+mode `0700` for that directory and any missing parents. Under `umask 022` or
+`000`, these new directories remain `0700`, including when Docker is
+unreachable.
+
+The probe does not chmod existing directories. Subsequent configuration
+validation still rejects work directories with group or other access,
+untrusted ownership, or a symlink at the work-directory path. Reused work
+directories must already satisfy those checks.
+
+These host permissions do not change the sandbox mount allow/deny lists or
+establish isolation from a same-UID agent. Protected command-output capture
+separately checks its storage against effective agent-visible mounts.
 
 ## How each runtime applies the credential deny list
 
@@ -67,6 +94,15 @@ should be updated accordingly.
 
 In all cases the agent receives the credentials it legitimately needs through the
 API proxy or environment, never from these on-disk stores.
+
+GitLab CLI's `~/.config/glab-cli/config.yml` is included in the credential deny
+list. AWF also hides GitLab config files at host `GLAB_CONFIG_DIR`,
+`XDG_CONFIG_HOME` and `XDG_CONFIG_DIRS` locations, and macOS configuration
+locations, **when an existing mount exposes them**. Compose maps these files
+through bind sources, including custom target aliases; sbx moves exposed files
+aside and restores them after teardown. This does not add mounts for otherwise
+inaccessible credential directories. Other GitLab config files, such as
+`aliases.yml`, remain available in Compose.
 
 ## Adding an entry
 

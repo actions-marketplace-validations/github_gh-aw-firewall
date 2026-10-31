@@ -21,6 +21,7 @@ import {
   CODEX_PROXY_ENV_KEY_REGEX,
   SESSION_STATE_DIR,
   sessionStateDirInjectionRegex,
+  sessionStateDirConfigInjectionRegex,
   legacyApiProxyLogsDirRegex,
   copySessionStateStepRegex,
   copilotCliDaemonCopyStepRegex,
@@ -29,12 +30,53 @@ import {
   issueDuplicationConclusionConcurrencyRegex,
   issueDuplicationConclusionConcurrencySentinel,
   ripgrepInstallStepRegex,
+  patchLocalBuildCloudHypervisorArtifacts,
+  assertCloudHypervisorSmokePrimaryRuntime,
+  removeCopilotGithubCliPermission,
 } from './workflow-patch-patterns';
 import {
   buildCopySessionStateStep,
   buildCopilotCliDaemonCopyStep,
 } from './workflow-step-builders';
+import { applyCodexWorkflowPatches } from './apply-codex-workflow-patches';
 
+
+describe('assertCloudHypervisorSmokePrimaryRuntime', () => {
+  it('preserves the explicit Cloud Hypervisor primary runtime', () => {
+    const input =
+      String.raw`awf --container-runtime cloud-hypervisor --config config.json ` +
+      String.raw`"enclaves":[{"runtime":"cloud-hypervisor"}]`;
+
+    expect(assertCloudHypervisorSmokePrimaryRuntime(input)).toBe(input);
+  });
+
+  it('rejects missing or non-Cloud-Hypervisor primary runtime selection', () => {
+    expect(() => assertCloudHypervisorSmokePrimaryRuntime(
+      String.raw`awf --container-runtime gvisor --config config.json`,
+    )).toThrow('Cloud Hypervisor enclave smoke must select the Cloud Hypervisor primary runtime');
+    expect(() => assertCloudHypervisorSmokePrimaryRuntime(
+      String.raw`\"container\":{\"containerRuntime\":\"docker\"}`,
+    )).toThrow('Cloud Hypervisor enclave smoke must select the Cloud Hypervisor primary runtime');
+    expect(() => assertCloudHypervisorSmokePrimaryRuntime(
+      String.raw`\"container\":{\"imageTag\":\"0.28.51\"}`,
+    )).toThrow('Cloud Hypervisor enclave smoke must select the Cloud Hypervisor primary runtime');
+    expect(() => assertCloudHypervisorSmokePrimaryRuntime(
+      String.raw`awf --container-runtime docker --config config.json`,
+    )).toThrow('Cloud Hypervisor enclave smoke must select the Cloud Hypervisor primary runtime');
+  });
+});
+
+describe('removeCopilotGithubCliPermission', () => {
+  it('removes the broad GitHub CLI route but preserves the explicit MCP tool', () => {
+    const input = String.raw`--allow-tool '\''github(list_pull_requests)'\'' --allow-tool '\''shell(github:*)'\'' --allow-tool '\''shell(cat)'\''`;
+    const result = removeCopilotGithubCliPermission(input);
+
+    expect(result).toBe(
+      String.raw`--allow-tool '\''github(list_pull_requests)'\'' --allow-tool '\''shell(cat)'\''`,
+    );
+    expect(removeCopilotGithubCliPermission(result)).toBe(result);
+  });
+});
 
 describe('installStepRegex', () => {
   it('should match unquoted /opt/gh-aw path', () => {
@@ -104,6 +146,42 @@ describe('ripgrepInstallStepRegex', () => {
 
     expect(ripgrepInstallStepRegex.test(input)).toBe(true);
     ripgrepInstallStepRegex.lastIndex = 0;
+  });
+
+  describe('patchLocalBuildCloudHypervisorArtifacts', () => {
+    it('enables the development bypass with all five artifact digests', () => {
+      const input =
+        '        env:\n' +
+        '          AWF_REFLECT_ENABLED: 1\n' +
+        '          sudo awf --cloud-hypervisor-supervisor "${GH_AW_CLOUD_HYPERVISOR_SUPERVISOR}" ' +
+        '--cloud-hypervisor-artifact-manifest "$MANIFEST" --cloud-hypervisor-preview --build-local\n';
+
+      const output = patchLocalBuildCloudHypervisorArtifacts(input);
+
+      expect(output).toContain('--cloud-hypervisor-artifact-manifest "$MANIFEST"');
+      expect(output).toContain('--cloud-hypervisor-mount-policy workspace-and-tool-cache');
+      expect(output).toContain('AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS: "1"');
+      expect(output).toContain('--cloud-hypervisor-development-allow-unattested-artifacts');
+      for (const artifact of ['binary', 'virtiofsd', 'kernel', 'rootfs', 'supervisor']) {
+        expect(output).toContain(`--cloud-hypervisor-${artifact}-sha256`);
+      }
+      for (const manifestKey of ['cloudHypervisor', 'virtiofsd', 'kernel', 'rootfs', 'supervisor']) {
+        expect(output).toContain(`.artifacts.${manifestKey}.sha256`);
+      }
+    });
+
+    it('is idempotent when the local-build workflow is already patched', () => {
+      const input =
+        '        env:\n' +
+        '          AWF_CLOUD_HYPERVISOR_DEVELOPMENT_ALLOW_UNATTESTED_ARTIFACTS: "1"\n' +
+        '          AWF_REFLECT_ENABLED: 1\n' +
+        'sudo awf --cloud-hypervisor-supervisor "${GH_AW_CLOUD_HYPERVISOR_SUPERVISOR}" ' +
+        '--cloud-hypervisor-binary-sha256 "$DIGEST" --cloud-hypervisor-preview ' +
+        '--cloud-hypervisor-development-allow-unattested-artifacts ' +
+        '--cloud-hypervisor-mount-policy workspace-and-tool-cache --build-local\n';
+
+      expect(patchLocalBuildCloudHypervisorArtifacts(input)).toBe(input);
+    });
   });
 
   it('matches an installer that already has a step timeout', () => {
@@ -349,6 +427,20 @@ describe('codexConfigTomlHeredocRegex + CODEX_PROXY_ENV_KEY_REGEX', () => {
     expect(result).not.toContain('env_key = "OPENAI_API_KEY"');
     expect(result).toContain('supports_websockets = false');
   });
+
+  it('removes the v0.91.6 JSON env_key from only the openai-proxy provider', () => {
+    const input =
+      "          GH_AW_CODEX_CONFIG_JSON: '" +
+      '{"model_providers":{"openai-proxy":{"base_url":"http://172.30.0.30:10000",' +
+      '"env_key":"CODEX_API_KEY","supports_websockets":false},' +
+      '"other":{"env_key":"OTHER_API_KEY"}}}' +
+      "'\n";
+
+    const result = applyCodexWorkflowPatches(input).content;
+
+    expect(result).not.toContain('"env_key":"CODEX_API_KEY"');
+    expect(result).toContain('"env_key":"OTHER_API_KEY"');
+  });
 });
 
 // ── Session state dir injection and Copy step replacement tests ──────────────
@@ -395,6 +487,48 @@ describe('sessionStateDirInjectionRegex', () => {
     );
     const count = (result.match(/--session-state-dir/g) || []).length;
     expect(count).toBe(2);
+  });
+});
+
+describe('sessionStateDirConfigInjectionRegex', () => {
+  const awfConfigInvocation =
+    '            awf --config "${RUNNER_TEMP}/gh-aw/awf-config.json" --container-workdir "${GITHUB_WORKSPACE}" --build-local';
+
+  beforeEach(() => {
+    sessionStateDirConfigInjectionRegex.lastIndex = 0;
+  });
+
+  it('should match the config-file based awf invocation', () => {
+    expect(sessionStateDirConfigInjectionRegex.test(awfConfigInvocation)).toBe(true);
+  });
+
+  it('should NOT match when --session-state-dir is already injected (idempotent)', () => {
+    const input = awfConfigInvocation.replace(
+      'awf-config.json"',
+      `awf-config.json" --session-state-dir ${SESSION_STATE_DIR}`
+    );
+    expect(sessionStateDirConfigInjectionRegex.test(input)).toBe(false);
+  });
+
+  it('should inject --session-state-dir without disturbing other flags', () => {
+    const result = awfConfigInvocation.replace(
+      sessionStateDirConfigInjectionRegex,
+      (match) => `${match} --session-state-dir ${SESSION_STATE_DIR}`
+    );
+    expect(result).toContain(
+      `awf --config "\${RUNNER_TEMP}/gh-aw/awf-config.json" --session-state-dir ${SESSION_STATE_DIR}`
+    );
+    expect(result).toContain('--container-workdir "${GITHUB_WORKSPACE}"');
+    expect(result).toContain('--build-local');
+  });
+
+  it('should inject in all occurrences (global flag)', () => {
+    const input = `${awfConfigInvocation}\n${awfConfigInvocation}\n`;
+    const result = input.replace(
+      sessionStateDirConfigInjectionRegex,
+      (match) => `${match} --session-state-dir ${SESSION_STATE_DIR}`
+    );
+    expect((result.match(/--session-state-dir/g) || []).length).toBe(2);
   });
 });
 

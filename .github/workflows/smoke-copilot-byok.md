@@ -18,6 +18,8 @@ permissions:
 name: Smoke Copilot BYOK
 engine:
   id: copilot
+  version: 1.0.101
+  checksums-sha256: 018625eac68670d66ede904b9b82cdcd6ab8f87ba20e6e1fbdf0b62c8295d5be
   env:
     # Direct-BYOK trigger. The sibling smoke-copilot workflow already exercises
     # the COPILOT_GITHUB_TOKEN path (auto-injected by gh-aw under the MCP
@@ -99,8 +101,9 @@ steps:
       GH_TOKEN: ${{ github.token }}
 post-steps:
   - name: Validate safe outputs were invoked
+    env:
+      OUTPUTS_FILE: ${{ steps.set-runtime-paths.outputs.GH_AW_SAFE_OUTPUTS }}
     run: |
-      OUTPUTS_FILE="${GH_AW_SAFE_OUTPUTS:-${RUNNER_TEMP}/gh-aw/safeoutputs/outputs.jsonl}"
       if [ ! -s "$OUTPUTS_FILE" ]; then
         echo "::error::No safe outputs were invoked. Smoke tests require the agent to call safe output tools."
         echo "Checked path: $OUTPUTS_FILE"

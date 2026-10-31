@@ -73,7 +73,75 @@ The `--enable-api-proxy` CLI flag is deprecated and ignored — it is kept only 
 4. Squid recognizes the trusted sidecar source IP and bypasses domain ACL evaluation
 5. Request reaches `api.openai.com` or `api.anthropic.com`
 
+### In-network endpoint contract for launchers
+
+AWF sets these variables in the agent environment whenever the API proxy is
+configured, independently of which provider credentials are present:
+
+| Variable | Default Docker-agent URL |
+|---|---|
+| `AWF_API_PROXY_OPENAI_URL` | `http://172.30.0.30:10000` |
+| `AWF_API_PROXY_ANTHROPIC_URL` | `http://172.30.0.30:10001` |
+| `AWF_API_PROXY_COPILOT_URL` | `http://172.30.0.30:10002` |
+| `AWF_API_PROXY_GEMINI_URL` | `http://172.30.0.30:10003` |
+| `AWF_API_PROXY_VERTEX_URL` | `http://172.30.0.30:10004` |
+
+These are local listener origins, not upstream API targets; they contain no
+credentials and do not indicate that a provider is authenticated. The URLs use
+the runtime-selected proxy address (also available as `AWF_API_PROXY_IP`), so
+launchers must read them inside the sandbox rather than hardcode the default
+subnet. Append any provider-required API path separately.
+
+For Compose-managed agents, host-service access is independent of inference
+routing. `--enable-host-access` and `--allow-host-service-ports 5432` may make
+PostgreSQL reachable through `host.docker.internal`, but do not move or publish
+the API proxy on the host. In particular, port `10002` is not published on the
+host in this topology. MicroVM backends select their own reachable proxy address
+and may publish infrastructure ports; launchers should still use these variables.
+
+For Claude using Copilot inference, the compiler-generated launcher must select
+the Copilot listener, regardless of host access, before running its preflight
+health check or starting Claude:
+
+```bash
+# Run inside the AWF agent sandbox, not in a host-runner setup step.
+export ANTHROPIC_BASE_URL="${AWF_API_PROXY_COPILOT_URL:?AWF Copilot proxy URL is required}"
+curl --fail --silent --show-error "${ANTHROPIC_BASE_URL}/health"
+```
+
+The inherited host/runner `ANTHROPIC_BASE_URL` must not be forwarded into the
+AWF agent environment: AWF checks it before the launcher runs, so a stale
+host-gateway URL can fail startup when only Copilot credentials are available.
+The compiler must omit it from explicit `--env` and `--env-file` inputs. If
+using `--env-all`, exclude it with `--exclude-env ANTHROPIC_BASE_URL`. Set the
+Copilot URL only in the in-sandbox launcher above.
+
+The workflow compiler must consume this contract; enabling host access alone
+must never select `http://host.docker.internal:10002` as the inference gateway.
+
 ## Usage
+
+### Restrict BYOK models
+
+Set `apiProxy.allowedModels` in the AWF config file to an operator-approved
+list of model IDs (or glob patterns). The proxy rejects a request for any other
+model with HTTP 403, including a fallback model selected by an agent harness.
+For example, `{"apiProxy":{"allowedModels":["gpt-5.6-sol"]}}` rejects a
+request for `gpt-5.4`. An omitted allowlist does not restrict models; an
+empty list or invalid `AWF_ALLOWED_MODELS` value prevents the proxy from
+starting rather than silently disabling the policy.
+
+For gh-aw workflows, `models.allowed` and `models.blocked` set this request
+policy. On AWF v0.28.33 or later,
+`engine.model-routing.allowed-models` is only a router-candidate list: it
+narrows router choices without restricting agent requests. Older AWF releases
+require this field and also use it as the admitted-model allowlist. When the
+field is omitted on a supported release, the router uses the policy-filtered
+catalogue; gh-aw additionally limits Claude and Codex candidates to their
+engine model families. Routed Claude and Codex workflows must set
+`engine.model-provider: github` to use GitHub Copilot routing. See the
+[gh-aw model-routing reference](https://github.github.com/gh-aw/reference/model-routing/)
+for the workflow configuration.
 
 ### Basic usage
 
@@ -105,6 +173,21 @@ When Codex runs through the AWF API proxy, use an explicit model such as
 remote model/plugin metadata resolution; API-key based proxy routing cannot use
 that catalog even when `chatgpt.com` is allowed, so `auto` can fail with
 `The requested model is not supported`.
+
+This OpenAI-native `auto` limitation does not apply to Copilot's own `auto`
+model selector. Pi's Chat Completions requests continue to forward `auto`
+unchanged. For native GitHub Copilot Responses requests, including Codex's
+`copilot/auto`, the sidecar selects the highest-version Codex model in the live
+Copilot inventory that advertises Responses support. It keeps the Copilot
+provider and credentials; if the inventory has no eligible model, the sidecar
+returns an explicit error. Custom Copilot/BYOK targets are not rewritten.
+
+Since [PR #9005](https://github.com/github/gh-aw-firewall/pull/9005), the
+redundant `<provider>/` prefix strip applied above is unconditional for every
+provider route, not Copilot-only: a LiteLLM-style `openai/gpt-6-sol` sent to
+the OpenAI route (port `10000`) is normalized to `gpt-6-sol` before the
+request reaches OpenAI, so harnesses like Pi that send provider-prefixed model
+IDs no longer receive an opaque upstream `400` for an unrecognized model name.
 
 ### Claude Code example
 
@@ -158,6 +241,8 @@ The API proxy sidecar receives **real credentials** and routing configuration:
 | `GITHUB_RUN_ID` | Forwarded GitHub Actions value | `GITHUB_RUN_ID` set on host (GitHub Actions runs) | Combined with `GITHUB_RUN_ATTEMPT` to derive a stable per-run `X-Interaction-Id` for Copilot API requests (CAPI prompt-cache key); see [Prompt-cache and attribution headers](./auth-matrix.md#prompt-cache-and-attribution-headers-githubcopilotcom-only) in the auth matrix. |
 | `GITHUB_RUN_ATTEMPT` | Forwarded GitHub Actions value | `GITHUB_RUN_ATTEMPT` set on host (GitHub Actions runs) | Paired with `GITHUB_RUN_ID` for the `X-Interaction-Id` derivation above; defaults to `1` if unset. |
 | `NODE_EXTRA_CA_CERTS` | `/usr/local/share/ca-certificates/awf-upstream-ca.crt` | `apiProxy.caCert` / `--api-proxy-ca-cert` set | Extends Node's trusted roots for private or corporate upstream gateways. |
+| `AWF_CLAUDE_HOSTED_WEB_POLICY` | Normalized policy JSON | `apiProxy.hostedWeb.claude` configured | AWF-owned domain policy for Anthropic-hosted `web_search_*`/`web_fetch_*` tools. Generated only from validated AWF config — never accepted from the agent. See [Claude hosted web search and fetch policy](#claude-hosted-web-search-and-fetch-policy). |
+| `AWF_CODEX_HOSTED_WEB_POLICY` | Normalized policy JSON | `apiProxy.hostedWeb.codex` configured | AWF-owned domain policy for OpenAI Responses `web_search` tools and Codex `/v1/alpha/search`. Generated only from validated AWF config — never accepted from the agent. See [Codex hosted web policy](#codex-hosted-web-policy). |
 | `HTTP_PROXY` | `http://172.30.0.10:3128` | Always | Routes through Squid; sidecar traffic is exempt from domain ACLs |
 | `HTTPS_PROXY` | `http://172.30.0.10:3128` | Always | Routes through Squid; sidecar traffic is exempt from domain ACLs |
 
@@ -178,14 +263,15 @@ The agent container receives **redacted placeholders** and proxy URLs:
 | `COPILOT_API_URL` | `http://172.30.0.30:10002` | `COPILOT_GITHUB_TOKEN` or `COPILOT_PROVIDER_API_KEY` provided to host | Redirects Copilot CLI to sidecar |
 | `COPILOT_TOKEN` | `ghu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` | `COPILOT_GITHUB_TOKEN` or `COPILOT_PROVIDER_API_KEY` provided to host | Placeholder token (real auth via API_URL) |
 | `COPILOT_GITHUB_TOKEN` | `ghu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` | `COPILOT_GITHUB_TOKEN` provided to host | Placeholder token protected by one-shot-token (real token in sidecar) |
-| `COPILOT_OFFLINE` | `true` | `COPILOT_GITHUB_TOKEN` or `COPILOT_PROVIDER_API_KEY` provided to host | Enables offline+BYOK mode (skips GitHub OAuth handshake) |
+| `COPILOT_OFFLINE` | `true` | `COPILOT_GITHUB_TOKEN`, `COPILOT_PROVIDER_API_KEY`, or `COPILOT_PROVIDER_BASE_URL` provided to host | Enables offline+BYOK mode (skips GitHub OAuth handshake); disables native `web_fetch` / `web_search`. See the [curl workaround](troubleshooting.md#copilot-web-tools-unavailable-in-api-proxy-mode). |
 | `COPILOT_PROVIDER_BASE_URL` | `http://172.30.0.30:10002` | `COPILOT_GITHUB_TOKEN` or `COPILOT_PROVIDER_API_KEY` provided to host | Points Copilot CLI BYOK provider at sidecar (real upstream URL, if any, held in sidecar) |
 | `COPILOT_PROVIDER_API_KEY` | `ghu_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa` | `COPILOT_GITHUB_TOKEN` or `COPILOT_PROVIDER_API_KEY` provided to host | BYOK provider API key placeholder (real key in sidecar) |
-| `GOOGLE_GEMINI_BASE_URL` | `http://172.30.0.30:10003` | `GEMINI_API_KEY` provided to host | Redirects Gemini CLI to proxy (primary var read by Gemini CLI) |
-| `GEMINI_API_BASE_URL` | `http://172.30.0.30:10003` | `GEMINI_API_KEY` provided to host | Redirects Gemini SDK to proxy (kept for backward compatibility) |
-| `GEMINI_API_KEY` | `gemini-api-key-placeholder-for-credential-isolation` | `GEMINI_API_KEY` provided to host | Placeholder so Gemini CLI auth check passes (real key in sidecar) |
-| `GOOGLE_VERTEX_BASE_URL` | `http://172.30.0.30:10004` | `GOOGLE_API_KEY` provided to host | Redirects Vertex AI requests to proxy |
-| `GOOGLE_API_KEY` | `google-api-key-placeholder-for-credential-isolation` | `GOOGLE_API_KEY` provided to host | Placeholder so Vertex mode auth checks pass (real key in sidecar) |
+| `GOOGLE_GEMINI_BASE_URL` | `http://172.30.0.30:10003` | `GEMINI_API_KEY` or GCP OIDC configured | Redirects Gemini CLI to proxy (primary var read by Gemini CLI) |
+| `GEMINI_API_BASE_URL` | `http://172.30.0.30:10003` | `GEMINI_API_KEY` or GCP OIDC configured | Redirects Gemini SDK to proxy (kept for backward compatibility) |
+| `GEMINI_API_KEY` | `gemini-api-key-placeholder-for-credential-isolation` | `GEMINI_API_KEY` or GCP OIDC configured | Placeholder so Gemini CLI auth check passes (real key or WIF token in sidecar) |
+| `GEMINI_CLI_SYSTEM_SETTINGS_PATH` | `/etc/awf/gemini-cli/settings.json` | Compose-backed Gemini routed through the proxy, unless `GOOGLE_GENAI_USE_VERTEXAI`/`GOOGLE_GENAI_USE_GCA` is `true` | Root-owned, read-only Gemini CLI system settings file that pins `security.auth.selectedType` to `gemini-api-key` |
+| `GOOGLE_VERTEX_BASE_URL` | `http://172.30.0.30:10004` | `GOOGLE_API_KEY` or GCP OIDC configured | Redirects Vertex AI requests to proxy |
+| `GOOGLE_API_KEY` | `google-api-key-placeholder-for-credential-isolation` | `GOOGLE_API_KEY` or GCP OIDC configured | Placeholder so Vertex mode auth checks pass (real key or WIF token in sidecar) |
 | `OPENAI_API_KEY` | `sk-placeholder-for-api-proxy` | `OPENAI_API_KEY` provided to host | Non-secret placeholder required by newer Codex clients; the real host value is excluded and held in the sidecar |
 | `CODEX_API_KEY` | `sk-placeholder-for-api-proxy` | `OPENAI_API_KEY` provided to host | Non-secret placeholder for Codex routing; the sidecar replaces its auth header |
 | `ANTHROPIC_API_KEY` | Not set | Always | Excluded from agent (held in api-proxy) |
@@ -196,9 +282,11 @@ The agent container receives **redacted placeholders** and proxy URLs:
 | `AWF_ONE_SHOT_TOKENS` | `COPILOT_GITHUB_TOKEN,GITHUB_TOKEN,...` | Always | Tokens protected by one-shot-token library |
 
 :::note[Gemini setup is conditional]
-`GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_BASE_URL`, the `GEMINI_API_KEY` placeholder, the `GOOGLE_VERTEX_BASE_URL`/`GOOGLE_API_KEY` placeholders, the `~/.gemini` home directory mount, and the `AWF_GEMINI_ENABLED` signal are only configured when `GEMINI_API_KEY` or `GOOGLE_API_KEY` is provided to the host AWF process. This avoids spurious log entries and unnecessary directory setup in non-Gemini runs (e.g. Copilot-only workflows).
+`GOOGLE_GEMINI_BASE_URL`, `GEMINI_API_BASE_URL`, the `GEMINI_API_KEY` placeholder, the `GOOGLE_VERTEX_BASE_URL`/`GOOGLE_API_KEY` placeholders, the `~/.gemini` home directory mount, and the `AWF_GEMINI_ENABLED` signal are only configured when `GEMINI_API_KEY`, `GOOGLE_API_KEY`, or GCP OIDC (`AWF_AUTH_TYPE=github-oidc`, `AWF_AUTH_PROVIDER=gcp`, `AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER`) is provided to the host AWF process. This avoids spurious log entries and unnecessary directory setup in non-Gemini runs (e.g. Copilot-only workflows).
 
 `GOOGLE_GEMINI_BASE_URL` is the primary variable read by the Gemini CLI (`google-gemini/gemini-cli`). `GEMINI_API_BASE_URL` is kept for backward compatibility with older SDK versions.
+
+Gemini CLI 0.44.0+ would otherwise reject `GOOGLE_GEMINI_BASE_URL` as unsupported "gateway" auth, so AWF also injects `GEMINI_CLI_SYSTEM_SETTINGS_PATH` pointing at an AWF-owned settings file that pins the API-key auth type — see [Gemini CLI exits 41](#gemini-cli-exits-41-with-invalid-auth-method-selected).
 
 **Important**: `GEMINI_API_KEY` must be set as a **runner-level environment variable** (e.g. `env: GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}` in the workflow step), not only as a GitHub Actions secret. The AWF process running on the runner must be able to read it so it can pass the key to the api-proxy sidecar container.
 :::
@@ -417,6 +505,76 @@ apiProxy:
   anthropicCacheTailTtl: "1h"
 ```
 
+### Claude hosted web search and fetch policy
+
+Anthropic's hosted server tools (`web_search_YYYYMMDD`, `web_fetch_YYYYMMDD`) run on Anthropic infrastructure, not inside the agent container. Squid only ever sees the request to `api.anthropic.com`; the domain that was actually searched or fetched is never presented to the domain ACL and never appears in Squid access logs, and the retrieved content comes back inside an already-allowed API response.
+
+This means Claude can reach a site the agent itself is not allowed to reach — a semantic egress gap, an indirect prompt-injection vector, and a blind exfiltration channel through model-generated queries and URLs.
+
+Because the sidecar is part of AWF's trusted computing base and already inspects Anthropic Messages bodies, it is the correct place to close the gap. Configure an AWF-owned policy and the sidecar injects and enforces it on every matching hosted tool definition before the request is dispatched upstream:
+
+```yaml
+apiProxy:
+  hostedWeb:
+    claude:
+      enabled: true
+      allowedDomains:
+        - docs.github.com
+        - nodejs.org
+      maxUses: 5
+```
+
+Blocklist mode (`blockedDomains`) and a hard prohibition (`enabled: false`) are also supported. `allowedDomains` and `blockedDomains` are mutually exclusive because Anthropic rejects both filters on one tool definition.
+
+The configured policy is an immutable upper bound. A request may narrow it — intersecting an allowlist, adding to a blocklist, or lowering `max_uses` — but can never broaden, replace, or remove it. Anything that cannot be represented safely (a cross-mode filter, an empty allowlist intersection, a malformed domain, an unrecognized hosted tool version) is rejected with a structured API-proxy error before the request reaches Anthropic; policy errors never include prompts, queries, URLs, or request bodies. Requests that contain no hosted web tool are forwarded unchanged.
+
+This setting is config-only — there is no CLI flag. AWF serializes the validated policy into the sidecar as `AWF_CLAUDE_HOSTED_WEB_POLICY`, which is generated solely from validated configuration and is never accepted from the agent; the sidecar fails startup if it is invalid. **Omitting `apiProxy.hostedWeb.claude` preserves the previous pass-through behaviour and does not constrain Claude-hosted egress.**
+
+See [§9.8 of the AWF config spec](./awf-config-spec.md#98-claude-hosted-web-search-and-fetch) for the complete precedence and error matrix.
+
+### Codex hosted web policy
+
+Codex can retrieve hosted web content through two OpenAI surfaces: a Responses
+`web_search` tool and the standalone `/v1/alpha/search` endpoint. The latter can
+also scope individual `commands.search_query[]` entries and can fetch literal
+URLs through `open`, `find`, and `screenshot` commands. In every case, OpenAI
+performs retrieval outside AWF's network boundary, so Squid sees only the
+OpenAI endpoint.
+
+Configure `apiProxy.hostedWeb.codex` to make the trusted sidecar enforce one
+AWF-owned upper bound across both routes:
+
+```yaml
+apiProxy:
+  hostedWeb:
+    codex:
+      enabled: true
+      allowedDomains:
+        - docs.github.com
+        - nodejs.org
+      maxUses: 5
+```
+
+Responses tool filters are injected or narrowed after model/body transforms.
+Standalone request filters are then applied to every query domain scope, and
+literal URL hosts are checked against the effective result. OpenAI can
+represent allowed and blocked filters together, so cross-mode request filters
+are preserved and combined with the configured restriction rather than
+rejected. The most restrictive applicable scope always governs.
+
+`maxUses` is emitted as `max_uses` on Responses tools. The standalone route has
+no equivalent cap; when `maxUses` is configured, AWF rejects standalone search
+instead of silently ignoring the limit. Disabled policies, empty intersections,
+malformed filters/domains/URLs, unsupported access modes, and unknown hosted
+search shapes fail closed with structured errors that exclude request content.
+Ordinary OpenAI requests without a hosted-web surface remain unchanged.
+
+This setting is config-only. `AWF_CODEX_HOSTED_WEB_POLICY` is an internal value
+generated from validated config, and invalid serialization fails sidecar
+startup. Omitting `apiProxy.hostedWeb.codex` preserves pass-through behavior
+and **does not constrain Codex-hosted egress**. See [§9.9 of the AWF config
+spec](./awf-config-spec.md#99-codexopenai-hosted-web-policy).
+
 ### Container configuration
 
 The sidecar container:
@@ -425,6 +583,79 @@ The sidecar container:
 - **Network**: `awf-net` at `172.30.0.30`
 - **Ports**: 10000 (OpenAI), 10001 (Anthropic), 10002 (GitHub Copilot), 10003 (Google Gemini), 10004 (Google Vertex AI)
 - **Proxy**: Routes via Squid at `http://172.30.0.10:3128`
+
+## Provider-scoped automatic model selection
+
+On JSON inference requests, combine `model: "auto"` with the AWF-only
+`model_provider` field to choose a model family without changing the configured
+backend, endpoint, or credentials. For example, send this body to the **Copilot**
+proxy on port **10002**, at `POST /v1/messages`, to request a Claude-compatible
+model using the configured Copilot credentials:
+
+```json
+{
+  "model": "auto?effort=high",
+  "model_provider": "anthropic",
+  "max_tokens": 1024,
+  "messages": [{"role": "user", "content": "Hello"}]
+}
+```
+
+- `model_provider` accepts `anthropic` (Claude), `openai` (GPT/o-series), or
+  `google` (Gemini). These are **model families**, not backend routing directives.
+  `copilot` is not a model-family constraint.
+- Supported request surfaces are `POST /messages`, `/chat/completions`, and
+  `/responses`, with optional `/v1` prefixes. Native Gemini/Vertex URL-model
+  requests and the Copilot `/auto` endpoint do not use this contract.
+- Redundant backend prefixes such as `copilot/auto` are accepted. Query suffixes
+  are preserved verbatim on the selected model and ranked retry candidates;
+  this does not add support for options the selected model/upstream rejects.
+- Selection uses only this backend's live inventory and models whose runtime
+  `supported_endpoints` explicitly includes the requested protocol. A model ID
+  alone or a maintained model-name mapping is not sufficient, particularly for
+  native Messages. Backends that omit endpoint metadata cannot satisfy the
+  picker; AWF does not assume compatibility or switch to another backend.
+- Disabled picker models and models excluded by allow/deny policy are omitted.
+  Anthropic selection prefers the newest compatible Sonnet, then Opus, then
+  Haiku. Other families use highest-version ordering. Copilot Responses requests
+  containing Codex custom tools additionally require a Codex model.
+- AWF removes `model_provider` before forwarding. Scoped requests never use the
+  global ordered fallback chain or unconstrained alias/middle-power fallback;
+  endpoint-blocked retries stay within the eligible ranked candidates.
+- Invalid combinations (including a concrete model with `model_provider`)
+  return HTTP **400**. No eligible model after one inventory refresh returns
+  HTTP **503**, code `scoped_auto_model_unavailable`, with troubleshooting advice.
+
+Each `/reflect` endpoint entry exposes `automatic_model_selection` separately
+from its concrete `models` list. It identifies `model: "auto"`,
+`constraint_field: "model_provider"`, accepted `model_providers`, and policy-filtered
+`candidates[model_provider][endpoint]` (for example,
+`candidates.anthropic.messages`). Wait for `models_fetch_complete: true` before
+validating candidates. An empty list means the current inventory cannot satisfy
+that family/protocol combination; tool-specific compatibility and upstream
+availability still need validation at inference time. This contract does not
+claim hosted end-to-end Messages validation.
+
+## gh-aw Inline Sub-Agent Model Resolution
+
+In gh-aw workflows, Claude and Codex inline sub-agent models are resolved by the
+**gh-aw harness before the engine starts**, not just by AWF's per-request alias
+rewriting. Declared aliases resolve to concrete IDs within the engine's
+provisioned provider scope, using AWF `/reflect` availability. Unavailable
+workflow-declared models stop engine startup. Codex additionally checks `/responses`
+support when its provider publishes per-model endpoint metadata; Claude sub-agent
+resolution does not preflight Messages compatibility.
+
+Claude's `model: inherit` uses the parent model without a separate resolution
+record. gh-aw applies resolved IDs to generated Claude agent files and generates
+native Codex TOML roles under `$CODEX_HOME/agents`; staged Markdown alone is not
+Codex's native role format. Each explicit, non-inherited sub-agent model has a
+`model.resolution` record keyed by its agent name. This is separate from AWF's
+`model_resolution` proxy log event and does not bypass model policy or wire-API
+constraints.
+
+For authoring syntax, see gh-aw's [inline sub-agent guide](https://github.com/github/gh-aw/blob/main/.github/aw/subagents.md).
+For failures, see [startup troubleshooting](troubleshooting.md#claudecodex-inline-sub-agent-model-resolution-fails).
 
 ## Model Fallback
 
@@ -515,6 +746,96 @@ apiProxy:
       fallback: false
 ```
 
+### Retired and unavailable model recovery
+
+With `apiProxy.modelFallback.enabled` (the default), HTTP Responses, Chat
+Completions, and Messages inference requests recover from retired or unavailable
+models without requiring `fallbackModels`.
+Known-retired Copilot IDs prefer their suggested replacement if it is in the
+discovered catalogue, compatible, and permitted. Other candidates come from the
+same backend's captured catalogue in deterministic version-descending order.
+On native Copilot backends, a concrete ID missing from a populated catalogue is
+also recovered before dispatch. Custom deployment IDs are not presumed
+unavailable merely because a provider does not list them.
+
+An upstream model-specific `400`/`404` (`model_not_supported`, `model_not_found`,
+or endpoint unavailability) can also trigger recovery. Configured
+`fallbackModels` retain their ordering and are tried before automatic catalogue
+alternatives. Automatic recovery never switches providers or credentials, never
+handles generic validation errors, `401`, `403`, `429`, or `5xx`, and makes at
+most three model substitutions per request, including a pre-dispatch replacement.
+Existing same-model endpoint recovery remains available.
+
+Automatic candidates must preserve the client's endpoint/protocol, tools,
+streaming, structured-output and multimodal requirements, explicit reasoning
+effort, and known context/output limits. Unknown feature support fails closed:
+AWF does not drop tools, remove request fields, or normalize an unsupported
+effort to make a replacement work. Every replacement passes the existing
+allow/deny, multiplier, credit-pricing, and budget guards. Enclave capability
+checks and per-attempt reservations still run before each upstream dispatch.
+Requests whose model remains available are unchanged by this recovery path.
+
+Each substitution emits a structured `model_fallback` warning containing the
+requested/from/to model, provider, and retirement/unavailability reason, without
+prompts or credentials. Token usage and routing evidence retain the replacement
+and original selection; pricing uses the request's captured catalogue. No
+compatible candidate produces `model_recovery_exhausted` before dispatch or
+`model_fallback_exhausted` after an upstream model rejection. Endpoint translation
+incompatibilities retain their actionable endpoint/feature error.
+
+`modelFallback.enabled: false`, `modelFallback.excludeEngines`, strict aliases
+with `fallback: false`, scoped-auto selection, and routing-classifier requests
+do not gain unconstrained recovery. WebSocket tunnels remain opaque: AWF cannot
+prove compatibility for tools/features in future frames, so it does not rewrite
+only the handshake or replay a live session. Known-retired or catalog-unavailable
+handshake models fail explicitly; use HTTP inference for automatic recovery or
+select an available model before opening the WebSocket.
+
+### Ordered fallback models
+
+When the upstream rejects the requested model, you can give the proxy an ordered
+list of models to try next:
+
+```yaml
+apiProxy:
+  fallbackModels:
+    - gpt-5.4
+    - claude-sonnet-4.6
+```
+
+The proxy re-sends the request with the next model only on model-specific
+failures:
+
+- upstream `5xx` responses
+- connection errors or timeouts
+- `400`/`404` responses that report the model as unsupported, not found, or not
+  accessible
+
+`401`, `403`, and `429` never trigger a fallback. The proxy rewrites the
+request's `model`, or the Gemini `/models/<model>:` path segment. Each fallback
+model must pass the same model-policy and budget guards as the original model.
+The token-usage record shows the model that actually served the request in
+`model`, plus a `model_fallback` object that names the `requested_model`. See
+[AWF config spec §12.7](awf-config-spec.md#127-ordered-fallback-models).
+
+Entries qualified with another configured provider switch the upstream provider
+as well as the model, keeping the agent's live session:
+
+```yaml
+apiProxy:
+  fallbackModels:
+    - openai/gpt-5.4
+    - anthropic/claude-sonnet-4.6
+```
+
+Each attempt uses the target provider's endpoint and credentials. The proxy
+translates Chat Completions and Responses requests to the Anthropic Messages API
+(including tools, tool results, and streaming) and translates the response back.
+The proxy refuses to start when an entry names a provider without credentials.
+Token-usage records include the serving `provider` and the `requested_provider`,
+`from_provider`, and `failures` evidence. See
+[§12.7.1](awf-config-spec.md#1271-cross-provider-fallback-chains).
+
 ### Health check
 
 Docker healthcheck on the `/health` endpoint (port 10000):
@@ -582,7 +903,25 @@ curl http://172.30.0.30:10000/reflect
       "port": 10000,
       "base_url": "http://api-proxy:10000",
       "configured": true,
-      "models": ["gpt-4o", "gpt-4o-mini"],
+      "models": ["gpt-5.4", "o3"],
+      "routing_models": [
+        {
+          "model_id": "gpt-5.4",
+          "source": "maintained",
+          "supported_endpoints": ["chat_completions", "responses"],
+          "supported_reasoning_efforts": ["none", "low", "medium", "high", "xhigh"],
+          "context_window_tokens": 1050000,
+          "candidate_metadata_complete": true
+        },
+        {
+          "model_id": "o3",
+          "source": "incomplete",
+          "supported_endpoints": ["responses"],
+          "supported_reasoning_efforts": null,
+          "context_window_tokens": null,
+          "candidate_metadata_complete": false
+        }
+      ],
       "models_url": "http://api-proxy:10000/v1/models"
     },
     {
@@ -635,8 +974,135 @@ Fields:
 - `configured` — `true` if an API key for this provider was found at startup
 - `models` — list of model IDs fetched from the provider at startup; `null` if the provider is not configured or model fetch failed
 - `model_metadata` — sanitized provider metadata, including pricing and provenance when the provider supplies it; currently Copilot supplies runtime pricing
+- `routing_models` — per-discovered-model endpoint, reasoning-effort, and context metadata used by task routing. `source` identifies provider-supplied or maintained fields; `candidate_metadata_complete: false` means the model cannot be offered as a route. `candidate_metadata_reason` explains known exclusions, such as a Copilot model not enabled in the model picker
+- `model_api_mapping` — maintained endpoint and routing metadata, with source references, for model families where provider `/models` APIs do not publish those limits
 - `models_fetch_complete` — `true` once the startup model-fetch pass has finished
 - `models_url` — URL to query for the live model list
+
+The top-level `routing` field is `null` unless task-level model routing is
+active. When it is active, it tells the agent which model, effort, and endpoint
+the router selected for the run:
+
+```json
+{
+  "status": "selected",
+  "selection": {
+    "provider": "copilot",
+    "model": "github-copilot/gpt-5.4-mini",
+    "wire_model": "gpt-5.4-mini",
+    "effort": "low",
+    "endpoint": "/responses"
+  }
+}
+```
+
+`status` is `pending` until the router selects, `selected` afterwards, or
+`failed` (with `failure_code`) after a terminal routing failure. The selection
+is advisory: the agent/harness seeds its model from it by sending `wire_model`
+as the body `model` to `endpoint` (for `/responses`, `reasoning.effort` equal to
+`effort`; for `/v1/messages`, `output_config.effort` when `effort` is not
+`null`). The proxy does not reject other requests — an agent or sub-agent may
+use any model that `AWF_ALLOWED_MODELS` / `AWF_DISALLOWED_MODELS` permit, and
+that model policy, not routing, is what bounds cost. Each inference request is
+logged as a `model_routing` event with `stage: "request"` and
+`routed: "as_selected"` or `"deviated"` (with differences in `model`, `effort`,
+or `provider`), recording requested and selected values side by side. Endpoint
+differences are informational: they remain in `deviations` but do not by
+themselves make a request `deviated`. Only genuine routing failures (no
+selection could be produced, or an upstream failure on a request that used the
+selected provider and model) end the run with exit `78`.
+
+### Model-routing audit log
+
+When task-level routing is active, the sidecar always writes
+`model-routing.jsonl` under `AWF_TOKEN_LOG_DIR` (default
+`/var/log/api-proxy`), alongside `token-usage.jsonl`. This audit log does not
+require `AWF_DEBUG_TOKENS`. AWF preserves it with the other API-proxy logs
+under `<logging.proxyLogsDir>/api-proxy-logs/`.
+Writes are synchronous and best-effort: a logging failure does not change
+routing or inference behavior, and no explicit flush is required. The writer uses
+owner-only file permissions (`0600`) and refuses symbolic links.
+
+Every record includes `_schema: "model-routing/v<AWF_VERSION>"`, an ISO 8601
+UTC `timestamp`, `event: "model_routing"`, and a `stage` of `classification`,
+`selection`, `failure`, or `request`.
+
+Selection records describe the decision, not merely the winning model:
+
+| Field | Meaning |
+|-------|---------|
+| `selected_model`, `selected_effort`, `selected_provider` | Canonical provider-qualified model, selected effort (or `null`), and provider. |
+| `wire_model`, `endpoint` | Wire model and endpoint advertised in `/reflect` for the selected model. |
+| `labels`, `mode` | Validated classification labels and mode, or `null` when classification did not succeed. |
+| `classifier_model`, `classifier_effort` | Successful classifier's canonical model and effort, or `null` when no classifier succeeded. |
+| `router` | Router identity as `{name, version}`. |
+| `ranked_choices` | Ordered router choices, each containing `model` and `effort`. |
+| `objective`, `provider` | Routing objective and configured routing provider. |
+| `conversation_sha256` | SHA-256 digest of `JSON.stringify` of the validated staged conversation, not the original file bytes. |
+| `interaction_id` | ID produced by the existing Copilot interaction-ID builder. |
+| `github_repository`, `github_workflow_ref` | GitHub run context, when available. |
+
+Request records retain `routed` (`as_selected`, `deviated`, or `unobserved`),
+`deviations`, and `unavailable`. If a request is rejected before its body is
+read, `unavailable` contains `model` and `effort`, and those comparisons are
+omitted from `deviations`; known provider and endpoint differences are still
+reported. Endpoint differences are informational and do not determine `routed`.
+Otherwise, a known provider difference makes the request `deviated`; if there
+is no known provider difference and body-dependent comparisons remain
+unavailable, it is `unobserved`.
+`selected_model`, `selected_effort`, `selected_provider`, `selected_endpoint`,
+`requested_model`, and `requested_effort`; `provider` and `pathname` identify
+the requested provider and endpoint. Selection
+records use a canonical model ID; request records use the request-side model
+representation for comparison. Each request record includes `request_id`,
+`outcome` (`completed`, `rejected`, `failed`, `aborted`, or `client_closed`),
+and `status` (the final HTTP status). A policy-rejected deviation remains a
+rejection, not a failure to select a route. HTTP success alone does not imply
+`completed`: stream errors or premature termination can produce `failed` or
+`aborted`. `client_closed` records a 2xx streamed response whose client closed
+the connection before AWF finished writing, after the upstream sent its
+protocol terminal success event (`response.completed` for Responses,
+`message_stop` for Messages, or `data: [DONE]` for Chat Completions). Codex,
+for example, stops reading at `response.completed`. Unlike `aborted`, a
+`client_closed` request on the selected model does not fail the routed run.
+Request records include `requested_endpoint` and `upstream_endpoint`; these
+differ when the Copilot proxy translates a request for a model that supports
+only the other wire API. Endpoint-only translation remains informational and
+does not change the `routed` classification. Translated token-usage records
+carry the same endpoint pair, and usage is extracted from the upstream response.
+Join `request_id` to `token-usage.jsonl` when a usage record is available;
+rejected or aborted calls may have no token-usage record.
+`failed` request records also carry `error_code` and `error_type` when an
+identifier-shaped value (`^[A-Za-z0-9_.:-]{1,64}$`) is available, plus
+`error_source`: `upstream` when the identifiers come from the provider's JSON
+error body (up to 16 KiB; a `gzip`, `deflate`, or `br` encoded body is
+inspected through a decoded copy bounded to 16 KiB, and the client still
+receives the original bytes) or the first SSE error event, and `awf` when AWF
+produced the error response itself (for example a local
+`unsupported_reasoning_effort` rejection, a `provider_not_configured`
+response for a provider without usable credentials, or
+`model_fallback_exhausted`). These fields are recorded for deviating requests
+too; they never include the provider's error `message`, and they are omitted
+when no valid value exists.
+When the provider rejects a request and AWF replaces that rejection with its
+own envelope (Copilot's endpoint rejection rewritten to
+`model_endpoint_incompatible` or `unsupported_wire_api_feature`), the request
+record carries AWF's code with `error_source: "awf"`. The matching
+`upstream-errors.jsonl` entry keeps the provider's original identifiers in
+`error_code`/`error_type`/`error_param` (omitted when the original body has
+none), sets `response_transformed: true`, and logs AWF's replacement as
+`response_body`.
+Classifier usage rows have `purpose: "routing_classification"` and
+`caller_source: "awf"`, and are not primary inference request records.
+When a request carries a valid `x-awf-caller` header, its request record
+carries the same `purpose`, `agent_name`, and `caller_source` as the
+token-usage record with the same `request_id` (see
+[Caller attribution](#caller-attribution-x-awf-caller)); otherwise none of these
+fields is present.
+
+The log contains routing metadata only: no raw conversation, prompt,
+classifier response text, or request/response body is captured. Optional
+conversation capture is not implemented and is outside this contract.
 
 Copilot discovery requests use API version `2026-07-01`. Runtime Copilot prices
 override bundled prices, including default and long-context tiers. Other
@@ -644,9 +1110,67 @@ providers continue to use bundled pricing because their model-list APIs do not
 currently advertise token prices. Failed or empty refreshes retain the last
 successful snapshot.
 
-Explicit `apiProxy.providers` model-cost overlays take precedence over runtime
-and bundled pricing. Overlay costs use the models.dev format (dollars per token)
-and are normalized to dollars per million tokens inside the proxy.
+Explicit `apiProxy.providers` model-cost overlays take precedence over all other
+pricing sources. A versioned `apiProxy.modelPricingCatalog` takes precedence
+over runtime and bundled pricing and records its catalog ID and version with
+AI-credit usage. Both sources may define an optional long-context tier with a
+prompt-token threshold and rates for every token category; the tier applies
+only when the prompt count exceeds the threshold. Overlay costs use the
+models.dev format (dollars per token) and are normalized to dollars per million
+tokens inside the proxy. Shared-catalog rates use dollars per million tokens.
+
+Azure deployment names are not inferred from model-family prefixes. With an
+active AI-credit budget, an unknown deployment must have explicit pricing or
+the proxy rejects it before inference. The two Azure BYOK smoke workflows use
+the operator-confirmed mapping `o4-mini-aw` to canonical `openai/o4-mini`.
+Their postprocessor installs a workflow-scoped catalog from the checked-in
+models.dev snapshot via `scripts/ci/configure-aoai-smoke-pricing.cjs`, preserving
+all budget limits and unknown-model rejection for other deployments. This is
+not a production-wide alias or a generic fallback. Update the confirmed mapping
+and pinned pricing together if that Azure deployment changes its underlying
+model.
+
+Both smokes explicitly select `COPILOT_PROVIDER_WIRE_API=responses` so Copilot
+does not send its generic chat-completions `temperature=0` default, which
+`o4-mini` rejects. The wire deployment remains `o4-mini-aw`, and the same
+workflow-scoped prices and budget limits apply.
+
+### Caller attribution (`x-awf-caller`)
+
+The agent harness may set an optional `x-awf-caller` request header so that
+`token-usage.jsonl` and `model-routing.jsonl` request records say which agent
+made each request:
+
+| Header value | `purpose` | `agent_name` | `caller_source` |
+|---|---|---|---|
+| `main` | `agent` | — | `caller_header` |
+| `subagent/<agentName>` | `subagent` | `<agentName>` | `caller_header` |
+| *(AWF router classifier call)* | `routing_classification` | — | `awf` |
+| absent or invalid | — | — | — |
+
+`<agentName>` is the sub-agent definition name. A value is valid only when it
+is at most 128 characters and the whole value matches
+`^(?:main|subagent/[A-Za-z0-9_.:/-]+)$`. Any other value — too long, containing
+illegal characters (including the `, ` Node inserts when the header is sent
+twice), `subagent/` with an empty name, or an unknown form such as `admin` — is
+ignored as if the header were absent. AWF logs only a
+`caller_header_rejected` event with a fixed `reason` (`too_long`,
+`invalid_format`, or `not_a_string`); the rejected value is never logged.
+
+The header is parsed once at ingress (HTTP requests and WebSocket upgrades)
+and is always stripped before forwarding upstream, valid or not, including on
+cross-provider fallback and WebSocket tunnels. A trusted AWF purpose always
+wins: classifier calls record `purpose: "routing_classification"` with
+`caller_source: "awf"` and never an `agent_name`. Without a valid header and
+AWF purpose, records contain none of these keys.
+
+**Trust model.** The header is a caller declaration from inside the sandbox,
+not an authenticated identity; a compromised agent can label its own requests
+however it likes. Consumers must take credits, token counts, and served models
+from AWF's own record and use the caller fields only to attribute that record
+to an agent. The header is metadata only: it never changes routing, model
+policy, steering, guards, budget accounting, or cost, and it is kept separate
+from AWF's trusted in-process request context.
 
 ## Troubleshooting
 
@@ -669,7 +1193,70 @@ When `GEMINI_API_KEY` is provided to the AWF runner, `GOOGLE_GEMINI_BASE_URL`, `
           -- gemini ...
 ```
 
-> **Note:** Exit code 41 ("no auth method") should no longer occur since the placeholder key satisfies the CLI's pre-flight check. If you see exit 41, verify `GEMINI_API_KEY` is exported in the AWF runner environment.
+> **Note:** A missing runner key causes the proxy listener to return 503. For exit 41 with `Invalid auth method selected.`, see the next section.
+
+### Gemini CLI exits 41 with "Invalid auth method selected."
+
+Gemini CLI **0.44.0 and newer** resolve *any* non-empty `GOOGLE_GEMINI_BASE_URL` to the internal `gateway` auth type in `getAuthTypeFromEnv()`, but their own `validateAuthMethod()` has no branch for that type and aborts with `Invalid auth method selected.` (exit code **41**) before a single request is issued. Because AWF must set `GOOGLE_GEMINI_BASE_URL` to route the CLI through the api-proxy sidecar, every proxied Gemini run hit this upstream regression (see [google-gemini/gemini-cli#27550](https://github.com/google-gemini/gemini-cli/issues/27550)). The placeholder `GEMINI_API_KEY` value is not involved — the CLI performs no key-format validation.
+
+**Resolution:** For Compose-backed agent runtimes, AWF stages an AWF-owned Gemini CLI *system* settings file at `/etc/awf/gemini-cli/settings.json` inside the chroot and points the CLI at it with `GEMINI_CLI_SYSTEM_SETTINGS_PATH`:
+
+```json
+{
+  "security": {
+    "auth": {
+      "selectedType": "gemini-api-key"
+    }
+  }
+}
+```
+
+The CLI uses `settings.merged.security.auth.selectedType || getAuthTypeFromEnv()`, and the system settings scope has the highest merge precedence, so the API-key auth type wins over the `gateway` inference while `GOOGLE_GEMINI_BASE_URL` is still honoured for request routing. The file only sets `security.auth.selectedType`, so workspace settings (for example the `mcpServers` block written by `gh-aw`) are deep-merged untouched. This policy staging does not write host Gemini user settings.
+
+The network-disabled `gemini-settings-init` service uses the agent image to populate
+the `gemini-system-settings` named volume as root (directory `0755`, file `0644`).
+The agent waits for successful initialization and mounts the directory read-only.
+The volume is daemon-local, so ARC/DinD does not depend on runner-side file binds;
+normal Compose teardown removes it with the other named volumes.
+
+Gemini CLI 0.64.0 validates root ownership and non-group/other-writable permissions
+on the file, every ancestor, and canonical symlink targets. The old
+`$HOME/.awf/gemini-cli-system-settings.json` path fails these checks even if its leaf
+is root-owned, because the agent home must remain runner-owned and writable. Do
+not change home ownership or disable Gemini's validation to work around this.
+
+The pin is skipped when `GOOGLE_GENAI_USE_VERTEXAI=true` or `GOOGLE_GENAI_USE_GCA=true`, since those auth types are resolved before the `gateway` branch and are unaffected.
+
+**Compatibility:** Gemini CLI 0.43.0 and earlier do not have the `gateway` branch and work with or without the pinned settings file; 0.44.0 and newer require AWF releases that include this fix (downgrading the CLI is no longer necessary).
+
+#### Offline secure-path regression
+
+After `npm run build`, run the opt-in Docker component check with an unmodified
+copy of Gemini CLI 0.64.0's validator. The harness verifies its SHA-256, transpiles
+the original validator without changing its POSIX checks, and supplies a `Map`
+cache; unused Windows/async dependencies fail if called. Source retrieval is a
+separate preparation step:
+
+```bash
+curl -fsSL \
+  https://raw.githubusercontent.com/google-gemini/gemini-cli/4a0749aceac5643e6f85a36d7420314d85e13b52/packages/core/src/utils/security.ts \
+  -o /tmp/gemini-security-0.64.0.ts
+node scripts/ci/gemini-system-settings-smoke.mjs /tmp/gemini-security-0.64.0.ts
+```
+
+The check requires a locally available `node:24-bookworm` image (override with
+`AWF_GEMINI_TEST_IMAGE`) and Docker Compose. It never pulls images, passes provider
+credentials, or calls a model. All test containers use `network_mode: none`.
+Named volumes avoid runner-to-daemon file binds, and teardown removes only the
+check's unique Compose project.
+
+As UID/GID `1001:1001`, it proves old-home-path rejection, new-system-path
+acceptance, writable-ancestor and symlink/canonical-target rejection, read-only
+policy access, and a still-writable home. It also checks initialization reuse and
+unsafe-file rejection, plus AWF's generated environment against a loopback fake
+proxy. This is not a full Gemini CLI authentication/inference run or proof of
+hosted smoke recovery; live ARC/DinD and gVisor integration still require their
+normal runtime checks after an approved AWF release.
 
 ### Gemini requests blocked by Squid (connection refused / raw-IP denied)
 
@@ -791,7 +1378,7 @@ SigV4 support applies to buffered HTTP requests, including streaming HTTP respon
 
 ### GCP Vertex AI
 
-Exchanges the GitHub OIDC JWT for a GCP access token via the Security Token Service, optionally followed by service account impersonation. The resulting token is injected as a Bearer token.
+Exchanges the GitHub OIDC JWT for a GCP access token via the Security Token Service, optionally followed by service account impersonation. The resulting token is injected as a bearer token for OpenAI-compatible GCP targets and for the native Gemini/Vertex adapters.
 
 #### GCP-specific environment variables
 
@@ -800,8 +1387,10 @@ Exchanges the GitHub OIDC JWT for a GCP access token via the Security Token Serv
 | `AWF_AUTH_GCP_WORKLOAD_IDENTITY_PROVIDER` | ✅ | — | Full resource name of the Workload Identity Provider |
 | `AWF_AUTH_GCP_SERVICE_ACCOUNT` | No | — | Service account email to impersonate (omit for direct access) |
 | `AWF_AUTH_GCP_SCOPE` | No | `https://www.googleapis.com/auth/cloud-platform` | OAuth2 scope |
+| `AWF_AUTH_GCP_PROJECT` | For native Vertex express-path rewriting | — | Google Cloud resource project ID supplied by the compiler |
+| `AWF_AUTH_GCP_LOCATION` | For native Vertex express-path rewriting | — | Vertex location supplied by the compiler (e.g. `us-central1` or `global`) |
 
-Default OIDC audience: the `gcpWorkloadIdentityProvider` value
+Default GitHub OIDC audience: `https://iam.googleapis.com/` followed by the `gcpWorkloadIdentityProvider` value. `AWF_AUTH_OIDC_AUDIENCE` overrides this default; the STS audience remains `//iam.googleapis.com/` followed by the provider resource name.
 
 :::note
 `ACTIONS_ID_TOKEN_REQUEST_URL` and `ACTIONS_ID_TOKEN_REQUEST_TOKEN` are injected by the Actions runner automatically. AWF forwards them to the sidecar when `AWF_AUTH_TYPE=github-oidc` and excludes them from the agent container.
@@ -811,14 +1400,12 @@ Default OIDC audience: the `gcpWorkloadIdentityProvider` value
 When `gcpServiceAccount` is omitted, the federated token is used directly without service account impersonation. This requires that the federated principal has direct access grants on the target resource.
 :::
 
-:::note[Implementation vs. provider documentation]
-GCP OIDC with Vertex-hosted models is served through the **OpenAI adapter** (`OPENAI_API_TARGET`/`--openai-api-target` pointed at a Vertex AI OpenAI-compatible endpoint), not through the native Vertex AI adapter (port 10004). The native Vertex adapter is static-`GOOGLE_API_KEY`-only and has no OIDC/WIF support today — see the [auth matrix](./auth-matrix.md#provider-google-vertex-ai) for details.
+:::note[Supported Vertex paths]
+For the Gemini CLI Vertex mode (`GOOGLE_GENAI_USE_VERTEXAI=true`), use the native Vertex adapter on port 10004. AWF sets `GOOGLE_VERTEX_BASE_URL` and exchanges GCP WIF credentials in the sidecar. The compiler must supply `AWF_AUTH_GCP_PROJECT` and `AWF_AUTH_GCP_LOCATION` to the host AWF process; AWF forwards these to the sidecar. In GCP OIDC mode, native `/v1/publishers/google/models/MODEL:METHOD` and `/v1beta1/publishers/google/models/MODEL:METHOD` paths are rewritten to include `/projects/PROJECT/locations/LOCATION`, preserving the API version, method, and query string. The resource project selects the target Google Cloud project; it is not inferred from the workload identity provider or service account.
 
-The OpenAI-compatible Vertex endpoint also requires a resource-specific base path such as `/v1/projects/PROJECT_ID/locations/LOCATION/endpoints/openapi`. Set it with `OPENAI_API_BASE_PATH` or `--openai-api-base-path`; replace the example project and location with your own values.
-:::
+Regional locations use `LOCATION-aiplatform.googleapis.com`; the `us` and `eu` multi-regions use `aiplatform.us.rep.googleapis.com` and `aiplatform.eu.rep.googleapis.com`, respectively, and `global` uses `aiplatform.googleapis.com`. `VERTEX_API_TARGET` still overrides the host. Already project-scoped paths are not rewritten, and their host is selected from the location in the path. Static-key express mode is unchanged. If either project or location is absent, paths are left unchanged.
 
-:::caution[Agent routing is not automatically configured]
-GCP OIDC can initialize in the sidecar, but OIDC configuration alone does not set `OPENAI_BASE_URL` or OpenAI compatibility placeholders in the agent. `buildOpenAiCredentialEnv()` currently enables agent routing only when `OPENAI_API_KEY` is configured. Until OIDC-aware OpenAI routing is implemented, AWF does not provide a complete keyless Vertex OpenAI-compatible invocation path.
+OpenAI-compatible Vertex endpoints can still use the OpenAI adapter (`OPENAI_API_TARGET` plus a resource-specific `OPENAI_API_BASE_PATH` such as `/v1/projects/PROJECT_ID/locations/LOCATION/endpoints/openapi`).
 :::
 
 ### Anthropic API
@@ -840,7 +1427,7 @@ Default OIDC audience: `https://api.anthropic.com`
 
 For compatibility with Anthropic's official SDKs, AWF sends `anthropic-beta: oauth-2025-04-20,oidc-federation-2026-04-01` only on its JWT-bearer `POST /v1/oauth/token` exchange. Requests authenticated with the resulting bearer token send `oauth-2025-04-20`; they do not send the federation beta. Static `x-api-key` requests receive neither value, and forwarded refresh-token exchanges never receive the federation beta. AWF merges required values with client-supplied `anthropic-beta` values and the optional auto-cache beta without duplicates.
 
-**Official references:** [Anthropic WIF documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation) · [Anthropic TypeScript SDK federation exchange](https://github.com/anthropics/anthropic-sdk-typescript/blob/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/oidc-federation.ts) · [credential beta constants](https://github.com/anthropics/anthropic-sdk-typescript/blob/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/types.ts)
+**Official references:** [Anthropic WIF documentation](https://platform.claude.com/docs/en/manage-claude/workload-identity-federation) · [Anthropic TypeScript SDK federation exchange](https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/oidc-federation.ts) · [credential beta constants](https://raw.githubusercontent.com/anthropics/anthropic-sdk-typescript/3b45cd3b69c956ac63384fdb09ce1d8109f3fa80/src/lib/credentials/types.ts)
 
 #### GitHub Actions example (Anthropic)
 
@@ -866,136 +1453,47 @@ jobs:
                 -- your-agent-command
 ```
 
-## Effective token budget
+## Runtime and AI-credit steering
 
-The API proxy can enforce a cumulative **effective token budget** per run. When enabled, the proxy tracks weighted token usage across all LLM requests and rejects new requests once the budget is exhausted.
-
-### Configuration
-
-Set in the AWF config file or via the `--max-model-multiplier` CLI flag:
-
-```json
-{
-  "apiProxy": {
-    "maxEffectiveTokens": 500000,
-    "modelMultipliers": {
-      "o3-pro": 15,
-      "o3": 4,
-      "claude-sonnet-4-20250514": 1,
-      "gpt-4.1-mini": 0.5
-    },
-    "defaultModelMultiplier": 15
-  }
-}
-```
-
-Or equivalently from the command line:
-
-```bash
-awf --max-model-multiplier o3-pro:15,o3:4,claude-sonnet-4-20250514:1,gpt-4.1-mini:0.5 ...
-```
-
-When both the config file and the CLI flag specify a multiplier for the same model, the **CLI flag takes precedence**.
-
-### How tokens are weighted
-
-Raw token counts from upstream responses are not treated equally. Each category has a fixed weight that reflects its relative cost:
-
-| Category | Weight | Example fields |
-|----------|--------|----------------|
-| Input | ×1.0 | `prompt_tokens`, `input_tokens` |
-| Cache read | ×0.1 | `cache_read_input_tokens` |
-| Output | ×4.0 | `completion_tokens`, `output_tokens` |
-| Reasoning | ×4.0 | `reasoning_tokens` |
-
-The formula for a single response is:
-
-```
-effective_tokens = model_multiplier × (1.0×input + 0.1×cache_read + 4.0×output + 4.0×reasoning)
-```
-
-If no model multiplier is configured, it defaults to `1`.
-
-### Enforcement
-
-After each successful upstream response, the proxy accumulates the effective tokens. Before forwarding the *next* request, the proxy checks the running total:
-
-- **Under budget**: Request is forwarded normally.
-- **Budget reached or exceeded**: Request is rejected immediately with:
-  - **HTTP `403 Forbidden`**
-  - **Error body**:
-
-    ```json
-    {
-      "error": {
-        "type": "effective_tokens_limit_exceeded",
-        "message": "Maximum effective tokens exceeded (512345.67 / 500000).",
-        "total_effective_tokens": 512345.67,
-        "max_effective_tokens": 500000
-      }
-    }
-    ```
-
-WebSocket upgrade requests are also rejected with `403` when the budget is reached or exceeded.
-
-:::caution
-Once the budget is reached or exceeded, **all subsequent requests in the run are rejected**. The budget is not recoverable — there is no way to "free up" tokens within a single run. The rejection uses **HTTP `403`** (not `429`) precisely because the limit is terminal: a `429` would invite LLM SDK clients to retry with backoff against a cap that never recovers, burning the remaining run budget until the step times out.
-:::
-
-### Threshold tracking and token steering
-
-The proxy tracks which usage thresholds have been crossed. When token steering is enabled (see below), it **injects a budget-warning message** into the body of the next eligible request sent to the upstream model:
-
-| Threshold | Tracked once per run | Warning injected (when steering enabled) |
-|-----------|-----------------------|------------------------------------------|
-| 80% | Yes | Yes |
-| 90% | Yes | Yes |
-| 95% | Yes | Yes |
-| 99% | Yes | Yes |
-
-#### Enabling token steering
-
-Token steering is **opt-in**. Pass `--enable-token-steering` on the CLI or set `apiProxy.enableTokenSteering: true` in the config file:
+Budget steering is **opt-in**. Pass `--enable-token-steering` on the CLI or set `apiProxy.enableTokenSteering: true` in the config file:
 
 ```yaml
 apiProxy:
-  maxEffectiveTokens: 500000
+  maxAiCredits: 25
   enableTokenSteering: true
 ```
 
-When disabled (the default), thresholds are still tracked and exposed via `/reflect`, but no warning messages are injected into request bodies.
+This one switch enables advisory warnings for AI-credit and runtime thresholds at 80%, 90%, 95%, and 99%. Credit thresholds use the lower of `maxAiCredits` and the non-overridable 10,000-credit hard cap (or the hard cap alone when no credit budget is configured). Runtime steering uses the actual agent start marker, not the first model request. Host timeout enforcement uses a separate host-controlled deadline and does not trust the agent-writable marker.
 
 To opt a workflow out explicitly, set `apiProxy.enableTokenSteering: false` (or omit the field). The CLI/config value is the only source of the sidecar's `AWF_ENABLE_TOKEN_STEERING` env var, which is emitted only when steering is enabled.
 
-#### How steering messages are injected
+Steering is advisory and delivered only in the body of a later eligible outbound model request. It cannot interrupt a running model request or tool, extend the timeout, raise a budget, guarantee a subsequent request, or guarantee completion/submission. Terminal budget exhaustion still rejects requests normally. The proxy cannot reliably distinguish main-agent requests from sub-agent requests: the recorded `x-initiator` value identifies billing class (`agent` or `user`), not which agent made the request. A notice may therefore be delivered to whichever agent or sub-agent request is next.
 
-When a threshold is crossed, the proxy modifies the outgoing request body of the *next* API call to include a system-level warning. This ensures the agent receives budget information even if it doesn't parse headers or error responses. The message format is:
+Each threshold is tracked once per run. At most one warning is injected per eligible request; the largest crossed percentage is delivered first, then pending warnings on later requests. Equal percentages are ordered time, then AI credits. Classifier, malformed, unsupported, or otherwise unmodifiable requests leave warnings pending; a warning is consumed only after successful injection.
 
-```
-[AWF TOKEN WARNING] You have used 90% of your effective token budget. Complete your current task and prepare final output.
-```
+When a usage record is available for a request carrying a notice, its `token-usage.jsonl` record includes `steering: { "type": "ai_credit", "threshold": 90 }` (with `type` set to `timeout` or `ai_credit`, and `threshold` to 80, 90, 95, or 99). This lets consumers correlate the delivered notice with its request ID without recording prompt content.
 
-When `--agent-timeout` is configured, the proxy also injects runtime steering messages at the same thresholds:
+The message formats are:
 
 ```
+[AWF AI CREDIT WARNING] You have used 90% of your AI-credit budget. Complete your current task and prepare final output.
 [AWF TIME WARNING] You have used 90% of your allotted run time. Complete your current task and prepare final output.
 ```
 
-The injection is provider-aware:
+Injection is protocol-aware and preserves caller content and tool exchanges:
 
-| Provider | Injection mechanism |
-|----------|---------------------|
-| OpenAI / Copilot | Inserts `{"role":"system","content":"..."}` after existing system messages |
-| Anthropic | Appends to the `system` field (string concat or block append) |
-| Gemini | Appends `{"text":"..."}` to `systemInstruction.parts` |
+| Request format | Injection mechanism |
+|---------------|---------------------|
+| OpenAI / Copilot Chat Completions | Inserts a `system` message after existing system messages |
+| OpenAI / Copilot Responses | Appends one final `developer` message item to `input` after all existing items, preserving `instructions`, tools, existing input/tool history, and stream fields for prompt-cache reuse; string input becomes a user message followed by the notice |
+| Anthropic / Copilot Messages | Appends a text block to `system` |
+| Gemini | Appends a text part to `systemInstruction.parts` |
 
-Each threshold is injected **at most once** per run. If the body cannot be parsed as JSON, injection is silently skipped for that request.
-
-Crossed thresholds are also exposed via `/reflect` in `effective_tokens.thresholds_crossed`.
+`/reflect` exposes AI-credit `thresholds_crossed` and `thresholds_pending`, and runtime deadline state at `time_steering` (`started_at_ms`, `percent_elapsed`, and threshold fields).
 
 ### Introspection
 
-Query the `/reflect` endpoint on any provider port to see the current budget state:
+Query the `/reflect` endpoint on any provider port to see the current AI-credit state:
 
 ```bash
 curl http://172.30.0.30:10000/reflect
@@ -1005,27 +1503,13 @@ The response includes:
 
 ```json
 {
-  "effective_tokens": {
-    "enabled": true,
-    "max_effective_tokens": 500000,
-    "total_effective_tokens": 234567.89,
-    "remaining_effective_tokens": 265432.11,
-    "percent_used": 46.91,
-    "thresholds_crossed": []
-  }
-}
-```
-
-### Detecting budget exhaustion
-
-Agents and orchestrators should detect the `403` response and the `effective_tokens_limit_exceeded` error type. The error body is structured JSON and can be parsed programmatically:
-
-```javascript
-if (response.status === 403) {
-  const body = await response.json();
-  if (body.error?.type === 'effective_tokens_limit_exceeded') {
-    // Budget exhausted — stop making API calls
-    console.log(`Token budget exceeded: ${body.error.total_effective_tokens} / ${body.error.max_effective_tokens}`);
+  "ai_credits": {
+    "total": 0.234567,
+    "max_ai_credits": 25,
+    "effective_max_ai_credits": 25,
+    "percent_used": 0.94,
+    "thresholds_crossed": [],
+    "thresholds_pending": []
   }
 }
 ```
@@ -1059,7 +1543,7 @@ Before forwarding each request to the upstream provider, the proxy checks the in
     {
       "error": {
         "type": "max_runs_exceeded",
-        "message": "Maximum LLM invocations exceeded (50 / 50).",
+        "message": "Maximum LLM invocations exceeded (50 / 50): the shared per-run max-turns budget, including sub-agents, is exhausted. For gh-aw workflows, increase max-turns in workflow frontmatter and recompile; retrying within this run cannot restore the budget.",
         "invocation_count": 50,
         "max_runs": 50
       }
@@ -1198,7 +1682,7 @@ awf --max-model-multiplier-cap 5 --max-model-multiplier claude-opus-4.7:27,gpt-4
 
 ### Enforcement
 
-Before forwarding each POST/PUT/PATCH request, the proxy resolves the model's effective multiplier using the same lookup used by the effective-token guard (exact match → longest-prefix match → default). If the resolved multiplier exceeds the cap:
+Before forwarding each POST/PUT/PATCH request, the proxy resolves the model's multiplier using the configured exact match, longest-prefix match, and default. If the resolved multiplier exceeds the cap:
 
 - **HTTP `400 Bad Request`**
 - **Error body**:
@@ -1312,12 +1796,97 @@ If your workflow uses the `observability.otlp` frontmatter block, gh-aw automati
 `GITHUB_AW_OTEL_TRACE_ID`, and `GITHUB_AW_OTEL_PARENT_SPAN_ID`. AWF forwards all of these
 into the api-proxy container, so no extra configuration is needed.
 
+## Copilot Wire API Translation
+
+The Copilot proxy endpoint (port 10002) automatically translates requests between GitHub Copilot's two wire APIs based on model support:
+
+- **Responses API** (`/responses`) — supports reasoning efforts and advanced features like streaming reasoning tokens
+- **Chat Completions API** (`/chat/completions`) — standard Chat Completions format
+
+### How it works
+
+When a Copilot model supports only one wire API but a request arrives for the other, the proxy transparently translates the request:
+
+1. **Detection**: The proxy checks the requested model's advertised endpoint support and preserves the client's endpoint when supported (or when support is unknown)
+2. **Translation**: If the model only supports the other wire API, the request body, headers, and endpoint are transformed only if the request's features can be preserved
+3. **Upstream dispatch**: The translated request is sent to the correct upstream endpoint
+4. **Response mapping**: Response tokens and usage are mapped back to the original wire API format
+
+If Copilot returns `model "..." is not accessible via the ... endpoint`, the
+proxy tries the other wire API once for the **same model**, provided the request
+can be translated without dropping features. This handles missing or stale
+endpoint metadata. If translation is incompatible or the other endpoint also
+rejects the model, the proxy can try a compatible policy-permitted model from
+the discovered catalogue (or an explicitly configured alias/fallback candidate).
+If no candidate can preserve the request, it returns an actionable error;
+endpoint recovery never drops features.
+
+### Supported features
+
+Wire API translation handles:
+- Message format normalization (roles, content types, tool calls)
+- Reasoning effort translation (`reasoning_effort` ↔ `reasoning.effort`)
+- Streaming and non-streaming responses
+- Error propagation with proper HTTP status codes
+
+### Observability
+
+The model-routing audit log (`model-routing.jsonl`) tracks wire API translation:
+
+- `requested_endpoint` — the wire API the client requested
+- `upstream_endpoint` — the wire API actually used (differs when translation occurred)
+- When translation happens, telemetry includes both endpoints so you can identify:
+  - Which models triggered translation
+  - Request patterns that benefited from fallback endpoints
+
+Example log entries:
+
+```json
+{"event":"model_routing","stage":"request","requested_endpoint":"/responses","upstream_endpoint":"/chat/completions","routed":"as_selected"}
+```
+
+### Limitations of wire API translation
+
+- **Unsupported features** return HTTP 400 with a `WireApiCompatibilityError` if a request includes features that cannot be translated between wire APIs
+- **Reasoning effort is required** when translating to Responses API, but optional when translating to Chat Completions
+- **Custom tool definitions** (`tools[custom]`) are preserved when the client's
+  endpoint is supported, but cannot generally translate between the two APIs.
+  Choose a model supporting that endpoint, or use function tools supported by
+  both APIs. The existing Responses `apply_patch` compatibility adapter remains
+  supported; this does not imply support for arbitrary freeform custom tools.
+
 ## Limitations
 
+- **Cursor native token accounting is unsupported when no recognized usage is observable**:
+  routing `apiProxy.targets.openai.host` to `api2.cursor.sh` can successfully
+  proxy `/agent.v1.AgentService/RunSSE` without producing token records.
+  The native protocol is not an OpenAI completion protocol merely because it
+  uses the OpenAI route or advertises `text/event-stream`.
+  Third-party [interoperability implementations](https://github.com/leookun/cursor-byok)
+  describe optional turn-ended counts and Connect-framed protobuf messages,
+  but these do not verify authoritative counts or executed-model metadata for
+  Cursor CLI `2026.07.20-8cc9c0b`. The reported smoke run did not capture the raw
+  response. Cursor's [official SDK contract](https://raw.githubusercontent.com/cursor/sdk-bridge/main/proto/sdk/v1/sdk_agent_service.proto)
+  exposes cloud usage through a different service, not native RunSSE; AWF does
+  not assume those contracts are interchangeable.
+  Until a native usage contract is verified, a 2xx RunSSE stream without
+  recognized usage emits `TRACK_END` with `result: "unsupported_accounting"`,
+  `protocol: "cursor-runsse"`, `reason: "native_usage_contract_unverified"`,
+  `provider`, `path`, `status`, and `streaming: true` in the always-on
+  `token-tracker-audit.jsonl`, plus a `token_track_unsupported_accounting`
+  warning. Consumers must inspect these records rather than interpret an empty
+  `token-usage.jsonl` as zero cost or an emitter failure. Match the native
+  `path` and `streaming: true`, not just `rid`: BidiAppend calls can reuse the
+  request ID and have their own `no_usage` result.
+  No zero-token record or byte-derived estimate is written. Effective-token
+  and AI-credit budgets cannot account for these responses, so their totals
+  are incomplete and must not be relied on as spending limits for this
+  protocol. Recognized OpenAI, Anthropic, and Gemini usage continues through
+  normal accounting. Inference routing and authentication are unchanged.
 - Keys must be set as environment variables (not file-based)
 - No request/response logging (by design, for security)
 - **AWS Bedrock OIDC signs HTTP requests only**: WebSocket upgrades are rejected, and the signing target is restricted to the exact regional Bedrock Runtime hostname. See [OIDC Authentication > AWS Bedrock](#aws-bedrock).
-- **Vertex AI adapter has no OIDC/WIF support**: the native Vertex adapter (port 10004) only accepts a static `GOOGLE_API_KEY`. To use GCP workload identity federation with Vertex-hosted models, point the OpenAI adapter (port 10000) at a Vertex OpenAI-compatible endpoint instead — see [OIDC Authentication > GCP Vertex AI](#gcp-vertex-ai).
+- **Vertex AI OpenAI-compatible endpoints still need explicit OpenAI routing**: native Gemini CLI Vertex mode uses port 10004 with GCP WIF, but OpenAI-compatible Vertex endpoints use port 10000 and require `OPENAI_API_TARGET`/`OPENAI_API_BASE_PATH` — see [OIDC Authentication > GCP Vertex AI](#gcp-vertex-ai).
 - **GitHub Copilot Business tier target is never auto-derived**: set `COPILOT_API_TARGET=api.business.githubcopilot.com` explicitly (or `--copilot-api-target`); it is not inferred from `GITHUB_SERVER_URL`.
 
 ## Related documentation

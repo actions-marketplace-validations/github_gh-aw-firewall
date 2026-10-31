@@ -54,9 +54,160 @@ The test suite is organized in three tiers:
 | Smoke Tests | 4 | N/A | Per-workflow (scheduled + PR) |
 | Build-Test | 8 | N/A | Per-workflow (PR + dispatch) |
 
+### CI image retrieval
+
+The chroot, examples, deterministic Cloud Hypervisor guest build, and supply-chain
+jobs configure the GitHub-hosted Linux runner's Docker daemon with Google's
+[Docker Hub cache](https://cloud.google.com/artifact-registry/docs/pull-cached-dockerhub-images)
+before starting containers. This covers ordinary and nested `docker build`
+commands without rewriting production Dockerfiles or digest pins. A cache miss
+still falls back to Docker Hub and can fail under upstream rate limits; retrieval
+errors are not skipped.
+
+The supply-chain job pulls its pinned scanners once before compilation. Syft
+retains the compiler's exact Docker Hub reference (served through the daemon
+cache); Grype and Grant use Anchore's GHCR distribution at the same reviewed
+digests. Scan targets, vulnerability database updates, and the blocking
+High/Critical PR-image gate are unchanged. The setup script validates the merged
+daemon configuration before restart and refuses local or self-hosted runners.
+
 ### Unified enclave coverage
 
-Legacy bounded smoke and runtime-matrix assets were removed from the owned workflow surface. Until a unified gh-aw enclave smoke workflow exists, coverage for the enclave MCP server and executor contracts stays local/unit-focused:
+Cloud Hypervisor enclave contract coverage runs in
+`.github/workflows/test-cloud-hypervisor-enclaves.yml`. Its ordinary CI job uses
+the authenticated broker/host boundary with a mock VM manager; its explicitly
+opted-in GitHub-hosted Ubuntu x86_64 KVM job exercises real host storage,
+nftables packets, and supervisor limit probes. A separate, false-by-default
+`live-kvm` gate invokes both static executors through the public broker route
+using package-matched release-attested artifacts and the production storage
+provider. Supported releases authorize automatic `workflow_dispatch` of the
+full conformance workflow, including `run_live_kvm: true`; no human dispatch is
+required after a successful supported release. The live gate is not run on
+pull-request events, avoiding exposure of the Copilot credential to untrusted
+pull-request code. Ad hoc diagnosis or recovery dispatches require separate
+maintainer authorization. It checks canonical bounded results, script guest
+identity and limits, and synthetic-output redaction. The live gate has not
+passed until it runs successfully on an eligible GitHub-hosted Ubuntu x86_64
+KVM/cgroup-v2 runner. Live dispatch must check out an exact published release
+tag containing the explicitly pinned reviewed acceptance commit, not `main`.
+The tag-only release version bump intentionally
+leaves `main` at `0.23.1`; substituting newer artifacts for that package is not
+allowed. A future authorized release containing this harness is required.
+Acceptance evidence must identify each exercised profile (primary agent,
+script-only enclave, agent-only enclave, and combined enclaves), the shared
+base-image lineage, and the final enclave rootfs digest for both enclave roles.
+Host probes and deterministic mock-manager tests do not establish guest
+acceptance. A branch-host/release-guest smoke failure, including the observed
+HTTP 403, is not proof of a newly published unified guest artifact or of a
+particular local-versus-upstream proxy rejection.
+A separate false-by-default `run_environment_probe` dispatch runs only the
+script-only public environment probe through the same release-attested public
+MCP route, without an agent executor, API proxy, or Copilot secret; see
+[the probe dispatch](cloud-hypervisor-foundation.md#public-enclave-environment-probe-dispatch).
+The public gateway fixture preserves the MCP server's empty HTTP 202
+acknowledgment for JSON-RPC notifications, including `notifications/initialized`
+and cancellation. It still requires bounded JSON responses for requests with
+an ID and rejects malformed, truncated, or oversized backend responses.
+Deterministic fixture tests cover this distinction: release v0.28.70's probe
+and live acceptance both passed `initialize` but failed the initialized
+notification because the fixture tried to parse its empty acknowledgment as
+JSON and returned HTTP 502. This fixture regression does not establish a guest
+or provider failure, and its mocked fix does not prove live KVM acceptance.
+The live job also runs scripts/ci-only startup-failure probes for both roles
+after real VM creation and boot, using the production host executor service,
+authenticated broker protocol v2 client, storage provider, and VM manager.
+Host closures force the errors only after capturing allocated resource
+identities; cleanup and rejection of replay must succeed. Those probes do not
+invoke the public MCP route or execute a workload, unlike the other live
+assertions. Their deterministic transport tests are not KVM evidence.
+Before broker readiness, an AWF exit, signal, spawn failure, or readiness
+timeout emits one `AWF_HOST_STARTUP_DIAGNOSTIC` JSON line to the job log before
+fixture cleanup. Legacy schema version 1 contains only `phase` (`pre-broker`),
+`stage` (`initial` or `recovery`), a fixed `reason` and `category`, bounded
+`exitCode`, allowlisted `signal`, and `logInspection` (`structured`, `bounded`,
+or `unavailable`). Categories cover exact known configuration, host-preflight,
+artifact, container-runtime, host-service, broker, recovery-state, and
+unsupported-host errors; unmatched errors are explicitly `unknown`, not an
+inferred root cause. The harness first uses the existing host startup record,
+then falls back to the first fatal stderr header for older/interrupted starts.
+Legacy lines remain at most 256 bytes. Schema version 2 uses `host-startup`
+and adds a validated `enclaveStartup` snapshot from AWF itself (not a harness
+probe). Its perspective is always `awf-host`; startup stages distinguish host
+bootstrap, configuration, runtime/host/storage/artifact preflight, seed staging,
+recovery, host service, container bring-up, gateway attachment, optional GitHub
+readiness, and the actual `initialize`, initialized notification, and `tools/list`
+requests. `readiness` is explicitly `not-attempted`, `attempted`, or `ready`.
+Missing/unvalidated observations remain unknown, never inferred as not attempted.
+Only allowlisted transport/protocol codes, initialization attempt count
+(saturated at 1200), and HTTP error status (100–599 or null) are exported.
+Categories distinguish `dns`, `connectivity`, `gateway-auth`,
+`gateway-protocol`, `gateway-readiness`, `other`, and `unknown`.
+The schema-2 diagnostic line without subchecks is bounded to 640 bytes.
+An optional versioned `hostPreflight` snapshot contains the current shared,
+fixed check plan, with `not-attempted` / `not-required` / `attempted` /
+`passed` / `failed` results and only
+allowlisted reasons. It records actual gate outcomes, including trusted tool
+ownership/traversal/access, pinned versions, bounded mounts, KVM, capabilities,
+cgroups, and Docker/Compose; it does not infer success for unexecuted checks.
+Schema 2 also identifies the profile and lifecycle phase; schema 1 remains
+readable for previously published evidence.
+Lines including only an active subcheck plan are bounded to 8192 bytes.
+The always-on `startupChecks` schema-1 cumulative checklist also retains
+earlier scopes as `scope/check-id: [result, reason]` and distinguishes
+complete hosting readiness from a gateway handshake alone. Lines including
+the cumulative checklist remain within 16 KiB, as do compact persisted
+records including the fatal message; the descriptor read limit is unchanged.
+Failed gates select the
+`host-preflight` category without interpreting their raw errors. Unknown
+errors remain explicit `unknown` reasons. See the
+[standard checklist and scope definitions](cloud-hypervisor-foundation.md#standard-enclave-startup-checklist).
+The privileged host-probes job also runs the production read-only admission
+method under sudo, emitting `AWF_HOST_PREFLIGHT_PROBE` with perspective
+`preflight-harness`, never `awf-host` or guest success.
+Spawn failures never
+consult possibly stale logs. A request timeout includes DNS/TCP/response time
+and does not prove a particular TCP failure. Retryable backend-unavailable
+responses remain distinct from readiness-deadline exhaustion.
+It never prints stdout, stderr, record messages, paths, timestamps, causes,
+or subprocess error objects. Descriptor-based, no-follow, regular-file reads
+are limited to 16 KiB for the record and 64 KiB for stderr; changed or unsafe
+files cannot produce a classification. Each launch resets its private logs.
+AWF reuses its existing startup-error record inside the fixture's root-private
+0700 directories; there is no new network or agent-facing diagnostic channel.
+Progress records have phase `enclave-startup-progress` and a fixed message;
+fatal records retain phase `startup`. Oversized serialized fatal messages are
+replaced with a fixed message so they cannot hide the bounded snapshot (1024
+serialized message bytes when subchecks are present; 8192 otherwise).
+Publication validates descriptor ownership, single-link regular-file metadata,
+and no-follow opening before truncation. Existing log readers ignore progress
+records rather than presenting them as failures.
+After broker health, both initial and recovery launches additionally wait for
+AWF's successful host handshake before making the harness's own MCP requests.
+For checklist-aware releases every required startup/storage/connectivity
+check must pass before primary-agent startup and before
+`AWF_HOST_GATEWAY_READINESS` is emitted with the same safe snapshot.
+Broker health and a successful harness request are not proof of AWF readiness.
+AWF stdout/stderr and startup error records are removed even when cleanup
+requires retaining private recovery state; no raw artifacts are uploaded.
+Cleanup failures remain failures and do not replace the primary startup error.
+Deterministic regressions cover the output shape and bounds, secrets and
+repository sentinels, malformed/unknown input, unsafe/changing files, each
+failure reason, and bounded cleanup. These diagnostics do not establish that
+an agent or workload ran and do not fix an unidentified startup cause. The
+immutable `v0.28.36` release cannot receive this change; release-pinned live
+acceptance needs a future authorized release containing it.
+Privileged enclave probes no longer run in the ordinary artifact-build job.
+Production full-storage admission is enabled only after supported-host and
+release-artifact preflight; invocation exports, artifact/rootfs copies, and
+manager state share the trusted allocation domain and recovery contract. See
+the [enclave conformance evidence and remaining live
+gate](cloud-hypervisor-foundation.md#enclave-conformance-evidence-and-remaining-live-gate)
+for exact blockers and the mandatory, still-unverified live acceptance
+criteria.
+
+Legacy bounded smoke and runtime-matrix assets were removed from the owned
+workflow surface. Beyond the new static-executor live gate, coverage for
+enclave MCP server and executor contracts remains local/unit-focused:
 
 - `src/services/enclave-mcp-service.test.ts`
 - `src/services/enclave-agent-service.test.ts`
@@ -230,14 +381,13 @@ following behavior:
 | `dns-denial` | Direct DNS (8.8.8.8:53) is blocked from the guest |
 | `metadata-denial` | Instance metadata IP (`169.254.169.254`) is unreachable |
 | `api-proxy-reflect` | API proxy `/reflect` reachable; secret sentinel not in output |
-| `workspace-copyback` | Guest file writes, permission changes, and symlinks survive copy-back |
 | `exit-code` | Agent exit code propagates faithfully (37 → 37) |
 | `timeout-124` | Timed-out agent exits 124 |
 | `device-assumptions` **(CH-only)** | `/dev/vda`/`/dev/vdb` and `eth0` guest device assumptions hold |
 | `partial-start-cleanup` | Corrupt rootfs causes clean failure; no residue |
 | `cancellation` | `SIGTERM` cleans up residue within a non-flaky time ceiling; exits 143 |
 | `keep` | `--keep-containers` preserves namespace/run-directory; diagnostics ≤1 MiB |
-| `security-assertions` **(CH-only)** | Live jailer-replacement boundary: non-root uid, `CapEff` limited to `CAP_NET_ADMIN` alone, `no_new_privs`, active seccomp filter, per-run cgroup membership/bounded memory, `landlock_enable` + exactly-minimal disk/net/vsock topology via `vm.info` |
+| `security-assertions` **(CH-only)** | Live jailer-replacement boundary: non-root uid, empty `CapInh`/`CapPrm`/`CapEff`/`CapBnd`/`CapAmb`, `no_new_privs`, active seccomp filter, per-run cgroup membership/bounded memory, `landlock_enable` + exactly-minimal disk/net/vsock topology via `vm.info` |
 
 After every case, the suite asserts no `awfvm-*` namespaces,
 `vmh*`/`vmn*`/`vmt*` interfaces, `awf-cloud-hypervisor` cgroup entries, or
@@ -245,3 +395,25 @@ After every case, the suite asserts no `awfvm-*` namespaces,
 sentinel (`awf-cloud-hypervisor-real-secret-do-not-expose`). See
 [Cloud Hypervisor integration (preview)](../docs/cloud-hypervisor-foundation.md#part-14--ci-workflow)
 for the full CI workflow specification.
+
+## NVX preview integration tests
+
+The NVX backend has an opt-in live-KVM workflow
+(`nvx-phase-3b-live-kvm.yml`) plus separate Copilot and build-test smoke
+workflows. The live job validates the production `NvxManager` path with the
+pinned, workflow-attested NVX artifacts on GitHub-hosted Ubuntu x86_64 KVM
+runners.
+
+Live assertions cover guest boot, exact OpenVMM capability/seccomp
+confinement, immediate bidirectional workspace visibility, workload-owned host
+files, selective workspace writes, an independent read-only tool-cache share,
+directory creation/rename/deletion, chmod, symlinks, network denial, Copilot
+API-proxy inference, timeout, cancellation, stale recovery, concurrent-run
+isolation, and residue-free cleanup. Focused tests additionally reject
+symlinked policy paths, nested mounts, overlapping or bind-aliased share roots,
+and hard links crossing write or read-denial boundaries.
+
+`smoke-nvx-build-test.md` exercises `npm ci`, TypeScript compilation, Jest, Go
+builds, and Go tests while writing results through the live workspace share.
+`smoke-nvx-copilot.md` runs a real Copilot agent and verifies that its workspace
+write is immediately visible to the host.

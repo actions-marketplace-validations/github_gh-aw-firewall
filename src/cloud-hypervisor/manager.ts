@@ -5,6 +5,7 @@ import { getSafeHostGid, getSafeHostUid } from '../host-identity';
 import {
   LinuxNetworkCommands,
   MicrovmNetworkManager,
+  reserveMicrovmNetworkPlan,
   type MicrovmNetworkLifecycle,
   type MicrovmNetworkPlan,
 } from '../microvm/network';
@@ -25,9 +26,11 @@ import {
   BoundedOutputCapture,
   collectCloudHypervisorDiagnostics,
   readBoundedTail,
+  writeGuestOutputAudit,
 } from './diagnostics';
 import {
   CloudHypervisorGuestChannel,
+  type GuestConnectionDiagnostics,
 } from './guest-execution';
 import {
   CloudHypervisorCgroup,
@@ -43,10 +46,33 @@ import {
   type CloudHypervisorRunPaths,
 } from './manager-types';
 import { runCloudHypervisorPreflight } from './preflight';
-import type { CloudHypervisorHostToolPaths } from './preflight';
+import type {
+  CloudHypervisorHostToolPaths,
+  CloudHypervisorPreflightResult,
+} from './preflight';
+import { copySparseFileWithRsync } from './preflight';
+import {
+  verifyCloudHypervisorConfinement,
+  type CloudHypervisorConfinementEvidence,
+} from './confinement-verifier';
 import { startCloudHypervisor } from './manager-start';
 import { stopCloudHypervisor } from './manager-stop';
+import { HostPreflightCleanupError, type HostPreflightReporter } from './host-preflight-progress';
 import { VirtiofsdManager, type VirtiofsdDevice } from './virtiofsd';
+import {
+  DurableCloudHypervisorCleanupRegistry,
+  type CloudHypervisorCleanupHandle,
+} from './cleanup-registry';
+import { CloudHypervisorVmmIdentityManager } from './vmm-identity';
+import {
+  CloudHypervisorEmptyNetworkNamespace,
+  type CloudHypervisorNetworkLifecycle,
+} from './network-namespace';
+import {
+  sealCloudHypervisorWorkloadProfile,
+  snapshotCloudHypervisorWorkloadProfile,
+  type CloudHypervisorWorkloadProfile,
+} from './workload-profile';
 
 export {
   CLOUD_HYPERVISOR_GUEST_VSOCK_PORT,
@@ -58,6 +84,11 @@ export type {
   CloudHypervisorManagerNetworkConfig,
   CloudHypervisorRunPaths,
 } from './manager-types';
+export type {
+  CloudHypervisorWorkloadIdentity,
+  CloudHypervisorWorkloadKind,
+  CloudHypervisorWorkloadProfile,
+} from './workload-profile';
 export {
   buildSupervisorBootArgs,
   encodeVirtiofsBootArg,
@@ -69,19 +100,34 @@ const defaultDependencies: CloudHypervisorManagerDependencies = {
   launch: (command, args, options) => execa(command, args, options),
   mkdir: fs.mkdir,
   copyFile: fs.copyFile,
+  copySparseFile: copySparseFileWithRsync,
   chmod: fs.chmod,
   chown: fs.chown,
+  lstat: fs.lstat,
+  realpath: fs.realpath,
+  open: fs.open,
   writeFile: fs.writeFile,
   readFileTail: (filePath, maxBytes) => readBoundedTail(filePath, maxBytes),
   access: fs.access,
   rm: fs.rm,
   sleep: (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds)),
   createClient: (socketPath, timeoutMs) => new CloudHypervisorApiClient({ socketPath, timeoutMs }),
-  createNetwork: (plan, tools) => new MicrovmNetworkManager(
+  reserveNetwork: reserveMicrovmNetworkPlan,
+  createNetwork: (plan, tools, reservation, observer) => new MicrovmNetworkManager(
     plan,
     new LinuxNetworkCommands(undefined, tools),
+    undefined,
+    reservation,
+    observer,
   ),
-  createRootfsPreparer: (config, tools) => new MicrovmRootfsPreparer(config, {
+  createEmptyNetworkNamespace: (plan, tools, observer) =>
+    new CloudHypervisorEmptyNetworkNamespace(
+      plan,
+      new LinuxNetworkCommands(undefined, tools),
+      observer,
+    ),
+  cleanupRegistry: new DurableCloudHypervisorCleanupRegistry(),
+  createRootfsPreparer: (config, tools, copyRootfs) => new MicrovmRootfsPreparer(config, {
     runTool: async (command, args) => {
       const tool = tools[command as keyof CloudHypervisorHostToolPaths] ?? command;
       const result = await execa(tool, [...args], {
@@ -92,9 +138,14 @@ const defaultDependencies: CloudHypervisorManagerDependencies = {
       if (result.exitCode === 0 || (command === 'e2fsck' && result.exitCode === 1)) return;
       throw new Error(`${tool} exited with code ${result.exitCode}: ${result.stderr.trim()}`);
     },
+    copyRootfs,
   }),
-  createVirtiofsdManager: (binaryPath, runDirectory, shareDirectory, identity, cgroup, tools) =>
-    new VirtiofsdManager(binaryPath, runDirectory, shareDirectory, identity, cgroup, tools),
+  createVirtiofsdManager: (
+    binaryPath, runDirectory, shareDirectory, identity, workspaceIdentity, cgroup, tools, cleanupRecord,
+  ) => new VirtiofsdManager(
+    binaryPath, runDirectory, shareDirectory, identity, workspaceIdentity, cgroup, tools, undefined,
+    cleanupRecord,
+  ),
   createVsockClient: (socketPath, guestPort, timeoutMs) => new MicrovmVsockClient({
     socketPath,
     guestPort,
@@ -103,8 +154,17 @@ const defaultDependencies: CloudHypervisorManagerDependencies = {
     writeTimeoutMs: timeoutMs,
   }),
   createCgroup: (cgroupPath, limits) => new CloudHypervisorCgroup(cgroupPath, limits),
+  verifyConfinement: verifyCloudHypervisorConfinement,
+  createVmmIdentity: (runId, tools, observer) =>
+    new CloudHypervisorVmmIdentityManager(runId, tools, undefined, observer),
   resolveIdentity: resolveCloudHypervisorIdentity,
 };
+
+export function resolveCloudHypervisorManagerDependencies(
+  overrides: Partial<CloudHypervisorManagerDependencies> = {},
+): CloudHypervisorManagerDependencies {
+  return { ...defaultDependencies, ...overrides };
+}
 
 /** @internal Exposed only for focused host-adapter tests. */
 export const cloudHypervisorManagerTestHelpers = {
@@ -154,13 +214,18 @@ export class CloudHypervisorManager {
   paths: CloudHypervisorRunPaths;
   private process: ExecaChildProcess<string> | undefined;
   private client: CloudHypervisorApiClient | undefined;
-  private network: MicrovmNetworkLifecycle | undefined;
+  private network: MicrovmNetworkLifecycle | CloudHypervisorNetworkLifecycle | undefined;
   private rootfsPreparer: MicrovmRootfsPreparer | undefined;
   private virtiofsd: VirtiofsdManager | undefined;
   private fsDevices: VirtiofsdDevice[] = [];
   private guest: CloudHypervisorGuestChannel | undefined;
+  private guestConnection: GuestConnectionDiagnostics | undefined;
   private cgroup: CloudHypervisorCgroup | undefined;
+  private cleanupRecord: CloudHypervisorCleanupHandle | undefined;
+  private cleanupRecordReady = false;
+  private vmmIdentity: CloudHypervisorVmmIdentityManager | undefined;
   private networkPlan: MicrovmNetworkPlan | undefined;
+  private confinementEvidence: CloudHypervisorConfinementEvidence | undefined;
   private instanceStarted = false;
   // Snapshotted in stop(), before any shutdown attempt, since the API
   // socket becomes unresponsive once the process is asked to exit --
@@ -169,6 +234,13 @@ export class CloudHypervisorManager {
   private lastVmCounters: CloudHypervisorVmCounters | undefined;
   private readonly stdoutCapture = new BoundedOutputCapture(CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
   private readonly stderrCapture = new BoundedOutputCapture(CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
+  private readonly guestStdoutCapture = new BoundedOutputCapture(CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
+  private readonly guestStderrCapture = new BoundedOutputCapture(CLOUD_HYPERVISOR_CAPTURE_LIMIT_BYTES);
+  private readonly guestStdoutAudit = this.guestStdoutCapture.writable();
+  private readonly guestStderrAudit = this.guestStderrCapture.writable();
+  private readonly workloadProfile: CloudHypervisorWorkloadProfile;
+  private enclaveDebugDiagnosticsCollected = false;
+  private enclaveDebugDiagnosticsPromise: Promise<void> | undefined;
 
   get guestIp(): string | undefined {
     return this.networkPlan?.guestIp;
@@ -195,10 +267,45 @@ export class CloudHypervisorManager {
     private readonly workDir: string,
     private readonly dependencies: CloudHypervisorManagerDependencies = defaultDependencies,
     runId?: string,
-    private readonly networkConfig?: CloudHypervisorManagerNetworkConfig,
-    private readonly guestConfig?: CloudHypervisorManagerGuestConfig,
+    profileOrNetworkConfig?: CloudHypervisorWorkloadProfile | CloudHypervisorManagerNetworkConfig,
+    legacyGuestConfig?: CloudHypervisorManagerGuestConfig,
+    private readonly verifiedArtifacts?: CloudHypervisorPreflightResult,
+    private readonly allowTrustedEnclaveExecution = false,
+    private readonly launchReport?: HostPreflightReporter,
+    private readonly managerStartReport?: HostPreflightReporter,
   ) {
-    this.paths = createCloudHypervisorRunPaths(config.cloudHypervisorBinary, runId);
+    const profile: CloudHypervisorWorkloadProfile = isWorkloadProfile(profileOrNetworkConfig)
+      ? sealCloudHypervisorWorkloadProfile(profileOrNetworkConfig)
+      : {
+          kind: 'primary-agent',
+          identity: { kind: 'primary-agent', ownerId: 'primary-agent' },
+          artifact: 'primary',
+          network: {
+            mode: 'primary',
+            ...(profileOrNetworkConfig ?? {
+              infrastructureBridge: '',
+              enableApiProxy: false,
+            }),
+          },
+          ...(legacyGuestConfig
+            ? { guest: { ...legacyGuestConfig, workspaceMount: '/workspace' } }
+            : {}),
+          rawOutput: 'capture',
+        };
+    this.workloadProfile = isWorkloadProfile(profileOrNetworkConfig)
+      ? profile
+      : snapshotCloudHypervisorWorkloadProfile(profile);
+    if (profile.kind !== 'primary-agent' && profile.rawOutput === 'capture'
+      && (!config.enclaveDebugPublic || !dependencies.enclaveDebugArtifactDirectory
+      || !dependencies.enclaveDebugArtifactProtectedRoot
+      || !allowTrustedEnclaveExecution)) {
+      throw new Error('Raw enclave output requires host-authorized public fixture debug artifacts');
+    }
+    this.paths = (dependencies.createRunPaths ?? createCloudHypervisorRunPaths)(
+      config.cloudHypervisorBinary,
+      runId,
+      this.workloadProfile.identity,
+    );
   }
 
   async start(): Promise<CloudHypervisorApiClient> {
@@ -207,34 +314,53 @@ export class CloudHypervisorManager {
       workDir: this.workDir,
       dependencies: this.dependencies,
       paths: this.paths,
-      networkConfig: this.networkConfig,
-      guestConfig: this.guestConfig,
+      workloadProfile: this.workloadProfile,
+      allowTrustedEnclaveExecution: this.allowTrustedEnclaveExecution,
+      verifiedArtifacts: this.verifiedArtifacts,
+      launchReport: this.launchReport,
+      managerStartReport: this.managerStartReport,
       stdoutCapture: this.stdoutCapture,
       stderrCapture: this.stderrCapture,
       setNetworkPlan: (value) => { this.networkPlan = value; },
       setNetwork: (value) => { this.network = value; },
       setRootfsPreparer: (value) => { this.rootfsPreparer = value; },
       setCgroup: (value) => { this.cgroup = value; },
+      setVmmIdentity: (value) => { this.vmmIdentity = value; },
       setProcess: (value) => { this.process = value; },
       setClient: (value) => { this.client = value; },
+      setConfinementEvidence: (value) => { this.confinementEvidence = value; },
       setVirtiofsd: (value) => { this.virtiofsd = value; },
       setFsDevices: (value) => { this.fsDevices = value; },
+      setCleanupRecord: (value) => { this.cleanupRecord = value; },
       getFsDevices: () => this.fsDevices,
       stop: () => this.stop(),
     });
   }
 
   async startInstance(): Promise<void> {
-    if (!this.client) throw new Error('Cloud Hypervisor API is not configured');
-    await this.client.vmBoot();
+    const client = this.client;
+    if (!client) throw new Error('Cloud Hypervisor API is not configured');
+    if (this.launchReport) await this.launchReport.check('vm-boot', () => client.vmBoot());
+    else await client.vmBoot();
     this.instanceStarted = true;
-    if (this.guestConfig) {
-      this.guest = await CloudHypervisorGuestChannel.connect(
-        this.dependencies,
-        this.paths.vsockSocketPath,
-        this.guestConfig.vsockPort ?? CLOUD_HYPERVISOR_GUEST_VSOCK_PORT,
-        this.config.apiTimeoutMs,
-      );
+    const guestConfig = this.workloadProfile.guest;
+    if (guestConfig) {
+      const identity = this.vmmIdentity;
+      if (!identity) {
+        throw new Error('Cloud Hypervisor VMM identity is not configured');
+      }
+      const connect = async (): Promise<CloudHypervisorGuestChannel> => {
+        await identity.validateOwnedPaths([this.paths.vsockSocketPath]);
+        return CloudHypervisorGuestChannel.connect(
+          this.dependencies,
+          this.paths.vsockSocketPath,
+          guestConfig.vsockPort ?? CLOUD_HYPERVISOR_GUEST_VSOCK_PORT,
+          this.config.apiTimeoutMs,
+          (progress) => { this.guestConnection = progress; },
+        );
+      };
+      this.guest = this.launchReport
+        ? await this.launchReport.check('guest-connect', connect) : await connect();
     }
   }
 
@@ -244,7 +370,18 @@ export class CloudHypervisorManager {
     if (!this.guest) {
       throw new Error('Cloud Hypervisor guest supervisor is not ready');
     }
-    return this.guest.execute(request);
+    const forwardedRequest = { ...request };
+    delete forwardedRequest.rawStdout;
+    delete forwardedRequest.rawStderr;
+    return this.guest.execute({
+      ...forwardedRequest,
+      ...(this.workloadProfile.rawOutput === 'capture'
+        ? {
+            rawStdout: this.guestStdoutAudit,
+            rawStderr: this.guestStderrAudit,
+          }
+        : {}),
+    });
   }
 
   cancel(reason = 'host cancellation', requestId?: string): Promise<void> {
@@ -276,36 +413,81 @@ export class CloudHypervisorManager {
   }
 
   async stop(options: { preserve?: boolean; beforeCleanup?: () => Promise<void> } = {}): Promise<void> {
-    return stopCloudHypervisor({
-      config: this.config,
-      dependencies: this.dependencies,
-      paths: this.paths,
-      process: this.process,
-      client: this.client,
-      network: this.network,
-      networkPlan: this.networkPlan,
-      rootfsPreparer: this.rootfsPreparer,
-      virtiofsd: this.virtiofsd,
-      fsDevices: this.fsDevices,
-      guest: this.guest,
-      cgroup: this.cgroup,
-      instanceStarted: this.instanceStarted,
-      lastVmInfo: this.lastVmInfo,
-      lastVmCounters: this.lastVmCounters,
-      ...options,
-      setProcess: (value) => { this.process = value; },
-      setClient: (value) => { this.client = value; },
-      setNetwork: (value) => { this.network = value; },
-      setNetworkPlan: (value) => { this.networkPlan = value; },
-      setRootfsPreparer: (value) => { this.rootfsPreparer = value; },
-      setVirtiofsd: (value) => { this.virtiofsd = value; },
-      setFsDevices: (value) => { this.fsDevices = value; },
-      setGuest: (value) => { this.guest = value; },
-      setCgroup: (value) => { this.cgroup = value; },
-      setInstanceStarted: (value) => { this.instanceStarted = value; },
-      setLastVmInfo: (value) => { this.lastVmInfo = value; },
-      setLastVmCounters: (value) => { this.lastVmCounters = value; },
-    });
+    const debugDirectory = this.workloadProfile.kind !== 'primary-agent'
+      && this.workloadProfile.rawOutput === 'capture'
+      ? this.dependencies.enclaveDebugArtifactDirectory
+      : undefined;
+    const collectDebug = async (): Promise<void> => {
+      if (!debugDirectory || this.enclaveDebugDiagnosticsCollected) return;
+      this.enclaveDebugDiagnosticsPromise ??= this.collectDiagnostics(debugDirectory)
+        .then(() => { this.enclaveDebugDiagnosticsCollected = true; })
+        .catch((error: unknown) => {
+          this.enclaveDebugDiagnosticsPromise = undefined;
+          throw error;
+        });
+      await this.enclaveDebugDiagnosticsPromise;
+    };
+    try {
+      await stopCloudHypervisor({
+        config: this.config,
+        dependencies: this.dependencies,
+        paths: this.paths,
+        process: this.process,
+        client: this.client,
+        network: this.network,
+        networkPlan: this.networkPlan,
+        rootfsPreparer: this.rootfsPreparer,
+        virtiofsd: this.virtiofsd,
+        fsDevices: this.fsDevices,
+        guest: this.guest,
+        cgroup: this.cgroup,
+        cleanupRecord: this.cleanupRecord,
+        deferCleanupRecordCompletion: Boolean(
+          this.verifiedArtifacts?.artifactSnapshotDirectory,
+        ),
+        vmmIdentity: this.vmmIdentity,
+        instanceStarted: this.instanceStarted,
+        lastVmInfo: this.lastVmInfo,
+        lastVmCounters: this.lastVmCounters,
+        ...options,
+        ...(debugDirectory ? {
+          preserveSourcesOnBeforeCleanupFailure: true,
+          beforeCleanup: async () => {
+            await collectDebug();
+            await options.beforeCleanup?.();
+          },
+        } : {}),
+        setProcess: (value) => { this.process = value; },
+        setClient: (value) => { this.client = value; },
+        setNetwork: (value) => { this.network = value; },
+        setNetworkPlan: (value) => { this.networkPlan = value; },
+        setRootfsPreparer: (value) => { this.rootfsPreparer = value; },
+        setVirtiofsd: (value) => { this.virtiofsd = value; },
+        setFsDevices: (value) => { this.fsDevices = value; },
+        setGuest: (value) => { this.guest = value; },
+        setCgroup: (value) => { this.cgroup = value; },
+        setVmmIdentity: (value) => { this.vmmIdentity = value; },
+        setCleanupRecordReady: (value) => { this.cleanupRecordReady = value; },
+        setInstanceStarted: (value) => { this.instanceStarted = value; },
+        setLastVmInfo: (value) => { this.lastVmInfo = value; },
+        setLastVmCounters: (value) => { this.lastVmCounters = value; },
+      });
+    } catch (error) {
+      // A failed termination can stop cleanup before its evidence hook.
+      try {
+        await collectDebug();
+      } catch (evidenceError) {
+        throw new HostPreflightCleanupError(error, evidenceError);
+      }
+      throw error;
+    }
+  }
+
+  async completeCleanupRecord(): Promise<void> {
+    if (!this.cleanupRecordReady) return;
+    await this.cleanupRecord?.complete();
+    this.cleanupRecord = undefined;
+    this.cleanupRecordReady = false;
   }
 
   async collectDiagnostics(directory: string): Promise<void> {
@@ -315,13 +497,41 @@ export class CloudHypervisorManager {
       config: this.config,
       stdoutCapture: this.stdoutCapture,
       stderrCapture: this.stderrCapture,
+      guestStdoutCapture: this.guestStdoutCapture,
+      guestStderrCapture: this.guestStderrCapture,
+      captureGuestRawOutput: this.workloadProfile.rawOutput === 'capture',
+      ...(this.dependencies.enclaveDebugArtifactProtectedRoot
+        ? { debugArtifactProtectedRoot: this.dependencies.enclaveDebugArtifactProtectedRoot }
+        : {}),
       network: this.network,
       networkPlan: this.networkPlan,
       client: this.client,
       instanceStarted: this.instanceStarted,
+      guestConnection: this.guestConnection,
       lastVmInfo: this.lastVmInfo,
       lastVmCounters: this.lastVmCounters,
       fsDevices: this.fsDevices,
+      confinementEvidence: this.confinementEvidence,
     });
   }
+
+  async collectGuestOutputAudit(directory: string): Promise<void> {
+    if (this.workloadProfile.rawOutput !== 'capture') {
+      throw new Error(
+        `Raw guest output is unavailable for Cloud Hypervisor ${this.workloadProfile.kind}`,
+      );
+    }
+    await writeGuestOutputAudit(
+      directory,
+      this.dependencies,
+      this.guestStdoutCapture,
+      this.guestStderrCapture,
+    );
+  }
+}
+
+function isWorkloadProfile(
+  value: CloudHypervisorWorkloadProfile | CloudHypervisorManagerNetworkConfig | undefined,
+): value is CloudHypervisorWorkloadProfile {
+  return value !== undefined && 'kind' in value;
 }

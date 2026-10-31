@@ -35,6 +35,7 @@ function normalizeSeparators(s: string): string {
 const INTENTIONALLY_EXCLUDED_FROM_SUPPORTED = new Set([
   // ── Embedding models — cannot be used as COPILOT_MODEL ────────────────────
   'text-embedding-3-small', // text embedding, not a chat/completion model
+  'text-embedding-3-small-inference', // inference endpoint alias for embeddings, not chat/completions
   'text-embedding-ada-002', // text embedding, not a chat/completion model
 
   // ── Older Claude Opus 4 versions ──────────────────────────────────────────
@@ -43,6 +44,11 @@ const INTENTIONALLY_EXCLUDED_FROM_SUPPORTED = new Set([
   'claude-opus-4-5',
   'claude-opus-4-6',
   'claude-opus-4-7',
+
+  // ── Claude models priced for OpenRouter/BYOK, not in the Copilot CLI picker ─
+  'claude-sonnet-5-5',
+  'claude-opus-5-5',
+  'claude-fable-5-1',
 
   // ── Unversioned Claude Sonnet 4 base alias ────────────────────────────────
   // Use explicit versioned models (claude-sonnet-4.5, claude-sonnet-4.6) instead.
@@ -69,21 +75,33 @@ const SUPPORTED_WITHOUT_CURATED_PRICING = new Set([
   'gpt-4o',
   'gpt-4o-mini',
   'gpt-5-1',
+  // GPT-6 families are routed by the static model API mapping while provider
+  // pricing has not yet been added to the local AI-credits catalog.
+  'gpt-6-1-sol',
+  'gpt-6-luna',
+  'gpt-6-sol',
   'o3',
   'o3-mini',
   'gemini-3-1-pro-preview',
+  // Claude Haiku 5.5 is in Copilot CLI; use the static model catalog until
+  // its curated per-model pricing is added.
+  'claude-haiku-5-5',
 ]);
 
 const MAPPING_FAMILIES_NOT_EXPOSED_BY_COPILOT_CLI = new Set([
   'gpt-daybreak', // responses-only preview aliases; not in the Copilot CLI model picker
+  'gpt-rosalind-research', // restricted-access, responses-only life-sciences model; not in the Copilot CLI model picker
   'gpt-5-6-cyber', // responses-only gpt-5.6 variant; not in the Copilot CLI model picker
   'gpt-5-5-pro', // responses-only gpt-5.5 variant; not in the Copilot CLI model picker
+  'gpt-5-2-pro', // responses-only gpt-5.2 variant; not in the Copilot CLI model picker
+  'gpt-5-1-codex', // older responses-only Codex family; not in the Copilot CLI model picker
   'gpt-5-1-codex-max',
   'gpt-5-codex/pro',
   'o4-mini-deep-research',
   'o4',
   'o3-pro/deep-research',
   'o1-pro',
+  'o1-mini/preview',
   'o1',
   'computer-use-preview',
   'codex-mini',
@@ -94,6 +112,7 @@ const MAPPING_FAMILIES_NOT_EXPOSED_BY_COPILOT_CLI = new Set([
   'claude-3-5-haiku',
   'claude-3-7-sonnet',
   'claude-3-opus',
+  'claude-haiku-5', // API mapping covers this family; it is not in the Copilot CLI model picker.
 ]);
 
 describe('SUPPORTED_COPILOT_MODELS ↔ ai-credits-pricing catalog sync', () => {
@@ -108,6 +127,122 @@ describe('SUPPORTED_COPILOT_MODELS ↔ ai-credits-pricing catalog sync', () => {
   // eslint-disable-next-line @typescript-eslint/no-require-imports
   const pricing = require(pricingPath) as Record<string, unknown>;
   const pricingModels = Object.keys(pricing);
+  const docsMappingPath = path.resolve(__dirname, '..', 'docs', 'model-api-mapping.json');
+  const apiProxyMappingPath = path.resolve(
+    __dirname,
+    '..',
+    'containers',
+    'api-proxy',
+    'model-api-mapping.json',
+  );
+
+  it('keeps the docs and packaged API proxy model API mappings identical', () => {
+    if (fs.readFileSync(apiProxyMappingPath, 'utf8') !== fs.readFileSync(docsMappingPath, 'utf8')) {
+      throw new Error(
+        'Model API mapping copies drifted: docs/model-api-mapping.json and ' +
+        'containers/api-proxy/model-api-mapping.json must be byte-for-byte identical.',
+      );
+    }
+  });
+
+  it('records the current #10029 host availability and fallback-pricing gaps', () => {
+    const normalizedSupported = new Set([...testHelpers.supportedCopilotModels].map(normalizeSeparators));
+    const normalizedPricing = new Set(pricingModels.map(normalizeSeparators));
+    const proposed = [
+      'claude-opus-5.5',
+      'claude-sonnet-5.5',
+      'gpt-6.1-sol',
+      'gemini-3.8-flash',
+      'grok-4.5',
+      'grok-4.6',
+      'grok-4.7',
+    ];
+    expect(proposed.filter(model => !normalizedSupported.has(normalizeSeparators(model)))).toEqual([
+      'claude-opus-5.5',
+      'claude-sonnet-5.5',
+      'gemini-3.8-flash',
+      'grok-4.5',
+      'grok-4.6',
+      'grok-4.7',
+    ]);
+    expect(proposed.filter(model => normalizedPricing.has(normalizeSeparators(model)))).toEqual([
+      'claude-opus-5.5',
+      'claude-sonnet-5.5',
+      'gpt-6.1-sol',
+    ]);
+    expect(proposed.filter(model => !normalizedPricing.has(normalizeSeparators(model)))).toEqual([
+      'gemini-3.8-flash',
+      'grok-4.5',
+      'grok-4.6',
+      'grok-4.7',
+    ]);
+    // These entries are already priced despite still appearing in the fallback exception list.
+    expect([...SUPPORTED_WITHOUT_CURATED_PRICING].filter(model => normalizedPricing.has(model))).toEqual([
+      'gpt-6-1-sol',
+      'gpt-6-luna',
+      'gpt-6-sol',
+      'claude-haiku-5-5',
+    ]);
+  });
+
+  it('records the current #10030 mapping routing-metadata gaps', () => {
+    const mapping = JSON.parse(fs.readFileSync(docsMappingPath, 'utf8')) as {
+      providers: Record<string, { models: Array<{ family: string; routing?: unknown }> }>;
+    };
+    const openai = mapping.providers.openai.models;
+    expect([
+      'gpt-5.4-mini',
+      'gpt-5.5',
+      'gpt-5.6',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
+      'gpt-6.1-sol',
+    ]
+      .filter(family => !openai.find(entry => entry.family === family)?.routing)).toEqual([
+      'gpt-5.4-mini',
+      'gpt-5.5',
+      'gpt-5.6',
+      'gpt-5.6-sol',
+      'gpt-5.6-terra',
+      'gpt-5.6-luna',
+      'gpt-6-astra',
+      'gpt-6-sol',
+      'gpt-6-luna',
+      'gpt-6.1-sol',
+    ]);
+    expect(mapping.providers.anthropic.models.find(entry => entry.family === 'claude-haiku-5')?.routing)
+      .toBeUndefined();
+  });
+
+  it('records #10030 xhigh reasoning-effort gaps for named Anthropic models', () => {
+    const mapping = JSON.parse(fs.readFileSync(docsMappingPath, 'utf8')) as {
+      providers: Record<string, { models: Array<{
+        family: string;
+        routingPatterns?: string[];
+        routing?: { reasoningEfforts?: string[] };
+      }> }>;
+    };
+    const missingXhigh = [
+      'claude-opus-5',
+      'claude-opus-5-5',
+      'claude-sonnet-5',
+      'claude-sonnet-5-5',
+      'claude-opus-4-7',
+      'claude-opus-4-8',
+    ];
+    expect(missingXhigh.map(model => {
+      const entry = mapping.providers.anthropic.models.find(candidate =>
+        candidate.family === model || candidate.routingPatterns?.includes(model));
+      return { model, reasoningEfforts: entry?.routing?.reasoningEfforts };
+    })).toEqual(missingXhigh.map(model => ({
+      model,
+      reasoningEfforts: ['low', 'medium', 'high', 'max'],
+    })));
+  });
 
   it('every Copilot CLI model in ai-credits-pricing.js appears in SUPPORTED_COPILOT_MODELS', () => {
     // Build a separator-normalised view of the supported set so that
@@ -148,8 +283,7 @@ describe('SUPPORTED_COPILOT_MODELS ↔ ai-credits-pricing catalog sync', () => {
   });
 
   it('every mapped completion family is represented or explicitly excluded', () => {
-    const mappingPath = path.resolve(__dirname, '..', 'docs', 'model-api-mapping.json');
-    const mapping = JSON.parse(fs.readFileSync(mappingPath, 'utf8')) as {
+    const mapping = JSON.parse(fs.readFileSync(docsMappingPath, 'utf8')) as {
       providers: Record<string, { models?: Array<{ family?: string }> }>;
     };
     const normalizedSupported = [...testHelpers.supportedCopilotModels].map(normalizeSeparators);

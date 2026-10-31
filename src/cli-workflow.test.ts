@@ -2,6 +2,7 @@ import { runMainWorkflow } from './cli-workflow';
 import { WrapperConfig } from './types';
 import { HostAccessConfig } from './host-iptables';
 import { normalizeEnclavesConfig } from './parsers/enclave-parser';
+import { getEnclaveStartupProgress } from './enclave/startup-progress';
 
 jest.mock('./topology', () => ({
   TOPOLOGY_NETWORK_NAME: 'awf-net',
@@ -125,6 +126,45 @@ const runWorkflowWithDefaults = async (
 };
 
 describe('runMainWorkflow', () => {
+  it.each([
+    [undefined, 'gvisor'],
+    [undefined, 'cloud-hypervisor'],
+    ['gvisor', 'docker'],
+    ['cloud-hypervisor', 'docker'],
+    ['nvx', 'docker'],
+  ] as const)('rejects primary %s / enclave %s before staging or infrastructure', async (primary, enclave) => {
+    const dependencies = createWorkflowDependencies({ prepareEnclaves: jest.fn() });
+    const config = {
+      ...enclaveConfig,
+      containerRuntime: primary,
+      enclaves: normalizeEnclavesConfig([
+        { script: {}, runtime: enclave, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+      ]),
+    };
+    await expect(runMainWorkflow(config, dependencies, createWorkflowOptions()))
+      .rejects.toThrow(/one sandbox backend is required per run/);
+    expect(dependencies.prepareEnclaves).not.toHaveBeenCalled();
+    expect(dependencies.ensureFirewallNetwork).not.toHaveBeenCalled();
+    expect(dependencies.writeConfigs).not.toHaveBeenCalled();
+    expect(dependencies.startContainers).not.toHaveBeenCalled();
+    expect(dependencies.runAgentCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps Cloud Hypervisor primary-with-enclave execution gated after inheritance', async () => {
+    const dependencies = createWorkflowDependencies({ prepareEnclaves: jest.fn() });
+    const config = {
+      ...enclaveConfig,
+      containerRuntime: 'cloud-hypervisor',
+      enclaves: normalizeEnclavesConfig([
+        { script: {}, repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+      ], { primaryRuntime: 'cloud-hypervisor' }),
+    };
+    await expect(runMainWorkflow(config, dependencies, createWorkflowOptions()))
+      .rejects.toThrow(/primary-agent cloud-hypervisor/);
+    expect(dependencies.prepareEnclaves).not.toHaveBeenCalled();
+    expect(dependencies.startContainers).not.toHaveBeenCalled();
+  });
+
   beforeEach(() => {
     // Default: topology peer lookup returns an empty map so onNetworkReady's
     // static-DNS pre-registration runs without throwing in tests that don't
@@ -173,6 +213,7 @@ describe('runMainWorkflow', () => {
             maxOutputBytes: 8192,
             maxTaskBytes: 4096,
             maxInvocations: 8,
+            repos: [],
           },
         },
       },
@@ -207,6 +248,97 @@ describe('runMainWorkflow', () => {
     expect(exitCode).toBe(0);
     expect(logger.success).toHaveBeenCalledWith('Command completed successfully');
     expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  it('stages routing before config generation and waits for selection before agent startup', async () => {
+    const callOrder: string[] = [];
+    const routingState = {
+      root: '/tmp/awf-test-routing',
+      inputDir: '/tmp/awf-test-routing/input',
+      outputDir: '/tmp/awf-test-routing/output',
+      inputFile: '/tmp/awf-test-routing/input/conversation.json',
+      containerInputFile: '/run/awf-routing/input/conversation.json',
+      containerOutputDir: '/run/awf-routing/output',
+    };
+    const config: WrapperConfig = {
+      ...baseConfig,
+      enableApiProxy: true,
+      experimentalModelRouting: true,
+      modelRouting: {
+        objective: { goal: 'cost', mode: 'balanced' },
+        task: { conversationFile: '/host/conversation.json' },
+      },
+    };
+    const dependencies = createOrderedWorkflowDependencies(callOrder, 0, {
+      prepareRouting: jest.fn().mockImplementation(async () => {
+        callOrder.push('prepareRouting');
+        return routingState;
+      }),
+      startContainers: jest.fn().mockImplementation(async (
+        _workDir,
+        _allowedDomains,
+        _proxyLogsDir,
+        _skipPull,
+        _onNetworkReady,
+        onInfrastructureReady,
+      ) => {
+        callOrder.push('startContainers');
+        await onInfrastructureReady?.();
+      }),
+      waitForRoutingSelection: jest.fn().mockImplementation(async () => {
+        callOrder.push('waitForRoutingSelection');
+      }),
+      verifyRoutingCompletion: jest.fn().mockImplementation(async () => {
+        callOrder.push('verifyRoutingCompletion');
+      }),
+      cleanupRouting: jest.fn().mockImplementation(async () => {
+        callOrder.push('cleanupRouting');
+      }),
+    });
+    const { logger, performCleanup } = createOrderedWorkflowOptions(callOrder);
+
+    const exitCode = await runMainWorkflow(config, dependencies, { logger, performCleanup });
+
+    expect(exitCode).toBe(0);
+    expect(callOrder).toEqual([
+      'prepareRouting',
+      'ensureFirewallNetwork',
+      'setupHostIptables',
+      'writeConfigs',
+      'startContainers',
+      'waitForRoutingSelection',
+      'runAgentCommand',
+      'performCleanup',
+      'verifyRoutingCompletion',
+      'cleanupRouting',
+    ]);
+    expect(dependencies.waitForRoutingSelection).toHaveBeenCalledWith(routingState);
+    expect(dependencies.verifyRoutingCompletion).toHaveBeenCalledWith(routingState);
+  });
+
+  it('does not run routing hooks without both the gate and a routing request', async () => {
+    const config: WrapperConfig = {
+      ...baseConfig,
+      modelRouting: {
+        objective: { goal: 'cost', mode: 'balanced' },
+        task: { conversationFile: '/host/conversation.json' },
+      },
+    };
+    const dependencies = createWorkflowDependencies({
+      prepareRouting: jest.fn(),
+      waitForRoutingSelection: jest.fn(),
+      verifyRoutingCompletion: jest.fn(),
+      cleanupRouting: jest.fn(),
+    });
+    for (const optIn of [undefined, false, true]) {
+      config.experimentalModelRouting = optIn;
+      if (optIn === true) delete config.modelRouting;
+      expect(await runMainWorkflow(config, dependencies, createWorkflowOptions())).toBe(0);
+    }
+    expect(dependencies.prepareRouting).not.toHaveBeenCalled();
+    expect(dependencies.waitForRoutingSelection).not.toHaveBeenCalled();
+    expect(dependencies.verifyRoutingCompletion).not.toHaveBeenCalled();
+    expect(dependencies.cleanupRouting).not.toHaveBeenCalled();
   });
 
   it('skips host network setup and iptables in network-isolation mode', async () => {
@@ -377,6 +509,7 @@ describe('runMainWorkflow', () => {
       ) => {
         order.push('infrastructure');
         await onInfrastructureReady?.();
+        expect(getEnclaveStartupProgress(enclaveConfig)?.startupChecks?.ready).toBe(true);
         order.push('agent-started');
       },
     );
@@ -401,6 +534,35 @@ describe('runMainWorkflow', () => {
       'agent-started',
       'agent-run',
     ]);
+    expect(getEnclaveStartupProgress(enclaveConfig)?.startupChecks?.checks).toMatchObject({
+      'startup/configuration': ['passed', 'none'],
+      'startup/enclave-preparation': ['passed', 'none'],
+      'startup/network-enforcement': ['passed', 'none'],
+      'startup/compose-configuration': ['passed', 'none'],
+      'startup/infrastructure': ['passed', 'none'],
+      'startup/gateway-attachment': ['passed', 'none'],
+      'startup/gateway-ready': ['passed', 'none'],
+      'startup/github-ready': ['not-required', 'none'],
+      'startup/readiness': ['passed', 'none'],
+    });
+  });
+
+  it('cannot consider a new enclave startup ready when the infrastructure readiness callback was not executed', async () => {
+    const runAgentCommand = jest.fn();
+    const config = { ...enclaveConfig };
+    await expect(runMainWorkflow(config, createWorkflowDependencies({
+      prepareEnclaves: jest.fn().mockResolvedValue(undefined),
+      connectEnclaveGateway: jest.fn().mockResolvedValue(undefined),
+      assertEnclaveGatewayReady: jest.fn().mockResolvedValue(undefined),
+      runAgentCommand,
+    }), createWorkflowOptions())).rejects.toThrow(/incomplete required checks/);
+    expect(runAgentCommand).not.toHaveBeenCalled();
+    expect(getEnclaveStartupProgress(config)?.startupChecks).toMatchObject({
+      ready: false, checks: {
+        'startup/infrastructure': ['attempted', 'none'],
+        'startup/gateway-ready': ['not-attempted', 'none'],
+      },
+    });
   });
 
   it('aborts before primary-agent startup when gateway readiness fails', async () => {
@@ -426,6 +588,8 @@ describe('runMainWorkflow', () => {
       runAgentCommand,
     }), createWorkflowOptions())).rejects.toThrow(/tool mismatch/);
     expect(runAgentCommand).not.toHaveBeenCalled();
+    expect(getEnclaveStartupProgress(enclaveConfig)?.startupChecks?.checks['startup/infrastructure'])
+      .toEqual(['passed', 'none']);
   });
 
   it('passes agentTimeout to runAgentCommand', async () => {
@@ -466,7 +630,7 @@ describe('runMainWorkflow', () => {
 
     const expectedHostAccess: HostAccessConfig = { enabled: true, allowHostPorts: '3000,8080' };
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, ['8.8.8.8', '8.8.4.4'], undefined, undefined, expectedHostAccess, undefined
+      '172.30.0.10', 3128, ['8.8.8.8', '8.8.4.4'], undefined, undefined, expectedHostAccess, undefined, '172.30.0.1'
     );
   });
 
@@ -487,7 +651,7 @@ describe('runMainWorkflow', () => {
       allowHostServicePorts: '5432,6379',
     };
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, ['8.8.8.8', '8.8.4.4'], undefined, undefined, expectedHostAccess, undefined
+      '172.30.0.10', 3128, ['8.8.8.8', '8.8.4.4'], undefined, undefined, expectedHostAccess, undefined, '172.30.0.1'
     );
   });
 
@@ -497,7 +661,7 @@ describe('runMainWorkflow', () => {
     });
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, ['8.8.8.8', '8.8.4.4'], undefined, undefined, undefined, undefined
+      '172.30.0.10', 3128, ['8.8.8.8', '8.8.4.4'], undefined, undefined, undefined, undefined, '172.30.0.1'
     );
   });
 
@@ -707,7 +871,7 @@ describe('runMainWorkflow', () => {
     });
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, expect.any(Array), '172.30.0.30', undefined, undefined, undefined
+      '172.30.0.10', 3128, expect.any(Array), '172.30.0.30', undefined, undefined, undefined, '172.30.0.1'
     );
   });
 
@@ -717,7 +881,7 @@ describe('runMainWorkflow', () => {
     });
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined, undefined
+      '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined, undefined, '172.30.0.1'
     );
   });
 
@@ -731,7 +895,7 @@ describe('runMainWorkflow', () => {
     });
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, expect.any(Array), undefined, '172.30.0.40', undefined, undefined
+      '172.30.0.10', 3128, expect.any(Array), undefined, '172.30.0.40', undefined, undefined, '172.30.0.1'
     );
   });
 
@@ -739,7 +903,7 @@ describe('runMainWorkflow', () => {
     const { dependencies } = await runWorkflowWithDefaults();
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined, undefined
+      '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined, undefined, '172.30.0.1'
     );
   });
 
@@ -754,7 +918,7 @@ describe('runMainWorkflow', () => {
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
       '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined,
-      { ip: '172.30.0.50', difcProxyPort: 18443 }
+      { ip: '172.30.0.50', difcProxyPort: 18443 }, '172.30.0.1'
     );
   });
 
@@ -762,7 +926,7 @@ describe('runMainWorkflow', () => {
     const { dependencies } = await runWorkflowWithDefaults();
 
     expect(dependencies.setupHostIptables).toHaveBeenCalledWith(
-      '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined, undefined
+      '172.30.0.10', 3128, expect.any(Array), undefined, undefined, undefined, undefined, '172.30.0.1'
     );
   });
 

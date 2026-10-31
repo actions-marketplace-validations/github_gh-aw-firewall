@@ -6,10 +6,11 @@ const {
   canonicalSuccessJson,
   parseAndValidateFiniteOutput,
   informationChargeForSchema,
+  schemaContainsFreeformString,
   validateEnclaveScriptRequest,
 } = require('../../bounded-execution/finite-disclosure');
 const { createEnclaveInformationBudgetLedger } = require('../../bounded-execution/sensitivity-ledger');
-const { createRealClock, waitForBucket } = require('../../bounded-execution/fixed-timing');
+const { createRealClock, waitForBucket, TIMEOUT_BOUNDARY_GRACE_MS } = require('../../bounded-execution/fixed-timing');
 const defaultWorkspace = require('./workspace');
 
 /**
@@ -70,6 +71,29 @@ function createExecutorHandler(params) {
   // Optional trusted exit-status → protected-audit category map. Categories
   // never reach the caller; every failure is still the canonical error.
   const exitCategories = params.exitCategories || {};
+  let diagnosticRecords = 0;
+  function timing(invocationId, startMs, record) {
+    if (!params.diagnosticAudit || diagnosticRecords > 4096) return;
+    diagnosticRecords += 1;
+    params.diagnosticAudit.lifecycle('invocation-timing', diagnosticRecords === 4097
+      ? { phase: 'diagnostics', status: 'limit-reached' }
+      : { invocationId, executorKind, elapsedMs: Math.max(0, Math.round(clock.nowMs() - startMs)), ...record });
+  }
+  const diagnosticReason = (failure) => {
+    const reason = failure?.[0];
+    return [
+      'workspace-create-failed', 'timeout', 'cancelled', 'non-zero-exit', 'unreadable-output',
+      'nonconformant-output', 'launch-failed', 'artifact-preservation-failed', 'cleanup-failed',
+      'dynamic-revocation-unresolved', ...Object.values(exitCategories),
+    ].includes(reason) ? reason : reason === undefined ? 'none' : 'unknown';
+  };
+
+  // Optional dynamic repository admission client (ADR 0001). When present the
+  // executor has no static seed catalog: each invocation's selector is routed
+  // through AWF's canonical admission first, and only an admitted repository
+  // yields a short-lived delegated bearer. Absent, the executor uses the
+  // immutable static seed map exactly as before.
+  const admission = params.admission;
 
   // Optional shared serialization lane. When several executors are exposed by
   // one server they share a lane so at most one sandbox — script or agent —
@@ -78,6 +102,11 @@ function createExecutorHandler(params) {
 
   let invocationsUsed = 0;
   let accepting = true;
+  /** Invocations already settled, so a retry can never double-settle. */
+  const settledInvocations = new Set();
+  /** Invocations that reached dynamic admission and therefore own an identity. */
+  const admittedInvocations = new Set();
+  const activeCancellations = new Set();
 
   function emitInvocationTelemetry(category) {
     telemetry.emit({
@@ -89,6 +118,36 @@ function createExecutorHandler(params) {
     });
   }
 
+  /** Maps this invocation's internal result to one terminal settlement outcome. */
+  function resolveTerminalOutcome(canonicalResult, failureReason) {
+    if (canonicalResult !== undefined) return 'success';
+    const category = failureReason ? failureReason[0] : 'broker-error';
+    if (category === 'timeout') return 'timeout';
+    if (category === 'nonconformant-output' || category === 'unreadable-output') {
+      return 'schema-failure';
+    }
+    if (typeof category === 'string' && category.startsWith('enclave-')) return 'agent-failure';
+    if (category === 'non-zero-exit') return 'agent-failure';
+    return 'broker-error';
+  }
+
+  /**
+   * Settles one dynamic invocation exactly once. Reports whether AWF confirmed
+   * revocation; an unconfirmed revocation is never treated as success.
+   */
+  async function settleDynamic(invocationId, outcome, outputBytes, executionSeconds) {
+    if (!admission || settledInvocations.has(invocationId)) {
+      return { settled: true, revoked: true };
+    }
+    settledInvocations.add(invocationId);
+    try {
+      return await admission.settle({ invocationId, outcome, outputBytes, executionSeconds });
+    } catch (error) {
+      audit.failure(invocationId, 'dynamic-settlement-failed', error.message);
+      return { settled: false, revoked: false };
+    }
+  }
+
   /**
    * Executes one request and reports its canonical result through
    * `respond` (called exactly once). The invocations run only through
@@ -96,8 +155,31 @@ function createExecutorHandler(params) {
    * validation actually reach the point where the response must be
    * time-bucketed; everything rejected before that responds immediately.
    */
-  async function execute(request, respond) {
+  async function execute(request, respond, externalSignal) {
     const invocationId = crypto.randomBytes(12).toString('hex');
+    const cancellation = new AbortController();
+    const abort = () => cancellation.abort();
+    if (runner.hostOwned) {
+      externalSignal?.addEventListener('abort', abort);
+      if (externalSignal?.aborted) abort();
+    }
+    activeCancellations.add(cancellation);
+    try {
+      await executeInvocation(request, respond, invocationId, cancellation.signal);
+    } finally {
+      activeCancellations.delete(cancellation);
+      if (runner.hostOwned) externalSignal?.removeEventListener('abort', abort);
+      // A dynamic invocation that reached admission must always settle its
+      // reservation and revoke its identity, even if an unexpected error
+      // escaped the pipeline. `settleDynamic` is a no-op once an invocation
+      // has already settled, so this can never double-charge or double-revoke.
+      if (admission && admittedInvocations.has(invocationId)) {
+        await settleDynamic(invocationId, 'broker-error', 0, 0);
+      }
+    }
+  }
+
+  async function executeInvocation(request, respond, invocationId, signal) {
     const admissionStartMs = uniformTiming ? clock.nowMs() : undefined;
     let responded = false;
     const safeRespond = (json) => {
@@ -106,6 +188,8 @@ function createExecutorHandler(params) {
       respond(json);
     };
     const rejectBeforeExecution = async (reason, detail, telemetryCategory = reason) => {
+      timing(invocationId, admissionStartMs ?? clock.nowMs(),
+        { phase: 'admission', status: 'rejected', reason });
       audit.failure(invocationId, reason, detail);
       emitInvocationTelemetry(telemetryCategory);
       if (admissionStartMs !== undefined) {
@@ -128,9 +212,49 @@ function createExecutorHandler(params) {
     const payload = validation.request[payloadKey];
     const repoKey = privateRepo.toLowerCase();
 
-    const seed = seedMap.get(repoKey);
-    if (!seed) {
-      await rejectBeforeExecution('repo-not-allowed', privateRepo);
+    let seed;
+    let admitted;
+    if (admission) {
+      // Canonical admission runs *before* any repository content is exposed:
+      // no workspace, no container, and no delegated bearer exists until AWF
+      // has matched the selector against the compiler envelope, reserved
+      // every run-wide quota, and minted exactly one identity.
+      admitted = await admission.admit({ invocationId, selector: privateRepo, schema });
+      if (!admitted || !admitted.admitted) {
+        await rejectBeforeExecution('dynamic-admission-denied', undefined);
+        return;
+      }
+      admittedInvocations.add(invocationId);
+      // Register into the *same* live per-repository ledger the static
+      // executors debit. Registration is idempotent, so re-admitting a
+      // repository can never refill a budget it has already spent.
+      try {
+        ledger.registerRepository(admitted.repo, admitted.sensitivity);
+      } catch (error) {
+        await settleDynamic(invocationId, 'broker-error', 0, 0);
+        await rejectBeforeExecution('dynamic-sensitivity-invalid', error.message);
+        return;
+      }
+      seed = { seedId: undefined, sensitivity: admitted.sensitivity };
+    } else if (runner.hostOwned && config.dynamicEnabled) {
+      // The host alone admits the selector and owns its delegated identity.
+      // Reserve the worst-case disclosure locally before asking it to launch;
+      // denied selectors never refund or reset the shared repository ledger.
+      ledger.registerRepository(repoKey, config.dynamicSensitivity);
+      seed = { seedId: undefined, sensitivity: config.dynamicSensitivity };
+    } else {
+      seed = seedMap.get(repoKey);
+      if (!seed) {
+        await rejectBeforeExecution('repo-not-allowed', privateRepo);
+        return;
+      }
+    }
+    if (schemaContainsFreeformString(schema) && seed.sensitivity !== 'trusted') {
+      if (admitted) await settleDynamic(invocationId, 'schema-failure', 0, 0);
+      await rejectBeforeExecution(
+        'trusted-schema-required',
+        `repo=${privateRepo} sensitivity=${seed.sensitivity}`,
+      );
       return;
     }
 
@@ -138,8 +262,9 @@ function createExecutorHandler(params) {
     // copying a seed or launching Python. Every invocation may declare a
     // different schema; there is no separate per-query cap — only whether
     // this charge fits the repository's remaining run balance.
-    const charge = informationChargeForSchema(schema);
-    if (!ledger.tryDebit(repoKey, charge, executorKind)) {
+    const charge = seed.sensitivity === 'trusted' ? 0 : informationChargeForSchema(schema);
+    if (!ledger.tryDebit(admitted ? admitted.repo : repoKey, charge, executorKind)) {
+      if (admitted) await settleDynamic(invocationId, 'broker-error', 0, 0);
       await rejectBeforeExecution('bit-budget-exhausted', `repo=${privateRepo} charge=${charge}`);
       return;
     }
@@ -153,44 +278,65 @@ function createExecutorHandler(params) {
     let layout;
     let failureReason;
     let canonicalResult;
+    timing(invocationId, startMs, { phase: 'work-start' });
 
     try {
-      layout = workspace.createInvocationWorkspace({
+      layout = runner.hostOwned ? {} : workspace.createInvocationWorkspace({
         config,
         runId,
         invocationId,
         seedId: seed.seedId,
-        privateRepo: repoKey,
+        privateRepo: admitted ? admitted.repo : repoKey,
         schema,
         [payloadKey]: payload,
+        ...(admitted
+          ? { executorBearer: admitted.executorBearer, readMode: admitted.readMode }
+          : {}),
       });
     } catch (error) {
       failureReason = ['workspace-create-failed', error.message];
     }
 
     if (layout) {
-      const remainingMs = config.timeoutSeconds * 1000 - (clock.nowMs() - startMs);
+      const remainingMs = config.timeoutSeconds * 1000 +
+        (runner.hostOwned ? TIMEOUT_BOUNDARY_GRACE_MS : 0) - (clock.nowMs() - startMs);
       if (remainingMs <= 0) {
         failureReason = ['timeout', 'workspace-creation-overran-deadline'];
       } else {
         try {
-          const run = await runner.runScriptContainer({
-            config,
+          timing(invocationId, startMs, { phase: 'runner-start',
+            timeoutMs: config.timeoutSeconds * 1000, graceMs: runner.hostOwned ? TIMEOUT_BOUNDARY_GRACE_MS : 0 });
+          const run = await runner.runInvocation({
             runId,
             invocationId,
             seedId: seed.seedId,
-            timeoutMs: remainingMs,
+            deadlineMs: clock.nowMs() + remainingMs,
+            signal,
+            ...(runner.hostOwned ? {
+              privateRepo: admitted ? admitted.repo : repoKey,
+              payload,
+              schema,
+              admissionId: invocationId,
+              executorKind,
+            } : {}),
+            ...(admitted
+              ? { binding: { repository: admitted.repo, readMode: admitted.readMode } }
+              : {}),
           });
           if (run.timedOut) {
             failureReason = ['timeout'];
+          } else if (run.status === 'cancelled') {
+            failureReason = ['cancelled'];
           } else if (run.exitCode !== 0) {
             failureReason = [
               exitCategories[run.exitCode] || 'non-zero-exit',
               `exit=${run.exitCode}`,
             ];
           } else {
-            const raw = workspace.readQueryOutput(layout.outPath, config.maxOutputBytes);
-            if (raw === undefined) {
+            const raw = runner.hostOwned
+              ? run.rawResult : workspace.readQueryOutput(layout.outPath, config.maxOutputBytes);
+            if (raw === undefined || (runner.hostOwned
+                && (typeof raw !== 'string' || Buffer.byteLength(raw, 'utf8') > config.maxOutputBytes))) {
               // Covers a missing file, an oversized file, invalid UTF-8, and
               // any non-regular replacement (symlink/FIFO/device/socket).
               failureReason = ['unreadable-output'];
@@ -204,21 +350,30 @@ function createExecutorHandler(params) {
             }
           }
         } catch (error) {
+          if (runner.hostOwned) {
+            accepting = false;
+            lane.closed = true;
+          }
           failureReason = ['launch-failed', error.message];
         }
       }
     }
 
+    timing(invocationId, startMs, { phase: 'work-complete',
+      status: canonicalResult === undefined ? 'error' : 'ok', reason: diagnosticReason(failureReason) });
+    timing(invocationId, startMs, { phase: 'cleanup-start' });
+    let cleanupFailed = false;
     // Teardown is part of the observable operation: repository size and tree
     // shape can affect deletion time, and queued requests must not expose that
     // duration outside the charged timing bucket. Destroy by invocation id
     // even when creation threw after materializing only part of the workspace.
     // Executor-specific protected artifacts (never agent-visible) are captured
     // before teardown and inside the charged timing bucket.
-    if (layout && typeof workspace.preserveInvocationArtifacts === 'function') {
+    if (!runner.hostOwned && layout && typeof workspace.preserveInvocationArtifacts === 'function') {
       try {
         workspace.preserveInvocationArtifacts({ layout, config, invocationId });
       } catch (error) {
+        cleanupFailed = true;
         if (failureReason === undefined) {
           failureReason = ['artifact-preservation-failed', error.message];
         } else {
@@ -228,17 +383,44 @@ function createExecutorHandler(params) {
       }
     }
     if (!safeDestroy(invocationId)) {
-      failureReason = ['cleanup-failed'];
+      cleanupFailed = true;
+      failureReason ??= ['cleanup-failed'];
       canonicalResult = undefined;
+      timing(invocationId, startMs, { phase: 'cleanup-failed', reason: 'cleanup-failed' });
+    }
+
+    // Settle the dynamic reservation and revoke the delegated identity on
+    // *every* terminal path. An unresolved revocation downgrades an otherwise
+    // successful invocation to the canonical error: a bearer that may still be
+    // live has already touched repository content.
+    if (admitted) {
+      const settled = await settleDynamic(
+        invocationId,
+        resolveTerminalOutcome(canonicalResult, failureReason),
+        canonicalResult === undefined ? 0 : Buffer.byteLength(canonicalResult, 'utf8'),
+        Math.ceil((clock.nowMs() - startMs) / 1000),
+      );
+      if (!settled.revoked) {
+        cleanupFailed = true;
+        failureReason ??= ['dynamic-revocation-unresolved'];
+        canonicalResult = undefined;
+        timing(invocationId, startMs, { phase: 'cleanup-failed', reason: 'dynamic-revocation-unresolved' });
+      }
     }
 
     const elapsedMs = clock.nowMs() - startMs;
+    timing(invocationId, startMs, { phase: 'cleanup-complete',
+      status: cleanupFailed ? 'error' : 'ok' });
     const { bucketMs, overflowed } = await waitForBucket(
       startMs,
       elapsedMs,
       clock,
       responseJitterSource,
+      (record) => timing(invocationId, startMs, record),
     );
+    timing(invocationId, startMs, { phase: 'response',
+      status: overflowed || canonicalResult === undefined ? 'error' : 'ok',
+      reason: overflowed ? 'timing-bucket-overflow' : diagnosticReason(failureReason), bucketMs });
 
     if (overflowed) {
       // Fail closed: processing (not the script itself, whose timeout
@@ -251,10 +433,11 @@ function createExecutorHandler(params) {
     } else if (canonicalResult !== undefined) {
       audit.invocation({
         invocationId,
-        repo: privateRepo,
+        repo: admitted ? admitted.repo : privateRepo,
         sensitivity: seed.sensitivity,
         bits: charge,
         bucketMs,
+        ...(admitted ? { admission: 'dynamic', readMode: admitted.readMode } : {}),
       });
       emitInvocationTelemetry('success');
       safeRespond(canonicalSuccessJson(canonicalResult));
@@ -268,6 +451,7 @@ function createExecutorHandler(params) {
   }
 
   function safeDestroy(invocationId) {
+    if (runner.hostOwned) return true;
     try {
       workspace.destroyInvocationWorkspace(config.workDir, invocationId);
       return true;
@@ -278,9 +462,10 @@ function createExecutorHandler(params) {
   }
 
   return {
-    /** Stops admitting new invocations while letting admitted work drain. */
+    /** Stops admissions and cancels any active runtime invocation. */
     close() {
       accepting = false;
+      for (const cancellation of activeCancellations) cancellation.abort();
     },
 
     /**
@@ -294,7 +479,7 @@ function createExecutorHandler(params) {
      *
      * Requests are queued so at most one query runs at a time.
      */
-    handle(request, respond) {
+    handle(request, respond, options = {}) {
       let responded = false;
       const safeRespond = (json) => {
         if (responded) return;
@@ -302,7 +487,9 @@ function createExecutorHandler(params) {
         respond(json);
       };
 
-      if (!accepting) {
+      if (!accepting || lane.closed) {
+        timing(undefined, clock.nowMs(), { phase: 'admission', status: 'rejected',
+          reason: 'admissions-closed', accepting, laneClosed: lane.closed === true });
         safeRespond(CANONICAL_ERROR_RESPONSE_JSON);
         return Promise.resolve();
       }
@@ -312,6 +499,8 @@ function createExecutorHandler(params) {
       // response the agent observes — including a rejection — counts
       // against it.
       if (invocationsUsed >= config.maxInvocations) {
+        timing(undefined, clock.nowMs(), { phase: 'admission', status: 'rejected',
+          reason: 'invocation-count-exhausted' });
         audit.failure('budget', 'invocation-count-exhausted', `max=${config.maxInvocations}`);
         emitInvocationTelemetry('invocation-count-exhausted');
         if (uniformTiming) {
@@ -336,7 +525,20 @@ function createExecutorHandler(params) {
       }
       invocationsUsed += 1;
 
-      const queued = lane.tail.then(() => execute(request, safeRespond)).catch((error) => {
+      const queued = lane.tail.then(() => {
+        if (!accepting || lane.closed || (runner.hostOwned && options.signal?.aborted)) {
+          timing(undefined, clock.nowMs(), { phase: 'admission', status: 'rejected',
+            reason: options.signal?.aborted ? 'cancelled' : 'admissions-closed',
+            accepting, laneClosed: lane.closed === true, aborted: options.signal?.aborted === true });
+          safeRespond(CANONICAL_ERROR_RESPONSE_JSON);
+          return;
+        }
+        return execute(request, safeRespond, options.signal);
+      }).catch((error) => {
+        if (runner.hostOwned) {
+          accepting = false;
+          lane.closed = true;
+        }
         audit.failure('queue', 'unexpected-error', error && error.message);
         emitInvocationTelemetry('unexpected-error');
         safeRespond(CANONICAL_ERROR_RESPONSE_JSON);

@@ -3,10 +3,12 @@ import * as path from 'path';
 import { normalizeEnclavesConfig } from '../parsers/enclave-parser';
 import { parseImageTag } from '../image-tag';
 import type { WrapperConfig } from '../types';
-import { buildEnclaveMcpService } from './enclave-mcp-service';
+import { buildEnclaveMcpService, deriveDockerEnclaveRunnerConfig } from './enclave-mcp-service';
 import { generateDockerCompose } from '../compose-generator';
+import { resolveEnclavePaths } from '../enclave/paths';
+import type { EnclaveRepository, RawEnclaveEntry } from '../types/enclave-options';
 
-const workDir = fs.mkdtempSync('/tmp/awf-enclave-mcp-service-test-');
+const workDir = fs.mkdtempSync(path.join(__dirname, 'awf-enclave-mcp-service-test-'));
 
 function config(overrides: Partial<WrapperConfig> = {}): WrapperConfig {
   return {
@@ -93,6 +95,100 @@ describe('buildEnclaveMcpService', () => {
       AWF_ENCLAVE_MAX_SCRIPT_BYTES: '4096',
       AWF_ENCLAVE_MAX_INVOCATIONS: '3',
     });
+    const paths = resolveEnclavePaths(workDir);
+    expect(result.service.volumes).toEqual(expect.arrayContaining([
+      '/var/run/docker.sock:/var/run/docker.sock:rw',
+      `${paths.seedsDir}:/srv/awf/seeds:ro`,
+      `${paths.workDir}:/srv/awf/work:rw`,
+    ]));
+    expect(JSON.stringify(result.service.volumes)).not.toContain('/run/awf-enclave-host-executor');
+    expect(() => deriveDockerEnclaveRunnerConfig(config({ enclaves }), ghcr, 'script'))
+      .toThrow(/enabled Docker entry/);
+  });
+
+  it('keeps Docker launch authority on the host while preserving configurable images and resources', () => {
+    const wrapper = config({
+      dockerHostPathPrefix: '/host',
+      enclaves: normalizeEnclavesConfig([{
+        script: { maxScriptBytes: 4096 }, runtime: 'docker', image: 'reviewed-script:test',
+        memoryLimit: '256m', cpuLimit: '0.5', pidsLimit: 32, tmpfsLimit: '24m',
+        timeout: 12, maxOutputBytes: 2048, maxInvocations: 3,
+        repos: [{ repo: 'octo/private', sensitivity: 'internal' }],
+      }]),
+    });
+    const result = buildEnclaveMcpService({ config: wrapper, imageConfig: ghcr });
+    const paths = resolveEnclavePaths(workDir);
+    expect(result.service.environment).toMatchObject({
+      AWF_ENCLAVE_BACKEND: 'docker', AWF_ENCLAVE_ENTRY_ID: 'script',
+    });
+    expect(result.service.environment).not.toHaveProperty('AWF_ENCLAVE_HOST_WORK_DIR');
+    expect(result.service.volumes).toEqual(expect.arrayContaining([
+      `/host${paths.hostExecutorDir}:/run/awf-enclave-host-executor:ro`,
+      `/host${paths.seedMapPath}:/srv/awf/seed-map.json:ro`,
+      `/host${paths.capabilityPath}:/run/awf-enclave-mcp/auth-token:ro`,
+    ]));
+    for (const forbidden of ['docker.sock', paths.workDir, paths.seedsDir, paths.runDir + ':']) {
+      expect(JSON.stringify(result.service.volumes)).not.toContain(forbidden);
+    }
+    expect(JSON.stringify(result.service)).not.toContain(path.join(paths.root, 'docker-enclave-seccomp.json'));
+    expect(deriveDockerEnclaveRunnerConfig(wrapper, ghcr, 'script')).toMatchObject({
+      queryImage: 'reviewed-script:test', querySeccompPath: path.join(paths.root, 'docker-enclave-seccomp.json'),
+      seedsDir: paths.seedsDir, workDir: paths.workDir, hostWorkDir: `/host${paths.workDir}`,
+      timeoutSeconds: 12, memoryLimit: '256m', cpuLimit: '0.5', pidsLimit: 32,
+      tmpfsLimit: '24m', maxOutputBytes: 2048, maxScriptBytes: 4096, maxInvocations: 3,
+    });
+  });
+
+  it('requires a budget-capable dedicated proxy when model ceilings are configured', () => {
+    const enclaves = normalizeEnclavesConfig([
+      {
+        agent: { engine: 'copilot', model: 'trusted-model', maxModelRequests: 2, maxModelTokens: 128 },
+        runtime: 'docker',
+        repos: [{ repo: 'octo/private', sensitivity: 'internal' }],
+      },
+    ]);
+    const wrapper = config({ enclaves, enableApiProxy: true });
+    const result = buildEnclaveMcpService({
+      config: wrapper,
+      imageConfig: ghcr,
+      networkConfig: {
+        subnet: '172.30.0.0/24', squidIp: '172.30.0.10', agentIp: '172.30.0.20', proxyIp: '172.30.0.30',
+      },
+    });
+    const runnerConfig = deriveDockerEnclaveRunnerConfig(wrapper, ghcr, 'agent');
+    const secret = runnerConfig.modelBudgetSecret;
+    const proxy = result.agentApiProxyService!;
+    const proxyEnvironment = proxy.environment as Record<string, string>;
+
+    expect(secret).toMatch(/^[0-9a-f]{64}$/);
+    expect(runnerConfig).toMatchObject({
+      engine: 'copilot', model: 'trusted-model',
+      enclaveImage: 'ghcr.io/github/gh-aw-firewall/enclave-agent:v1',
+      apiEndpoint: 'http://172.31.0.30:10002',
+      network: 'awf-enclave-agent', maxModelRequests: 2, maxModelTokens: 128,
+    });
+    expect(result.service.environment).not.toHaveProperty('AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET');
+    expect(proxyEnvironment.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET).toBe(secret);
+    expect(proxyEnvironment.AWF_ENCLAVE_PROXY_DIAGNOSTICS).toBe('1');
+    expect((proxy.healthcheck as { test: string[] }).test.join(' '))
+      .toContain('model_budget_enforcement');
+  });
+
+  it('enables only the dedicated proxy response audit without optional model ceilings', () => {
+    const compose = generateDockerCompose(config({
+      enableApiProxy: true,
+      enclaves: normalizeEnclavesConfig([{
+        agent: { engine: 'copilot', model: 'trusted-model' }, runtime: 'docker',
+        repos: [{ repo: 'octo/public', sensitivity: 'public' }],
+      }]),
+    }), { subnet: '172.30.0.0/24', squidIp: '172.30.0.10', agentIp: '172.30.0.20', proxyIp: '172.30.0.30' });
+    const services = compose.services;
+    expect(services['enclave-agent-api-proxy'].environment).toMatchObject({
+      AWF_ENCLAVE_PROXY_DIAGNOSTICS: '1',
+    });
+    expect(services['enclave-agent-api-proxy'].environment)
+      .not.toHaveProperty('AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET');
+    expect(services['api-proxy'].environment).not.toHaveProperty('AWF_ENCLAVE_PROXY_DIAGNOSTICS');
   });
 
   it('fails closed for the not-yet-proven sbx script runtime', () => {
@@ -101,6 +197,92 @@ describe('buildEnclaveMcpService', () => {
     ]);
     expect(() => buildEnclaveMcpService({ config: config({ enclaves }), imageConfig: ghcr }))
       .toThrow(/sbx script enclave capability is not yet available/);
+  });
+
+  it.each(['script', 'agent', 'both'] as const)(
+    'routes static Cloud Hypervisor %s only through the private host channel',
+    (kind) => {
+      const repos: EnclaveRepository[] = [{ repo: 'octo/private', sensitivity: 'internal' }];
+      const entries: RawEnclaveEntry[] = [];
+      if (kind !== 'agent') entries.push({ script: {}, runtime: 'cloud-hypervisor', repos });
+      if (kind !== 'script') {
+        entries.push({
+          agent: { engine: 'copilot', model: 'gpt-4.1', maxModelRequests: 2 },
+          runtime: 'cloud-hypervisor',
+          repos,
+        });
+      }
+      const enclaves = normalizeEnclavesConfig(entries);
+      const result = buildEnclaveMcpService({
+        config: config({ enclaves, enableApiProxy: true, containerRuntime: 'cloud-hypervisor' }),
+        imageConfig: ghcr,
+        networkConfig: {
+          subnet: '172.30.0.0/24', squidIp: '172.30.0.10', agentIp: '172.30.0.20', proxyIp: '172.30.0.30',
+        },
+      });
+      expect(result.scriptImageService).toBeUndefined();
+      expect(result.agentImageService).toBeUndefined();
+      const environment = result.service.environment as Record<string, string>;
+      expect(environment.AWF_ENCLAVE_PRIMARY_BACKEND).toBe('cloud-hypervisor');
+      expect(environment.AWF_ENCLAVE_IMAGE).toBeUndefined();
+      expect(environment.AWF_ENCLAVE_AGENT_IMAGE).toBeUndefined();
+      expect(environment.AWF_ENCLAVE_HOST_WORK_DIR).toBeUndefined();
+      expect(environment.AWF_ENCLAVE_AGENT_HOST_WORK_DIR).toBeUndefined();
+      expect(environment.AWF_ENCLAVE_AGENT_HOST_SEEDS_DIR).toBeUndefined();
+      if (kind !== 'agent') expect(environment.AWF_ENCLAVE_ENTRY_ID).toBe('script');
+      if (kind !== 'script') {
+        expect(environment.AWF_ENCLAVE_AGENT_ENTRY_ID).toBe('agent');
+        expect(environment.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET).toBeUndefined();
+        const proxyEnvironment = result.agentApiProxyService!.environment as Record<string, string>;
+        expect(proxyEnvironment.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET).toMatch(/^[0-9a-f]{64}$/);
+      }
+      const paths = resolveEnclavePaths(workDir);
+      const volumes = result.service.volumes as string[];
+      expect(volumes).toContain(
+        `${paths.hostExecutorDir}:/run/awf-enclave-host-executor:ro`,
+      );
+      expect(volumes.some((volume) => volume.includes('docker.sock'))).toBe(false);
+      expect(volumes.some((volume) => volume.startsWith(`${paths.seedsDir}:`))).toBe(false);
+      expect(volumes.some((volume) => volume.startsWith(`${paths.workDir}:`))).toBe(false);
+      expect(volumes.some((volume) => volume.startsWith(`${paths.hostExecutorJournalDir}:`))).toBe(false);
+      expect(volumes).toContain(`${paths.seedMapPath}:/srv/awf/seed-map.json:ro`);
+    },
+  );
+
+  it('rejects mixed Cloud Hypervisor and container enclave runtimes', () => {
+    const repos: EnclaveRepository[] = [{ repo: 'octo/private', sensitivity: 'internal' }];
+    const enclaves = normalizeEnclavesConfig([
+      { script: {}, runtime: 'cloud-hypervisor', repos },
+      { agent: { engine: 'copilot', model: 'gpt-4.1' }, runtime: 'docker', repos },
+    ]);
+    expect(() => buildEnclaveMcpService({
+      config: config({ enclaves, enableApiProxy: true }), imageConfig: ghcr,
+    })).toThrow(/cannot be mixed/);
+  });
+
+  it.each(['docker', 'gvisor'] as const)(
+    'rejects a %s script sharing its broker with the other container backend',
+    (runtime) => {
+      const repos: EnclaveRepository[] = [{ repo: 'octo/private', sensitivity: 'internal' }];
+      const enclaves = normalizeEnclavesConfig([
+        { script: {}, runtime, repos },
+        { agent: { engine: 'copilot', model: 'gpt-4.1' }, runtime: runtime === 'docker' ? 'gvisor' : 'docker', repos },
+      ]);
+      expect(() => buildEnclaveMcpService({
+        config: config({ enclaves, enableApiProxy: true }), imageConfig: ghcr,
+      })).toThrow(/cannot share a broker/);
+    },
+  );
+
+  it.each(['script', 'agent'] as const)('rejects a custom %s image for Cloud Hypervisor', (kind) => {
+    const repos: EnclaveRepository[] = [{ repo: 'octo/private', sensitivity: 'internal' }];
+    const entry: RawEnclaveEntry = kind === 'script'
+      ? { script: {}, runtime: 'cloud-hypervisor', image: 'custom:latest', repos }
+      : { agent: { engine: 'copilot', model: 'gpt-4.1' }, runtime: 'cloud-hypervisor', image: 'custom:latest', repos };
+    expect(() => buildEnclaveMcpService({
+      config: config({ enclaves: normalizeEnclavesConfig([entry]), enableApiProxy: true }),
+      imageConfig: ghcr,
+    })).toThrow(/static entries and release-attested artifacts/);
   });
 
   it('assembles the service without primary-agent mounts or dependency wiring', () => {
@@ -135,5 +317,39 @@ describe('buildEnclaveMcpService', () => {
     expect(JSON.stringify((agent as { networks?: unknown }).networks)).not.toContain(
       'awf-enclave-mcp-control',
     );
+  });
+
+  it('assembles unified CH supporting services without a Compose workload or Docker socket', () => {
+    const compose = generateDockerCompose(config({
+      containerRuntime: 'cloud-hypervisor',
+      networkIsolation: true,
+      enableApiProxy: true,
+      enclaves: normalizeEnclavesConfig([
+        { script: {}, runtime: 'cloud-hypervisor', repos: [{ repo: 'octo/private', sensitivity: 'internal' }] },
+        {
+          agent: { engine: 'copilot', model: 'gpt-4.1' }, runtime: 'cloud-hypervisor',
+          repos: [{ repo: 'octo/private', sensitivity: 'internal' }],
+        },
+      ]),
+    }), {
+      subnet: '172.30.0.0/24', squidIp: '172.30.0.10',
+      agentIp: '172.30.0.20', proxyIp: '172.30.0.30',
+    });
+    expect(compose.services.agent).toBeUndefined();
+    expect(compose.services['iptables-init']).toBeUndefined();
+    expect(compose.services['enclave-script-image']).toBeUndefined();
+    expect(compose.services['enclave-agent-image']).toBeUndefined();
+    expect(compose.services['squid-proxy']).toBeDefined();
+    expect(compose.services['api-proxy']).toBeDefined();
+    expect(compose.services['enclave-agent-api-proxy']).toBeDefined();
+    const broker = compose.services['enclave-mcp-server'];
+    expect(broker.environment).toMatchObject({
+      AWF_ENCLAVE_PRIMARY_BACKEND: 'cloud-hypervisor',
+      AWF_ENCLAVE_BACKEND: 'cloud-hypervisor',
+      AWF_ENCLAVE_AGENT_BACKEND: 'cloud-hypervisor',
+    });
+    expect(Object.keys(broker.networks ?? {})).toEqual(['awf-enclave-mcp-control']);
+    expect(JSON.stringify(broker.volumes)).not.toContain('docker.sock');
+    expect(JSON.stringify(broker.volumes)).not.toContain(resolveEnclavePaths(workDir).seedsDir);
   });
 });

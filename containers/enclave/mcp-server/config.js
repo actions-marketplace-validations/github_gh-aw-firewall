@@ -7,7 +7,7 @@ const {
   MAX_RESULT_BYTES,
   MAX_SCRIPT_BYTES,
 } = require('../../bounded-execution/finite-disclosure');
-const { ENCLAVE_SENSITIVITY_RUN_BITS } = require('../../bounded-execution/sensitivity-policy');
+const { ENCLAVE_SENSITIVITIES, ENCLAVE_SENSITIVITY_RUN_BITS } = require('../../bounded-execution/sensitivity-policy');
 const { parsePrivateRepositorySeedMap } = require('../../bounded-execution/repository-staging');
 const {
   ENCLAVE_INVOCATION_LABEL,
@@ -23,7 +23,9 @@ const CAPABILITY_PATH = path.join(CAPABILITY_DIR, 'auth-token');
 const CONTROL_DIR = '/run/awf-enclave-mcp-control';
 const AUDIT_DIR = '/var/log/awf-enclave';
 const READY_PATH = path.join(CONTROL_DIR, 'server.ready');
+const TOOL_CALL_BUDGET_PATH = path.join(CONTROL_DIR, 'tool-call-budget.json');
 const MCP_PORT = 8080;
+const HOST_EXECUTOR_DIR = '/run/awf-enclave-host-executor';
 
 /**
  * Fixed agent-enclave mount points and identity. Never caller-supplied.
@@ -43,8 +45,12 @@ const AGENT_SUPPORTED_BACKENDS = new Set(['docker', 'gvisor']);
 const AGENT_SUPPORTED_ENGINES = new Set(['copilot']);
 const AGENT_SUPPORTED_PROFILES = new Set(['openai', 'anthropic']);
 const AGENT_CONTAINER_PREFIX = 'awf-enclave-agent';
-const GITHUB_CAPABILITY_FILE = '/run/awf-enclave-mcp/github-capability-key';
-const GITHUB_RUN_IDENTITY_FILE = '/run/awf-enclave-mcp/github-run-identity';
+const GITHUB_AGENT_ID_FILE = '/run/awf-enclave-mcp/github-agent-id';
+/** Broker-side mount of AWF's private dynamic-admission channel. */
+const DELEGATION_CHANNEL_DIR = '/run/awf-enclave-delegation';
+/** Invocation-private path the executor reads its delegated bearer from. */
+const ENCLAVE_GITHUB_BEARER_PATH = '/run/awf-enclave-github/bearer';
+const DYNAMIC_SENSITIVITIES = new Set(ENCLAVE_SENSITIVITIES);
 
 function requireEnv(name) {
   const value = process.env[name];
@@ -78,11 +84,14 @@ function dockerSize(name, fallback) {
 
 function loadConfig(files = fs) {
   const executorBackend = requireEnv('AWF_ENCLAVE_BACKEND');
+  if (executorBackend === 'cloud-hypervisor' || executorBackend === 'docker') {
+    return loadHostConfig('script', loadServerConfig(files));
+  }
   if (executorBackend !== 'docker' && executorBackend !== 'gvisor') {
     throw new Error('AWF_ENCLAVE_BACKEND must be docker or gvisor');
   }
   const primaryBackend = requireEnv('AWF_ENCLAVE_PRIMARY_BACKEND');
-  if (primaryBackend !== 'docker' && primaryBackend !== 'gvisor' && primaryBackend !== 'sbx') {
+  if (!['docker', 'gvisor', 'sbx', 'cloud-hypervisor'].includes(primaryBackend)) {
     throw new Error('AWF_ENCLAVE_PRIMARY_BACKEND is unsupported');
   }
   const cpuLimit = process.env.AWF_ENCLAVE_CPU || '1';
@@ -143,6 +152,27 @@ function isAgentExecutorEnabled() {
 }
 
 /**
+ * True when the agent entry admits repositories dynamically (ADR 0001).
+ *
+ * A dynamic entry has no static seed catalog: it never mounts `/awf/seed`,
+ * never reads a seed map, and never holds a job token.
+ */
+function isDynamicAdmissionEnabled() {
+  return process.env.AWF_ENCLAVE_AGENT_DYNAMIC_ENABLED === 'true';
+}
+
+/**
+ * True when AWF staged an immutable seed catalog for this run.
+ *
+ * Absent, the value defaults to `true` so a pinned older AWF release — which
+ * never sets it — keeps its existing static behaviour. A dynamic-only run sets
+ * it explicitly to `false`.
+ */
+function isSeedMapEnabled() {
+  return process.env.AWF_ENCLAVE_SEED_MAP_ENABLED !== 'false';
+}
+
+/**
  * Loads the shared, executor-independent server settings.
  *
  * Used on every start, including agent-only runs where no script-executor
@@ -150,7 +180,7 @@ function isAgentExecutorEnabled() {
  */
 function loadServerConfig(files = fs) {
   const primaryBackend = requireEnv('AWF_ENCLAVE_PRIMARY_BACKEND');
-  if (primaryBackend !== 'docker' && primaryBackend !== 'gvisor' && primaryBackend !== 'sbx') {
+  if (!['docker', 'gvisor', 'sbx', 'cloud-hypervisor'].includes(primaryBackend)) {
     throw new Error('AWF_ENCLAVE_PRIMARY_BACKEND is unsupported');
   }
   const capability = files.readFileSync(CAPABILITY_PATH, 'utf8').trim();
@@ -159,6 +189,8 @@ function loadServerConfig(files = fs) {
   }
   return {
     seedMapPath: SEED_MAP_PATH,
+    seedMapEnabled: isSeedMapEnabled(),
+    runId: resolveRunId(),
     listenHost: process.env.AWF_ENCLAVE_LISTEN_HOST || '0.0.0.0',
     listenPort: MCP_PORT,
     controlDir: CONTROL_DIR,
@@ -166,7 +198,30 @@ function loadServerConfig(files = fs) {
     auditDir: AUDIT_DIR,
     primaryBackend,
     capability,
+    // Optional run-wide enclave tool-call cap; omission means unlimited.
+    maxToolCalls: optionalPositiveInt('AWF_ENCLAVE_MAX_TOOL_CALLS'),
+    toolCallBudgetPath: TOOL_CALL_BUDGET_PATH,
   };
+}
+
+/**
+ * Resolves the AWF-generated run id.
+ *
+ * Static runs can also recover it from the seed map, but a dynamic-only run
+ * stages no seed catalog at all, so AWF passes it explicitly.
+ */
+function resolveRunId() {
+  const runId = process.env.AWF_ENCLAVE_RUN_ID;
+  if (runId !== undefined && runId !== '') {
+    if (!/^[0-9a-f]{16,64}$/.test(runId)) {
+      throw new Error('AWF_ENCLAVE_RUN_ID is not an AWF-generated run identifier');
+    }
+    return runId;
+  }
+  if (!isSeedMapEnabled()) {
+    throw new Error('AWF_ENCLAVE_RUN_ID is required when no seed catalog is staged');
+  }
+  return undefined;
 }
 
 /**
@@ -179,6 +234,7 @@ function loadServerConfig(files = fs) {
  */
 function loadAgentConfig(server, files = fs) {
   const backend = requireEnv('AWF_ENCLAVE_AGENT_BACKEND');
+  if (backend === 'cloud-hypervisor' || backend === 'docker') return loadHostConfig('agent', server);
   if (!AGENT_SUPPORTED_BACKENDS.has(backend)) {
     throw new Error(`Unsupported AWF_ENCLAVE_AGENT_BACKEND: ${backend}`);
   }
@@ -200,36 +256,66 @@ function loadAgentConfig(server, files = fs) {
   }
   const cpuLimit = process.env.AWF_ENCLAVE_AGENT_CPU || '1';
   const githubEnabled = process.env.AWF_ENCLAVE_AGENT_GITHUB_ENABLED === 'true';
+  const dynamicEnabled = isDynamicAdmissionEnabled();
+  if (githubEnabled && dynamicEnabled) {
+    throw new Error('An enclave entry declares a static GitHub profile and a dynamic policy');
+  }
+  let dynamicChannelDir;
+  let dynamicSensitivity;
+  let dynamicGithubMcpUrl;
+  if (dynamicEnabled) {
+    dynamicChannelDir = process.env.AWF_ENCLAVE_AGENT_DYNAMIC_CHANNEL_DIR;
+    if (dynamicChannelDir !== DELEGATION_CHANNEL_DIR) {
+      throw new Error('AWF_ENCLAVE_AGENT_DYNAMIC_CHANNEL_DIR is not the fixed private path');
+    }
+    dynamicSensitivity = process.env.AWF_ENCLAVE_AGENT_DYNAMIC_SENSITIVITY;
+    if (!DYNAMIC_SENSITIVITIES.has(dynamicSensitivity)) {
+      throw new Error('AWF_ENCLAVE_AGENT_DYNAMIC_SENSITIVITY is not a supported sensitivity');
+    }
+    dynamicGithubMcpUrl = process.env.AWF_ENCLAVE_AGENT_DYNAMIC_GITHUB_MCP_URL;
+    if (!/^http:\/\/[0-9.]+:[0-9]+\/mcp\/github$/.test(dynamicGithubMcpUrl || '')) {
+      throw new Error('AWF_ENCLAVE_AGENT_DYNAMIC_GITHUB_MCP_URL must be a fixed IPv4 MCP endpoint');
+    }
+  }
   const githubProfile = process.env.AWF_ENCLAVE_AGENT_GITHUB_PROFILE;
-  const githubProxyUrl = process.env.AWF_ENCLAVE_AGENT_GITHUB_PROXY_URL;
-  const githubCapabilityKeyPath = process.env.AWF_ENCLAVE_AGENT_GITHUB_CAPABILITY_KEY_PATH;
-  const githubRunIdentityPath = process.env.AWF_ENCLAVE_AGENT_GITHUB_RUN_IDENTITY_PATH;
-  let githubCapabilityKey;
-  let githubRunIdentity;
+  const githubMcpUrl = process.env.AWF_ENCLAVE_AGENT_GITHUB_MCP_URL;
+  const githubAgentIdPath = process.env.AWF_ENCLAVE_AGENT_GITHUB_AGENT_ID_PATH;
+  const githubGatewayContainer = process.env.AWF_ENCLAVE_AGENT_GITHUB_GATEWAY_CONTAINER;
+  if (dynamicEnabled && !/^[A-Za-z0-9][A-Za-z0-9_.-]{7,127}$/.test(githubGatewayContainer || '')) {
+    // A dynamic entry reaches the same shared gateway as the static profile,
+    // so the per-launch network-isolation proof needs its real container name.
+    throw new Error('AWF_ENCLAVE_AGENT_GITHUB_GATEWAY_CONTAINER is invalid');
+  }
+  let githubAgentId;
   if (githubEnabled) {
     if (githubProfile !== 'issues-read-v1') {
       throw new Error('AWF_ENCLAVE_AGENT_GITHUB_PROFILE must be issues-read-v1');
     }
-    if (!/^http:\/\/[0-9.]+:[0-9]+$/.test(githubProxyUrl || '')) {
-      throw new Error('AWF_ENCLAVE_AGENT_GITHUB_PROXY_URL must be a fixed IPv4 HTTP origin');
+    if (!/^http:\/\/[0-9.]+:[0-9]+\/mcp\/github$/.test(githubMcpUrl || '')) {
+      throw new Error('AWF_ENCLAVE_AGENT_GITHUB_MCP_URL must be a fixed IPv4 MCP endpoint');
     }
-    if (githubCapabilityKeyPath !== GITHUB_CAPABILITY_FILE) {
-      throw new Error('AWF_ENCLAVE_AGENT_GITHUB_CAPABILITY_KEY_PATH is not the fixed private path');
+    if (githubAgentIdPath !== GITHUB_AGENT_ID_FILE) {
+      throw new Error('AWF_ENCLAVE_AGENT_GITHUB_AGENT_ID_PATH is not the fixed private path');
     }
-    if (githubRunIdentityPath !== GITHUB_RUN_IDENTITY_FILE) {
-      throw new Error('AWF_ENCLAVE_AGENT_GITHUB_RUN_IDENTITY_PATH is not the fixed private path');
+    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{7,127}$/.test(githubGatewayContainer || '')) {
+      throw new Error('AWF_ENCLAVE_AGENT_GITHUB_GATEWAY_CONTAINER is invalid');
     }
-    githubCapabilityKey = files.readFileSync(githubCapabilityKeyPath, 'utf8').trim();
-    if (!/^[0-9a-f]{64}$/.test(githubCapabilityKey)) {
-      throw new Error('Enclave GitHub capability root is invalid');
-    }
-    githubRunIdentity = files.readFileSync(githubRunIdentityPath, 'utf8').trim();
-    if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(githubRunIdentity)) {
-      throw new Error('Enclave GitHub run identity is invalid');
+    githubAgentId = files.readFileSync(githubAgentIdPath, 'utf8').trim();
+    if (!/^[A-Za-z0-9_-]{32,128}$/.test(githubAgentId)) {
+      throw new Error('Enclave GitHub MCP agent identity is invalid');
     }
   }
   if (!/^(?:[0-9]{1,2})(?:\.[0-9]{1,3})?$/.test(cpuLimit) || Number(cpuLimit) <= 0) {
     throw new Error('AWF_ENCLAVE_AGENT_CPU must be a positive decimal');
+  }
+  const maxModelRequests = optionalPositiveInt('AWF_ENCLAVE_AGENT_MAX_MODEL_REQUESTS');
+  const maxModelTokens = optionalPositiveInt('AWF_ENCLAVE_AGENT_MAX_MODEL_TOKENS');
+  const modelBudgetSecret = process.env.AWF_ENCLAVE_AGENT_MODEL_BUDGET_SECRET;
+  if (
+    (maxModelRequests !== undefined || maxModelTokens !== undefined) &&
+    !/^[0-9a-f]{64}$/.test(modelBudgetSecret || '')
+  ) {
+    throw new Error('Model budget enforcement requires a trusted proxy capability secret');
   }
 
   return {
@@ -237,7 +323,7 @@ function loadAgentConfig(server, files = fs) {
     workDir: WORK_DIR,
     auditDir: server.auditDir,
     hostWorkDir: requireEnv('AWF_ENCLAVE_AGENT_HOST_WORK_DIR'),
-    hostSeedsDir: requireEnv('AWF_ENCLAVE_AGENT_HOST_SEEDS_DIR'),
+    hostSeedsDir: dynamicEnabled ? undefined : requireEnv('AWF_ENCLAVE_AGENT_HOST_SEEDS_DIR'),
     enclaveSeccompPath: AGENT_SECCOMP_PATH,
     enclaveMountDir: AGENT_MOUNT_DIR,
     enclaveSeedPath: AGENT_SEED_PATH,
@@ -263,17 +349,63 @@ function loadAgentConfig(server, files = fs) {
     maxOutputBytes: positiveInt('AWF_ENCLAVE_AGENT_MAX_OUTPUT_BYTES', MAX_RESULT_BYTES, MAX_RESULT_BYTES),
     maxPromptBytes: positiveInt('AWF_ENCLAVE_AGENT_MAX_PROMPT_BYTES', 4096, MAX_TASK_BYTES),
     maxInvocations: positiveInt('AWF_ENCLAVE_AGENT_MAX_INVOCATIONS', 8),
-    maxModelRequests: optionalPositiveInt('AWF_ENCLAVE_AGENT_MAX_MODEL_REQUESTS'),
-    maxModelTokens: optionalPositiveInt('AWF_ENCLAVE_AGENT_MAX_MODEL_TOKENS'),
+    maxModelRequests,
+    maxModelTokens,
+    modelBudgetSecret,
     githubEnabled,
     githubProfile: githubEnabled ? githubProfile : undefined,
-    githubProxyUrl: githubEnabled ? githubProxyUrl : undefined,
-    githubCapabilityKey,
-    githubRunIdentity,
-    enclaveGithubCapabilityPath: '/run/awf-enclave-github/capability',
+    githubMcpUrl: githubEnabled ? githubMcpUrl : undefined,
+    githubAgentId,
+    githubGatewayContainer: githubEnabled || dynamicEnabled ? githubGatewayContainer : undefined,
+    enclaveGithubAgentIdPath: '/run/awf-enclave-github/agent-id',
+    dynamicEnabled,
+    dynamicChannelDir,
+    dynamicSensitivity,
+    dynamicGithubMcpUrl,
+    enclaveGithubBearerPath: ENCLAVE_GITHUB_BEARER_PATH,
     runLabelKey: ENCLAVE_RUN_LABEL,
     invocationLabelKey: ENCLAVE_INVOCATION_LABEL,
     containerPrefix: AGENT_CONTAINER_PREFIX,
+  };
+}
+
+function loadHostConfig(kind, server) {
+  const prefix = kind === 'script' ? 'AWF_ENCLAVE' : 'AWF_ENCLAVE_AGENT';
+  const backend = requireEnv(`${prefix}_BACKEND`);
+  const dynamicEnabled = kind === 'agent' && isDynamicAdmissionEnabled();
+  if (dynamicEnabled && backend !== 'docker') {
+    throw new Error('Dynamic host executor admission is not yet supported');
+  }
+  if (dynamicEnabled && process.env.AWF_ENCLAVE_AGENT_GITHUB_ENABLED === 'true') {
+    throw new Error('An enclave entry declares a static GitHub profile and a dynamic policy');
+  }
+  const dynamicSensitivity = dynamicEnabled ? process.env.AWF_ENCLAVE_AGENT_DYNAMIC_SENSITIVITY : undefined;
+  if (dynamicEnabled && !DYNAMIC_SENSITIVITIES.has(dynamicSensitivity)) {
+    throw new Error('AWF_ENCLAVE_AGENT_DYNAMIC_SENSITIVITY is not a supported sensitivity');
+  }
+  const entryId = requireEnv(`${prefix}_ENTRY_ID`);
+  if (!/^[a-z0-9](?:[a-z0-9-]{0,62})$/.test(entryId)) {
+    throw new Error('Invalid trusted host executor entry identity');
+  }
+  const runId = server.runId;
+  if (!runId) throw new Error('Host executor requires an explicit AWF_ENCLAVE_RUN_ID');
+  return {
+    entryId,
+    runId,
+    executorBackend: backend,
+    executorTransport: 'host',
+    backend,
+    primaryBackend: server.primaryBackend,
+    hostExecutorSocketPath: path.join(HOST_EXECUTOR_DIR, 'executor.sock'),
+    hostExecutorCapabilityPath: path.join(HOST_EXECUTOR_DIR, 'capability'),
+    timeoutSeconds: positiveInt(`${prefix}_TIMEOUT`, kind === 'script' ? 30 : 120, MAX_ENCLAVE_TIMEOUT_SECONDS),
+    maxInvocations: positiveInt(`${prefix}_MAX_INVOCATIONS`, kind === 'script' ? 32 : 8),
+    maxOutputBytes: positiveInt(`${prefix}_MAX_OUTPUT_BYTES`, MAX_RESULT_BYTES, MAX_RESULT_BYTES),
+    maxScriptBytes: positiveInt('AWF_ENCLAVE_MAX_SCRIPT_BYTES', MAX_SCRIPT_BYTES, MAX_SCRIPT_BYTES),
+    maxPromptBytes: positiveInt('AWF_ENCLAVE_AGENT_MAX_PROMPT_BYTES', 4096, MAX_TASK_BYTES),
+    githubEnabled: kind === 'agent' && process.env.AWF_ENCLAVE_AGENT_GITHUB_ENABLED === 'true',
+    dynamicEnabled,
+    dynamicSensitivity,
   };
 }
 
@@ -293,15 +425,19 @@ module.exports = {
   AUDIT_DIR,
   CAPABILITY_PATH,
   CONTROL_DIR,
+  DELEGATION_CHANNEL_DIR,
+  ENCLAVE_GITHUB_BEARER_PATH,
   READY_PATH,
   SEED_MAP_PATH,
   SEEDS_DIR,
   CAPABILITY_DIR,
   WORK_DIR,
-  GITHUB_CAPABILITY_FILE,
-  GITHUB_RUN_IDENTITY_FILE,
+  GITHUB_AGENT_ID_FILE,
+  HOST_EXECUTOR_DIR,
   isAgentExecutorEnabled,
+  isDynamicAdmissionEnabled,
   isScriptExecutorEnabled,
+  isSeedMapEnabled,
   loadAgentConfig,
   loadConfig,
   loadSeedMap,

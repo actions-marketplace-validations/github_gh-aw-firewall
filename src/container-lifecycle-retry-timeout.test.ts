@@ -13,11 +13,15 @@
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 jest.mock('execa', () => require('./test-helpers/mock-execa.test-utils').execaMockFactory());
 jest.mock('./container-startup-diagnostics');
+jest.mock('./enclave/startup-diagnostics');
 jest.mock('./squid-log-reader', () => ({
   checkSquidLogs: jest.fn().mockResolvedValue({ hasDenials: false, blockedTargets: [] }),
 }));
 
 import { startContainers, runAgentCommand, fastKillAgentContainer } from './container-lifecycle';
+import * as fs from 'fs';
+import * as path from 'path';
+import { captureEnclaveStartupDiagnostics } from './enclave/startup-diagnostics';
 import { containerLifecycleTestHelpers } from './container-lifecycle.test-utils';
 import { markAgentExternallyKilled } from './container-lifecycle-state';
 import { mockExecaFn } from './test-helpers/mock-execa.test-utils';
@@ -42,6 +46,7 @@ describe('container-lifecycle retry and timeout branches', () => {
 
   beforeEach(() => {
     mockExecaFn.mockReset();
+    jest.mocked(captureEnclaveStartupDiagnostics).mockReset();
     containerLifecycleTestHelpers.resetAgentExternallyKilled();
 
     mockDidContainerFailStartup.mockReset();
@@ -128,7 +133,7 @@ describe('container-lifecycle retry and timeout branches', () => {
     });
 
     describe('startContainers - enclave MCP server fails on first attempt', () => {
-      it('surfaces server logs without retrying', async () => {
+      it('captures safe server diagnostics without dumping raw logs or retrying', async () => {
         const startupError = new Error(
           'dependency failed to start: container awf-enclave-mcp-server exited (1)',
         );
@@ -143,8 +148,9 @@ describe('container-lifecycle retry and timeout branches', () => {
           .mockResolvedValueOnce(true); // enclave MCP server
 
         await expect(startContainers(getDir(), ['github.com'])).rejects.toThrow(startupError);
-        expect(mockLogContainerLogsToStderr)
-          .toHaveBeenCalledWith('awf-enclave-mcp-server');
+        expect(captureEnclaveStartupDiagnostics)
+          .toHaveBeenCalledWith(getDir(), undefined, 'startup-failure');
+        expect(mockLogContainerLogsToStderr).not.toHaveBeenCalled();
         expectComposeUpAttempts(1);
       });
     });
@@ -226,6 +232,35 @@ describe('container-lifecycle retry and timeout branches', () => {
 
         const result = await resultPromise;
 
+        expect(result.exitCode).toBe(124);
+        expect(mockExecaFn).toHaveBeenCalledWith(
+          'docker',
+          ['stop', '-t', '10', 'awf-agent'],
+          expect.objectContaining({ reject: false }),
+        );
+      } finally {
+        jest.useRealTimers();
+      }
+    });
+
+    it('does not let the agent runtime marker extend the host timeout deadline', async () => {
+      jest.useFakeTimers();
+      const startTimeMs = Date.now();
+      const runtimeDir = path.join(getDir(), 'api-proxy-logs', 'agent-runtime');
+      fs.mkdirSync(runtimeDir, { recursive: true });
+      fs.writeFileSync(path.join(runtimeDir, 'started-at-ms'), String(startTimeMs + 10 * 60 * 1000));
+      jest.setSystemTime(startTimeMs + 30_000);
+      try {
+        mockExecaFn
+          .mockResolvedValueOnce(ok() as any)
+          .mockReturnValueOnce(new Promise<never>(() => {}))
+          .mockResolvedValueOnce(ok() as any);
+
+        const resultPromise = runAgentCommand(getDir(), ['github.com'], undefined, 1);
+        await jest.advanceTimersByTimeAsync(60_001);
+        await jest.advanceTimersByTimeAsync(300);
+
+        const result = await resultPromise;
         expect(result.exitCode).toBe(124);
         expect(mockExecaFn).toHaveBeenCalledWith(
           'docker',

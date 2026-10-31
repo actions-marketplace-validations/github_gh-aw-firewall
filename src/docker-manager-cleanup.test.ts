@@ -113,8 +113,11 @@ describe('docker-manager cleanup', () => {
 
       await cleanup(getDir(), false, proxyLogsDir);
 
-      // Verify chmod was called on proxyLogsDir
-      expect(mockExecaSync).toHaveBeenCalledWith('chmod', ['-R', 'a+rX', proxyLogsDir]);
+      expect(mockExecaSync).toHaveBeenCalledWith('chmod', ['a+rX', proxyLogsDir]);
+      expect(mockExecaSync).toHaveBeenCalledWith('chmod', [
+        'a+rX',
+        path.join(proxyLogsDir, 'access.log'),
+      ]);
     });
 
     it('should not move squid logs to /tmp when proxyLogsDir is specified', async () => {
@@ -135,14 +138,19 @@ describe('docker-manager cleanup', () => {
     });
 
     it('should skip squid log chmod when proxyLogsDir does not exist', async () => {
-      const proxyLogsDir = path.join(os.tmpdir(), `awf-missing-proxy-logs-${Date.now()}`);
+      const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-missing-proxy-parent-'));
+      const proxyLogsDir = path.join(parentDir, 'proxy-logs');
 
-      await cleanup(getDir(), false, proxyLogsDir);
+      try {
+        await cleanup(getDir(), false, proxyLogsDir);
 
-      expect(mockExecaSync).not.toHaveBeenCalledWith('chmod', ['-R', 'a+rX', proxyLogsDir]);
+        expect(mockExecaSync).not.toHaveBeenCalledWith('chmod', ['-R', 'a+rX', proxyLogsDir]);
+      } finally {
+        fs.rmSync(parentDir, { recursive: true, force: true });
+      }
     });
 
-    it('should chmod api-proxy-logs subdirectory when proxyLogsDir is specified', async () => {
+    it('does not make api-proxy logs world-readable when proxyLogsDir is specified', async () => {
       // proxyLogsDir must be OUTSIDE workDir since cleanup deletes workDir
       const externalDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-proxy-logs-test-'));
       const proxyLogsDir = path.join(externalDir, 'proxy-logs');
@@ -155,19 +163,32 @@ describe('docker-manager cleanup', () => {
       try {
         await cleanup(getDir(), false, proxyLogsDir);
 
-        // Verify chmod was called on both proxyLogsDir and api-proxy-logs subdirectory
-        expect(mockExecaSync).toHaveBeenCalledWith('chmod', ['-R', 'a+rX', proxyLogsDir]);
-        expect(mockExecaSync).toHaveBeenCalledWith('chmod', ['-R', 'a+rX', apiProxyLogsDir]);
+        // Only the root and direct Squid log files become readable; payload-bearing
+        // API proxy diagnostics retain their owner-only file permissions.
+        expect(mockExecaSync).toHaveBeenCalledWith('chmod', ['a+rX', proxyLogsDir]);
+        expect(mockExecaSync).toHaveBeenCalledWith('chmod', [
+          'a+rX',
+          path.join(proxyLogsDir, 'access.log'),
+        ]);
+        expect(mockExecaSync).not.toHaveBeenCalledWith('chmod', ['-R', 'a+rX', proxyLogsDir]);
+        expect(mockExecaSync).not.toHaveBeenCalledWith(
+          'chmod',
+          expect.arrayContaining([apiProxyLogsDir]),
+        );
       } finally {
         fs.rmSync(externalDir, { recursive: true, force: true });
       }
     });
 
     it('should handle non-existent work directory gracefully', async () => {
-      const nonExistentDir = path.join(os.tmpdir(), 'awf-nonexistent-12345');
+      const parentDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awf-nonexistent-parent-'));
+      const nonExistentDir = path.join(parentDir, 'workdir');
 
-      // Should not throw
-      await expect(cleanup(nonExistentDir, false)).resolves.not.toThrow();
+      try {
+        await expect(cleanup(nonExistentDir, false)).resolves.not.toThrow();
+      } finally {
+        fs.rmSync(parentDir, { recursive: true, force: true });
+      }
     });
 
     it('should preserve session state to /tmp when sessionStateDir is not specified', async () => {

@@ -17,16 +17,18 @@ describe('host-iptables (network)', () => {
     };
 
     const expectNetworkInspectCalled = (): void => {
-      expect(mockedExeca).toHaveBeenCalledWith('docker', ['network', 'inspect', NETWORK_NAME], { env: expect.any(Object) });
+      expect(mockedExeca).toHaveBeenCalledWith(
+        'docker',
+        ['network', 'inspect', NETWORK_NAME, '--format', '{{range .IPAM.Config}}{{.Subnet}} {{end}}'],
+        { env: expect.any(Object) },
+      );
     };
 
     it('should return network config when network already exists', async () => {
-      // Mock successful network inspect (network exists)
-      mockedExeca.mockResolvedValue(execaResult({
-        stdout: '',
-        stderr: '',
-        exitCode: 0,
-      }));
+      // Mock successful network inspect (network exists with the default subnet)
+      mockedExeca
+        .mockResolvedValueOnce(execaResult({ stdout: `${NETWORK_SUBNET} ` }))
+        .mockResolvedValueOnce(execaResult({ stdout: '{"com.docker.network.bridge.name":"fw-bridge"}' }));
 
       const result = await ensureFirewallNetwork();
 
@@ -62,6 +64,89 @@ describe('host-iptables (network)', () => {
         '--opt',
         'com.docker.network.bridge.name=fw-bridge',
       ], { env: expect.any(Object) });
+    });
+
+    it('creates the network with an overridden subnet and derived IPs', async () => {
+      mockedExeca
+        .mockRejectedValueOnce(new Error('network not found'))
+        .mockResolvedValueOnce(execaResult({ stdout: '', stderr: '', exitCode: 0 }));
+
+      const result = await ensureFirewallNetwork('10.88.0.0/24');
+
+      expect(result).toEqual({
+        subnet: '10.88.0.0/24',
+        squidIp: '10.88.0.10',
+        agentIp: '10.88.0.20',
+        proxyIp: '10.88.0.30',
+      });
+      expect(mockedExeca).toHaveBeenCalledWith('docker', [
+        'network',
+        'create',
+        NETWORK_NAME,
+        '--subnet',
+        '10.88.0.0/24',
+        '--opt',
+        'com.docker.network.bridge.name=fw-bridge',
+      ], { env: expect.any(Object) });
+    });
+
+    it('fails when a pre-existing network uses a different subnet', async () => {
+      mockedExeca.mockResolvedValue(execaResult({
+        stdout: `${NETWORK_SUBNET} `,
+        stderr: '',
+        exitCode: 0,
+      }));
+
+      await expect(ensureFirewallNetwork('10.88.0.0/24')).rejects.toThrow(
+        /already exists with subnet 172\.30\.0\.0\/24/,
+      );
+    });
+
+    it('recreates an empty network missing the bridge option', async () => {
+      mockedExeca
+        .mockResolvedValueOnce(execaResult({ stdout: `${NETWORK_SUBNET} ` }))
+        .mockResolvedValueOnce(execaResult({ stdout: '{}' }))
+        .mockResolvedValueOnce(execaResult({ stdout: '0' }))
+        .mockResolvedValueOnce(execaResult({ stdout: NETWORK_NAME }))
+        .mockResolvedValueOnce(execaResult({ stdout: NETWORK_NAME }));
+
+      expectFirewallNetworkConfig(await ensureFirewallNetwork());
+      expect(mockedExeca).toHaveBeenCalledWith('docker', ['network', 'rm', NETWORK_NAME], { env: expect.any(Object) });
+      expect(mockedExeca).toHaveBeenCalledWith('docker', [
+        'network', 'create', NETWORK_NAME, '--subnet', NETWORK_SUBNET,
+        '--opt', 'com.docker.network.bridge.name=fw-bridge',
+      ], { env: expect.any(Object) });
+      expect(mockedExeca).toHaveBeenCalledTimes(5);
+    });
+
+    it('does not remove a network with attached containers', async () => {
+      mockedExeca
+        .mockResolvedValueOnce(execaResult({ stdout: `${NETWORK_SUBNET} ` }))
+        .mockResolvedValueOnce(execaResult({ stdout: '{}' }))
+        .mockResolvedValueOnce(execaResult({ stdout: '1' }));
+
+      await expect(ensureFirewallNetwork()).rejects.toThrow(/awf-net.*1 attached container\(s\).*docker network rm awf-net/);
+      expect(mockedExeca).not.toHaveBeenCalledWith('docker', ['network', 'rm', NETWORK_NAME], expect.anything());
+    });
+
+    it('fails safely when Docker returns malformed bridge options', async () => {
+      mockedExeca
+        .mockResolvedValueOnce(execaResult({ stdout: `${NETWORK_SUBNET} ` }))
+        .mockResolvedValueOnce(execaResult({ stdout: 'invalid options' }));
+
+      await expect(ensureFirewallNetwork()).rejects.toThrow(/Could not read bridge options for Docker network 'awf-net'/);
+      expect(mockedExeca).not.toHaveBeenCalledWith('docker', ['network', 'rm', NETWORK_NAME], expect.anything());
+    });
+
+    it('reports how to remove a stale network when automatic removal fails', async () => {
+      mockedExeca
+        .mockResolvedValueOnce(execaResult({ stdout: `${NETWORK_SUBNET} ` }))
+        .mockResolvedValueOnce(execaResult({ stdout: '{}' }))
+        .mockResolvedValueOnce(execaResult({ stdout: '0' }))
+        .mockRejectedValueOnce(new Error('network has active endpoints'));
+
+      await expect(ensureFirewallNetwork()).rejects.toThrow(/awf-net.*docker network rm awf-net/);
+      expect(mockedExeca).not.toHaveBeenCalledWith('docker', expect.arrayContaining(['network', 'create']), expect.anything());
     });
   });
 });

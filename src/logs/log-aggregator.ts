@@ -6,9 +6,20 @@ import * as fs from 'fs';
 import * as path from 'path';
 import execa from 'execa';
 import { LogSource, ParsedLogEntry } from '../types';
-import { parseLogLine, parseAuditJsonlLine } from './log-parser';
+import { parseLogLine, parseAuditJsonlLine, isNoneDecision } from './log-parser';
 import { logger } from '../logger';
 import { isInternalAwfDomain } from './internal-domain-filter';
+import { readStartupDiagnostics } from './startup-diagnostics';
+
+/**
+ * Returns true for Squid log rows that should not count as meaningful traffic.
+ * These are benign operational events, including connection-close noise and
+ * SSL-bump step-1 preflight handshakes that never reached an HTTP transaction.
+ */
+export function isSkippableLogEntry(entry: Pick<ParsedLogEntry, 'url' | 'decision'>): boolean {
+  return entry.url === 'error:transaction-end-before-headers' ||
+    (typeof entry.decision === 'string' && entry.decision.startsWith('NONE'));
+}
 
 /**
  * Statistics for a single domain
@@ -42,6 +53,8 @@ export interface AggregatedStats {
   timeRange: { start: number; end: number } | null;
   /** Per-rule hit statistics (populated when policy manifest is available) */
   byRule?: import('./audit-enricher').RuleStats[];
+  /** Startup diagnostics captured before Squid emitted access.log */
+  startupDiagnostics?: import('../types').StartupDiagnostic[];
 }
 
 /**
@@ -80,7 +93,8 @@ function parseLines(
  */
 function aggregateLogs(
   entries: ParsedLogEntry[],
-  knownTopologyPeers?: ReadonlySet<string>
+  knownTopologyPeers?: ReadonlySet<string>,
+  networkSubnet?: string
 ): AggregatedStats {
   const byDomain = new Map<string, DomainStats>();
   let allowedRequests = 0;
@@ -98,9 +112,9 @@ function aggregateLogs(
       maxTimestamp = entry.timestamp;
     }
 
-    // Skip benign operational entries (connection closures without HTTP headers)
-    // These appear during healthchecks and shutdown-time keep-alive connection closures
-    if (entry.url === 'error:transaction-end-before-headers') {
+    // Skip benign operational entries (connection closures without HTTP headers
+    // and Squid step-1 SSL preflight peeks that never reached an HTTP request).
+    if (isNoneDecision(entry.decision) || entry.url === 'error:transaction-end-before-headers') {
       continue;
     }
 
@@ -110,7 +124,7 @@ function aggregateLogs(
     // entry — they are never missing external dependencies and surfacing them
     // as blocked external domains in reports is spurious noise.
     const domain = entry.domain || '-';
-    if (!entry.isAllowed && isInternalAwfDomain(domain, knownTopologyPeers)) {
+    if (!entry.isAllowed && isInternalAwfDomain(domain, knownTopologyPeers, networkSubnet)) {
       continue;
     }
 
@@ -225,14 +239,23 @@ export async function loadAllLogs(source: LogSource): Promise<ParsedLogEntry[]> 
  * @param knownTopologyPeers - Optional set of topology-peer hostnames from the
  *   policy manifest. When provided, denied entries for these hosts are suppressed
  *   even if their names contain dots (e.g. mcp.gateway-01).
+ * @param networkSubnet - Optional effective `awf-net` subnet (CIDR) from the
+ *   policy manifest's `networkSubnet` field, for classifying denied in-subnet
+ *   IPs as AWF-internal when `--network-subnet` relocated the network.
  * @returns Aggregated statistics
  */
 export async function loadAndAggregate(
   source: LogSource,
-  knownTopologyPeers?: ReadonlySet<string>
+  knownTopologyPeers?: ReadonlySet<string>,
+  networkSubnet?: string
 ): Promise<AggregatedStats> {
   const entries = await loadAllLogs(source);
-  return aggregateLogs(entries, knownTopologyPeers);
+  const stats = aggregateLogs(entries, knownTopologyPeers, networkSubnet);
+  const startupDiagnostics = readStartupDiagnostics(source);
+  if (startupDiagnostics.length > 0) {
+    stats.startupDiagnostics = startupDiagnostics;
+  }
+  return stats;
 }
 
 /** @internal Exposed only for unit tests — not part of the public API. */

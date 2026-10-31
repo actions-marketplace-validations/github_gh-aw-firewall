@@ -13,8 +13,27 @@ import {
   assertCloudHypervisorPreSecurityCompatibility,
   assertCloudHypervisorRuntimeCompatibility,
   assertCloudHypervisorSelection,
+  isPrimaryCloudHypervisorRuntime,
+  requiresCloudHypervisorInfrastructure,
+  usesCloudHypervisorEnclaveRuntime,
 } from '../../cloud-hypervisor/runtime-validation';
+import {
+  assertNvxRuntimeCompatibility,
+  assertNvxSelection,
+  isPrimaryNvxRuntime,
+} from '../../nvx/runtime-validation';
+import { assertProtectedCommandOutputCaptureSupported } from '../../protected-command-output-capture';
 import { assertFilesystemWritePolicyCompatibility } from '../../filesystem-policy';
+import {
+  formatCloudHypervisorDockerFallbackWarning,
+  isCloudHypervisorUnsupportedHostError,
+} from '../../cloud-hypervisor/errors';
+
+function fallBackCloudHypervisorToDocker(config: WrapperConfig, error: unknown): void {
+  logger.warn(formatCloudHypervisorDockerFallbackWarning(error));
+  config.containerRuntime = undefined;
+  config.cloudHypervisor = undefined;
+}
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -55,6 +74,7 @@ export function assembleAndValidateConfig(
     dnsServers: networkOptions.dnsServers,
     dnsServersExplicit: networkOptions.dnsServersExplicit,
     dnsOverHttps: networkOptions.dnsOverHttps,
+    networkSubnet: networkOptions.networkSubnet,
     allowedUrls: agentOptions.allowedUrls,
     memoryLimit: logAndLimits.memoryLimit,
     pidsLimit: logAndLimits.pidsLimit,
@@ -62,10 +82,9 @@ export function assembleAndValidateConfig(
     modelAliases: logAndLimits.modelAliases,
     allowedModels: logAndLimits.allowedModels,
     disallowedModels: logAndLimits.disallowedModels,
-    maxEffectiveTokens: logAndLimits.maxEffectiveTokens,
     maxAiCredits: logAndLimits.maxAiCredits,
-    effectiveTokenModelMultipliers: logAndLimits.effectiveTokenModelMultipliers,
-    effectiveTokenDefaultModelMultiplier: logAndLimits.effectiveTokenDefaultModelMultiplier,
+    modelMultipliers: logAndLimits.modelMultipliers,
+    defaultModelMultiplier: logAndLimits.defaultModelMultiplier,
     maxModelMultiplierCap: logAndLimits.maxModelMultiplierCap,
     maxRuns: logAndLimits.maxRuns,
     maxPermissionDenied: logAndLimits.maxPermissionDenied,
@@ -75,14 +94,21 @@ export function assembleAndValidateConfig(
     dockerHostPathPrefix: networkOptions.dockerHostPathPrefixResolution.dockerHostPathPrefix,
   });
 
-  validateInfrastructureOptions(config);
   try {
-    assertCloudHypervisorSelection(config);
+    assertProtectedCommandOutputCaptureSupported(config);
   } catch (error) {
     logger.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
-  if (config.containerRuntime === 'cloud-hypervisor') {
+  validateInfrastructureOptions(config);
+  try {
+    assertCloudHypervisorSelection(config);
+    assertNvxSelection(config);
+  } catch (error) {
+    logger.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+    process.exit(1);
+  }
+  if (requiresCloudHypervisorInfrastructure(config)) {
     try {
       assertCloudHypervisorPreSecurityCompatibility(config);
     } catch (error) {
@@ -97,9 +123,27 @@ export function assembleAndValidateConfig(
     logger.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
     process.exit(1);
   }
-  if (config.containerRuntime === 'cloud-hypervisor') {
+  if (requiresCloudHypervisorInfrastructure(config)) {
     try {
       assertCloudHypervisorRuntimeCompatibility(config);
+    } catch (error) {
+      if (
+        isCloudHypervisorUnsupportedHostError(error)
+        && isPrimaryCloudHypervisorRuntime(config)
+        && !usesCloudHypervisorEnclaveRuntime(config)
+      ) {
+        fallBackCloudHypervisorToDocker(config, error);
+      } else {
+        logger.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
+        process.exit(1);
+      }
+    }
+  }
+  if (isPrimaryNvxRuntime(config)) {
+    // NVX never falls back to another runtime: any validation failure here
+    // (missing preview flag, unsupported host, invalid artifacts) is fatal.
+    try {
+      assertNvxRuntimeCompatibility(config);
     } catch (error) {
       logger.error(`❌ ${error instanceof Error ? error.message : String(error)}`);
       process.exit(1);

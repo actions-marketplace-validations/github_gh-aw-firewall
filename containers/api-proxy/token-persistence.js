@@ -11,12 +11,15 @@
 const fs = require('fs');
 const path = require('path');
 const { logRequest } = require('./logging');
+const { callerRecordFields } = require('./caller-header');
 
 // Token usage log file path (inside the mounted log volume)
 const TOKEN_LOG_DIR = process.env.AWF_TOKEN_LOG_DIR || '/var/log/api-proxy';
 const TOKEN_LOG_FILE = path.join(TOKEN_LOG_DIR, 'token-usage.jsonl');
 const DIAG_LOG_FILE = path.join(TOKEN_LOG_DIR, 'token-diag.jsonl');
 const AUDIT_LOG_FILE = path.join(TOKEN_LOG_DIR, 'token-tracker-audit.jsonl');
+const UPSTREAM_ERROR_LOG_FILE = path.join(TOKEN_LOG_DIR, 'upstream-errors.jsonl');
+const ENCLAVE_RESPONSE_LOG_FILE = path.join(TOKEN_LOG_DIR, 'enclave-proxy-events.jsonl');
 const DIAG_ENABLED = process.env.AWF_DEBUG_TOKENS === '1';
 
 // AWF version used to identify schema version in JSONL records.
@@ -35,6 +38,19 @@ const TOKEN_DIAG_SCHEMA = `token-diag/v${AWF_VERSION || '0.0.0-dev'}`;
 let logStream = null;
 let diagStream = null;
 let auditStream = null;
+let upstreamErrorStream = null;
+let enclaveResponseStream = null;
+let enclaveResponseRecords = 0;
+
+function createOwnerOnlyAppendStream(filePath, onError) {
+  fs.mkdirSync(TOKEN_LOG_DIR, { recursive: true });
+  const fd = fs.openSync(filePath, 'a', 0o600);
+  fs.fchmodSync(fd, 0o600);
+  fs.closeSync(fd);
+  const stream = fs.createWriteStream(filePath, { flags: 'a', mode: 0o600 });
+  stream.on('error', onError);
+  return stream;
+}
 
 function ensureTokenUsageFileExists() {
   try {
@@ -96,12 +112,42 @@ function diag(msg, data) {
 function auditTrack(event, data) {
   try {
     if (!auditStream) {
-      fs.mkdirSync(TOKEN_LOG_DIR, { recursive: true });
-      auditStream = fs.createWriteStream(AUDIT_LOG_FILE, { flags: 'a', mode: 0o644 });
-      auditStream.on('error', () => { auditStream = null; });
+      auditStream = createOwnerOnlyAppendStream(AUDIT_LOG_FILE, () => { auditStream = null; });
     }
     const line = { ts: Date.now(), event, ...data };
     auditStream.write(JSON.stringify(line) + '\n');
+  } catch { /* best-effort */ }
+}
+
+/**
+ * Persist one sanitized upstream error-response diagnostic to upstream-errors.jsonl.
+ * Callers must pass fields that have already been header/body sanitized for logs.
+ * This is best-effort and never throws so diagnostics cannot disrupt proxy traffic.
+ */
+function auditUpstreamErrorResponse(fields) {
+  try {
+    if (!upstreamErrorStream) {
+      upstreamErrorStream = createOwnerOnlyAppendStream(UPSTREAM_ERROR_LOG_FILE, () => { upstreamErrorStream = null; });
+    }
+
+    const line = { ts: Date.now(), event: 'UPSTREAM_ERROR_RESPONSE', ...fields };
+    upstreamErrorStream.write(JSON.stringify(line) + '\n');
+  } catch { /* best-effort */ }
+}
+
+function auditEnclaveResponse(status, origin) {
+  if (process.env.AWF_ENCLAVE_PROXY_DIAGNOSTICS !== '1') return;
+  // One overflow record makes truncation distinguishable from complete evidence.
+  if (enclaveResponseRecords >= 4097 ||
+      !Number.isInteger(status) || status < 100 || status > 599 ||
+      !['local', 'upstream'].includes(origin)) return;
+  try {
+    if (!enclaveResponseStream) {
+      enclaveResponseStream = createOwnerOnlyAppendStream(ENCLAVE_RESPONSE_LOG_FILE,
+        () => { enclaveResponseStream = null; });
+    }
+    enclaveResponseStream.write(JSON.stringify({ schemaVersion: 1, origin, status }) + '\n');
+    enclaveResponseRecords++;
   } catch { /* best-effort */ }
 }
 
@@ -211,10 +257,15 @@ function validateTokenUsageRecord(record) {
  * @param {boolean} opts.streaming
  * @param {number} opts.duration
  * @param {number} opts.responseBytes
+ * @param {string} [opts.purpose] - Trusted AWF purpose from req.awfRequestContext; wins over any caller
+ * @param {object|null} [opts.caller] - Parsed x-awf-caller from req.awfCaller (untrusted attribution metadata)
  * @returns {object}
  */
 function buildTokenUsageRecord(normalized, opts) {
-  const { requestId, provider, model, reqPath, status, streaming, duration, responseBytes } = opts;
+  const {
+    requestId, provider, model, reqPath, status, streaming, duration, responseBytes, purpose,
+    caller, requestedEndpoint, upstreamEndpoint, steering,
+  } = opts;
   return {
     _schema: TOKEN_USAGE_SCHEMA,
     timestamp: new Date().toISOString(),
@@ -231,6 +282,10 @@ function buildTokenUsageRecord(normalized, opts) {
     cache_write_tokens: normalized.cache_write_tokens,
     duration_ms: duration,
     response_bytes: responseBytes,
+    ...callerRecordFields(purpose, caller),
+    ...(steering ? { steering } : {}),
+    ...(requestedEndpoint ? { requested_endpoint: requestedEndpoint } : {}),
+    ...(upstreamEndpoint ? { upstream_endpoint: upstreamEndpoint } : {}),
   };
 }
 
@@ -302,6 +357,14 @@ function closeLogStream() {
         pending++;
         auditStream.end(() => { auditStream = null; pending--; check(); });
       }
+      if (upstreamErrorStream) {
+        pending++;
+        upstreamErrorStream.end(() => { upstreamErrorStream = null; pending--; check(); });
+      }
+      if (enclaveResponseStream) {
+        pending++;
+        enclaveResponseStream.end(() => { enclaveResponseStream = null; pending--; check(); });
+      }
       if (pending === 0) resolve();
     }),
     closeBlockedRequestDiagStream(),
@@ -310,10 +373,14 @@ function closeLogStream() {
 
 module.exports = {
   TOKEN_LOG_FILE,
+  AUDIT_LOG_FILE,
+  UPSTREAM_ERROR_LOG_FILE,
   TOKEN_USAGE_SCHEMA,
   TOKEN_DIAG_SCHEMA,
   diag,
   auditTrack,
+  auditUpstreamErrorResponse,
+  auditEnclaveResponse,
   buildTokenDiagRecord,
   buildTokenUsageRecord,
   incrementTokenMetrics,

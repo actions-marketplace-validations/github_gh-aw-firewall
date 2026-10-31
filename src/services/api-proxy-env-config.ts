@@ -1,14 +1,19 @@
 import { SQUID_PORT } from '../constants';
-import { stripScheme } from '../host-env';
+import { isIP } from 'net';
+import { normalizeApiTargetScheme } from '../host-env';
 import { WrapperConfig } from '../types';
 import { getConfigEnvValue, getLowerCaseProcessEnvValue, pickEnvVars } from '../env-utils';
 import { OPENAI_ENV, ANTHROPIC_ENV, GEMINI_ENV, COPILOT_ENV, VERTEX_ENV, OIDC_AUTH_ENV_VARS, OIDC_AUTH_ENV_MAPPING } from '../api-proxy-env-constants';
 import { NetworkConfig } from './squid-service';
 import { buildNoProxyEnv } from './no-proxy-utils';
 import { resolveOpenAiBaseUrlFromEnv } from '../openai-base-url-env';
+import { normalizeClaudeHostedWebPolicy } from '../claude-hosted-web-policy';
+import { normalizeCodexHostedWebPolicy } from '../codex-hosted-web-policy';
+import { resolveCopilotApiRouting } from '../copilot-api-resolver';
 
 const DEFAULT_API_PROXY_SHUTDOWN_TIMEOUT_MS = 8000;
 export const API_PROXY_UPSTREAM_CA_CERT_CONTAINER_PATH = '/usr/local/share/ca-certificates/awf-upstream-ca.crt';
+export const MODEL_ROUTING_NOT_STAGED_MESSAGE = 'Model routing was configured but the routing conversation was not staged';
 
 /**
  * Builds provider API target/basePath environment variables for the api-proxy container.
@@ -16,20 +21,36 @@ export const API_PROXY_UPSTREAM_CA_CERT_CONTAINER_PATH = '/usr/local/share/ca-ce
  * @internal Exported for testing
  */
 export function buildProviderTargetEnv(config: WrapperConfig): Record<string, string> {
+  const routingValue = (key: string): string | undefined =>
+    getConfigEnvValue(config, key) ?? (process.env[key]?.trim() || undefined);
   const openAiEndpointOverride = resolveOpenAiEndpointOverride(config);
   const secretOpenAiBaseUrl = resolveOpenAiBaseUrlFromEnv(config.openaiBaseUrlEnv);
-  const resolvedOpenAiTarget = secretOpenAiBaseUrl?.host ?? config.openaiApiTarget ?? openAiEndpointOverride;
-  const resolvedOpenAiBasePath = secretOpenAiBaseUrl
+  let resolvedOpenAiTarget = secretOpenAiBaseUrl?.url ?? config.openaiApiTarget
+    ?? routingValue(OPENAI_ENV.TARGET) ?? openAiEndpointOverride;
+  let resolvedOpenAiBasePath = secretOpenAiBaseUrl
     ? (secretOpenAiBaseUrl.basePath || undefined)
-    : config.openaiApiBasePath;
+    : config.openaiApiBasePath ?? routingValue(OPENAI_ENV.BASE_PATH);
   const copilotProviderType = config.copilotProviderType || getConfigEnvValue(config, COPILOT_ENV.PROVIDER_TYPE);
-  const copilotProviderBaseUrl = config.copilotProviderBaseUrl || getConfigEnvValue(config, COPILOT_ENV.PROVIDER_BASE_URL);
+  const copilotProviderBaseUrl = config.copilotProviderBaseUrl || routingValue(COPILOT_ENV.PROVIDER_BASE_URL);
+  if (copilotProviderType?.trim().toLowerCase() === 'azure') {
+    const azureRouting = resolveCopilotApiRouting({}, { COPILOT_PROVIDER_BASE_URL: copilotProviderBaseUrl });
+    resolvedOpenAiTarget ??= azureRouting.copilotApiTarget;
+    if (!secretOpenAiBaseUrl) resolvedOpenAiBasePath ||= azureRouting.copilotApiBasePath;
+  }
+  const copilotRouting = resolveCopilotApiRouting(
+    { copilotApiTarget: config.copilotApiTarget },
+    {
+      COPILOT_API_TARGET: routingValue(COPILOT_ENV.API_TARGET),
+      COPILOT_API_BASE_PATH: config.copilotApiBasePath ?? routingValue(COPILOT_ENV.API_BASE_PATH),
+      COPILOT_PROVIDER_BASE_URL: copilotProviderBaseUrl,
+    }
+  );
   const copilotProviderApiKey = config.copilotProviderApiKey;
 
   const env: Record<string, string> = {};
 
   const providers: Array<{ target?: string; basePath?: string; envTarget: string; envBasePath: string; stripTarget?: boolean }> = [
-    { target: config.copilotApiTarget, basePath: config.copilotApiBasePath, envTarget: COPILOT_ENV.API_TARGET, envBasePath: COPILOT_ENV.API_BASE_PATH, stripTarget: true },
+    { target: copilotRouting.copilotApiTarget, basePath: copilotRouting.copilotApiBasePath, envTarget: COPILOT_ENV.API_TARGET, envBasePath: COPILOT_ENV.API_BASE_PATH, stripTarget: true },
     { target: resolvedOpenAiTarget, basePath: resolvedOpenAiBasePath, envTarget: OPENAI_ENV.TARGET, envBasePath: OPENAI_ENV.BASE_PATH, stripTarget: true },
     { target: config.anthropicApiTarget, basePath: config.anthropicApiBasePath, envTarget: ANTHROPIC_ENV.TARGET, envBasePath: ANTHROPIC_ENV.BASE_PATH, stripTarget: true },
     { target: config.geminiApiTarget, basePath: config.geminiApiBasePath, envTarget: GEMINI_ENV.TARGET, envBasePath: GEMINI_ENV.BASE_PATH, stripTarget: true },
@@ -37,8 +58,10 @@ export function buildProviderTargetEnv(config: WrapperConfig): Record<string, st
   ];
 
   for (const { target, basePath, envTarget, envBasePath, stripTarget } of providers) {
-    if (target) env[envTarget] = stripTarget ? stripScheme(target) : target;
-    if (basePath) env[envBasePath] = basePath;
+    const effectiveTarget = target ?? routingValue(envTarget);
+    const effectiveBasePath = basePath ?? (secretOpenAiBaseUrl && envTarget === OPENAI_ENV.TARGET ? undefined : routingValue(envBasePath));
+    if (effectiveTarget) env[envTarget] = stripTarget ? normalizeApiTargetScheme(effectiveTarget) : effectiveTarget;
+    if (effectiveBasePath) env[envBasePath] = effectiveBasePath;
   }
   if (secretOpenAiBaseUrl) {
     env.AWF_SENSITIVE_OPENAI_TARGET = secretOpenAiBaseUrl.host;
@@ -66,6 +89,32 @@ export function buildProviderTargetEnv(config: WrapperConfig): Record<string, st
   }
 
   return env;
+}
+
+/** Uses the same effective routing values passed to the trusted sidecar. */
+export function resolveApiProxyUpstreams(config: WrapperConfig): Array<{ hostname: string; port: number }> {
+  const env = buildProviderTargetEnv(config);
+  const upstreams: Array<{ hostname: string; port: number }> = [];
+  for (const key of [COPILOT_ENV.API_TARGET, OPENAI_ENV.TARGET, ANTHROPIC_ENV.TARGET, GEMINI_ENV.TARGET, VERTEX_ENV.TARGET]) {
+    const target = env[key];
+    if (!target) continue;
+    let parsed: URL;
+    try {
+      parsed = new URL(target.includes('://') ? target : `https://${target}`);
+    } catch {
+      throw new Error('Invalid API proxy upstream target');
+    }
+    if (!['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password) {
+      throw new Error('Invalid API proxy upstream target');
+    }
+    // Raw-IP targets never receive a custom-port exception.
+    if (isIP(parsed.hostname.replace(/^\[|\]$/g, ''))) continue;
+    const port = Number(parsed.port || (parsed.protocol === 'http:' ? 80 : 443));
+    if (!upstreams.some(endpoint => endpoint.hostname === parsed.hostname && endpoint.port === port)) {
+      upstreams.push({ hostname: parsed.hostname, port });
+    }
+  }
+  return upstreams;
 }
 
 function resolveProviderSessionId(config: WrapperConfig): string | undefined {
@@ -119,10 +168,13 @@ function buildProviderRoutingEnv(config: WrapperConfig): Record<string, string> 
   const openAiEndpointOverride = resolveOpenAiEndpointOverride(config);
 
   return {
-    // Configurable API targets (for GHES/GHEC / custom endpoints)
-    // Strip any scheme prefix — server.js also normalizes defensively, but
-    // stripping here prevents a scheme-prefixed hostname from reaching the
-    // container at all (belt-and-suspenders for gh-aw#25137).
+    // Configurable API targets (for GHES/GHEC / custom endpoints).
+    // An explicit https:// scheme (or no scheme) is stripped to an authority,
+    // matching prior behavior; an explicit http:// scheme is preserved so the
+    // sidecar dials the target in cleartext. Non-default ports are preserved.
+    // server.js's
+    // normalizeApiTarget() re-validates and normalizes this defensively
+    // (gh-aw#25137), so any other scheme or malformed value is rejected there.
     ...buildProviderTargetEnv(config),
     // Forward GITHUB_SERVER_URL so api-proxy can auto-derive enterprise endpoints
     ...(process.env.GITHUB_SERVER_URL && { GITHUB_SERVER_URL: process.env.GITHUB_SERVER_URL }),
@@ -146,8 +198,11 @@ function buildProviderRoutingEnv(config: WrapperConfig): Record<string, string> 
     // run and differ between runs/attempts.
     ...(process.env.GITHUB_RUN_ID?.trim() && { GITHUB_RUN_ID: process.env.GITHUB_RUN_ID.trim() }),
     ...(process.env.GITHUB_RUN_ATTEMPT?.trim() && { GITHUB_RUN_ATTEMPT: process.env.GITHUB_RUN_ATTEMPT.trim() }),
-    // Do not forward GITHUB_COPILOT_INTEGRATION_ID — api-proxy defaults to
-    // 'agentic-workflows' which is the correct integration ID for AWF.
+    ...(process.env.GITHUB_REPOSITORY?.trim() && { GITHUB_REPOSITORY: process.env.GITHUB_REPOSITORY.trim() }),
+    ...(process.env.GITHUB_WORKFLOW_REF?.trim() && { GITHUB_WORKFLOW_REF: process.env.GITHUB_WORKFLOW_REF.trim() }),
+    ...(getConfigEnvValue(config, 'GITHUB_COPILOT_INTEGRATION_ID') && {
+      GITHUB_COPILOT_INTEGRATION_ID: getConfigEnvValue(config, 'GITHUB_COPILOT_INTEGRATION_ID')!,
+    }),
     // Note: AWF_VERSION is intentionally NOT forwarded here. It is baked into the api-proxy
     // container image at release build time (via --build-arg AWF_VERSION=...), so the
     // token-usage.jsonl _schema field reflects the api-proxy image version rather than
@@ -201,7 +256,7 @@ function buildOtelEnv(): Record<string, string> {
 
 /**
  * Builds rate limiting and token guard environment variables.
- * Controls request rates, effective token budgets, run limits, and agent timeout.
+ * Controls request rates, AI-credit budgets, run limits, and agent timeout.
  */
 function buildRateLimitEnv(config: WrapperConfig): Record<string, string> {
   return {
@@ -212,9 +267,6 @@ function buildRateLimitEnv(config: WrapperConfig): Record<string, string> {
       AWF_RATE_LIMIT_RPH: String(config.rateLimitConfig.rph),
       AWF_RATE_LIMIT_BYTES_PM: String(config.rateLimitConfig.bytesPm),
     }),
-    ...(config.maxEffectiveTokens !== undefined && {
-      AWF_MAX_EFFECTIVE_TOKENS: String(config.maxEffectiveTokens),
-    }),
     ...(config.maxAiCredits !== undefined && {
       AWF_MAX_AI_CREDITS: String(config.maxAiCredits),
     }),
@@ -224,11 +276,19 @@ function buildRateLimitEnv(config: WrapperConfig): Record<string, string> {
     ...(config.apiProxyProviders && {
       AWF_API_PROXY_PROVIDERS: JSON.stringify(config.apiProxyProviders),
     }),
-    ...(config.effectiveTokenModelMultipliers && {
-      AWF_EFFECTIVE_TOKEN_MODEL_MULTIPLIERS: JSON.stringify(config.effectiveTokenModelMultipliers),
+    ...(config.modelPricingCatalog && {
+      AWF_MODEL_PRICING_CATALOG: JSON.stringify(config.modelPricingCatalog),
     }),
-    ...(config.effectiveTokenDefaultModelMultiplier !== undefined && {
-      AWF_EFFECTIVE_TOKEN_DEFAULT_MODEL_MULTIPLIER: String(config.effectiveTokenDefaultModelMultiplier),
+    ...(config.modelCatalogue && {
+      AWF_MODEL_CATALOGUE: JSON.stringify(config.modelCatalogue),
+    }),
+    ...(config.modelMultipliers && {
+      AWF_MODEL_MULTIPLIERS: JSON.stringify(config.modelMultipliers),
+      AWF_EFFECTIVE_TOKEN_MODEL_MULTIPLIERS: JSON.stringify(config.modelMultipliers),
+    }),
+    ...(config.defaultModelMultiplier !== undefined && {
+      AWF_DEFAULT_MODEL_MULTIPLIER: String(config.defaultModelMultiplier),
+      AWF_EFFECTIVE_TOKEN_DEFAULT_MODEL_MULTIPLIER: String(config.defaultModelMultiplier),
     }),
     ...(config.maxModelMultiplierCap !== undefined && {
       AWF_MAX_MODEL_MULTIPLIER: String(config.maxModelMultiplierCap),
@@ -244,6 +304,7 @@ function buildRateLimitEnv(config: WrapperConfig): Record<string, string> {
     }),
     ...(config.agentTimeout !== undefined && {
       AWF_AGENT_TIMEOUT_MINUTES: String(config.agentTimeout),
+      AWF_AGENT_RUNTIME_START_FILE: '/var/log/api-proxy/agent-runtime/started-at-ms',
     }),
   };
 }
@@ -253,6 +314,11 @@ function buildRateLimitEnv(config: WrapperConfig): Record<string, string> {
  * Anthropic prompt-cache optimizations, token steering, and diagnostic logging.
  */
 function buildModelPolicyEnv(config: WrapperConfig): Record<string, string> {
+  // Normalization throws on an invalid policy, which aborts the run before any
+  // container starts rather than surfacing on the first Anthropic request.
+  const claudeHostedWebPolicy = normalizeClaudeHostedWebPolicy(config.claudeHostedWeb);
+  const codexHostedWebPolicy = normalizeCodexHostedWebPolicy(config.codexHostedWeb);
+
   return {
     // Model alias configuration
     ...(config.modelAliases && {
@@ -261,12 +327,23 @@ function buildModelPolicyEnv(config: WrapperConfig): Record<string, string> {
     ...(config.modelFallback && {
       AWF_MODEL_FALLBACK: JSON.stringify(config.modelFallback),
     }),
+    ...(config.fallbackModels && config.fallbackModels.length > 0 && {
+      AWF_FALLBACK_MODELS: JSON.stringify(config.fallbackModels),
+    }),
     // Model policy (allowed/disallowed)
-    ...(config.allowedModels && config.allowedModels.length > 0 && {
+    ...(config.allowedModels !== undefined && {
       AWF_ALLOWED_MODELS: JSON.stringify(config.allowedModels),
     }),
     ...(config.disallowedModels && config.disallowedModels.length > 0 && {
       AWF_DISALLOWED_MODELS: JSON.stringify(config.disallowedModels),
+    }),
+    // Claude hosted web search/fetch policy (validated on the host; the sidecar
+    // re-parses it at startup and fails closed if it is not a valid policy).
+    ...(claudeHostedWebPolicy && {
+      AWF_CLAUDE_HOSTED_WEB_POLICY: JSON.stringify(claudeHostedWebPolicy),
+    }),
+    ...(codexHostedWebPolicy && {
+      AWF_CODEX_HOSTED_WEB_POLICY: JSON.stringify(codexHostedWebPolicy),
     }),
     // Anthropic prompt-cache optimizations
     ...(config.anthropicAutoCache && {
@@ -285,6 +362,21 @@ function buildModelPolicyEnv(config: WrapperConfig): Record<string, string> {
       }),
     ...(config.maxCapturedBytes !== undefined && {
       AWF_MAX_BLOCKED_CAPTURE_BYTES: String(config.maxCapturedBytes),
+    }),
+  };
+}
+
+function buildModelRoutingEnv(config: WrapperConfig): Record<string, string> {
+  if (config.experimentalModelRouting !== true || !config.modelRouting) return {};
+  if (!config.modelRoutingBootstrap) {
+    throw new Error(MODEL_ROUTING_NOT_STAGED_MESSAGE);
+  }
+  return {
+    AWF_ROUTING_CONFIG: JSON.stringify({
+      ...config.modelRouting,
+      task: {
+        conversationFile: config.modelRoutingBootstrap.containerInputFile,
+      },
     }),
   };
 }
@@ -314,6 +406,14 @@ function buildOidcEnv(config: WrapperConfig): Record<string, string> {
       'AWF_ANTHROPIC_DROP_TOOLS',
       'AWF_ANTHROPIC_STRIP_ANSI',
     ),
+    // OIDC auth values supplied via --env/--env-file (or --env-all) must reach the
+    // sidecar too: agent-side routing helpers (e.g. isGcpOidcConfigured) resolve
+    // these same values, so forwarding keeps routing and credentials consistent.
+    ...Object.fromEntries(
+      [...OIDC_AUTH_ENV_VARS, 'AWF_AUTH_ANTHROPIC_TOKEN_URL']
+        .map((envVar) => [envVar, getConfigEnvValue(config, envVar)])
+        .filter(([, value]) => !!value)
+    ),
     // Custom auth header names for internal AI gateways
     ...(config.openaiApiAuthHeader && { [OPENAI_ENV.AUTH_HEADER]: config.openaiApiAuthHeader }),
     ...(config.anthropicApiAuthHeader && { [ANTHROPIC_ENV.AUTH_HEADER]: config.anthropicApiAuthHeader }),
@@ -341,6 +441,7 @@ export function buildApiProxyBaseEnv(config: WrapperConfig, networkConfig: Netwo
     ...buildOtelEnv(),
     ...buildRateLimitEnv(config),
     ...buildModelPolicyEnv(config),
+    ...buildModelRoutingEnv(config),
     ...buildOidcEnv(config),
   };
 }
@@ -354,6 +455,7 @@ export const testHelpers = {
   buildOtelEnv,
   buildRateLimitEnv,
   buildModelPolicyEnv,
+  buildModelRoutingEnv,
   buildOidcEnv,
   resolveApiProxyShutdownTimeoutMs,
 };

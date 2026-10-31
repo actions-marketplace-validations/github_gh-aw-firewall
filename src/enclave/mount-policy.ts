@@ -6,6 +6,12 @@ import type { WrapperConfig } from '../types';
 import { applyHostPathPrefixToVolumes } from '../services/host-path-prefix';
 import { resolveDockerSocketPath } from '../services/agent-volumes/docker-socket';
 import type { EnclavePaths } from './paths';
+import { markHostPreflightError } from '../cloud-hypervisor/host-preflight-progress';
+import type { CloudHypervisorDirectoryExport } from '../cloud-hypervisor/exports';
+import { resolveEnclavePaths } from './paths';
+import { HOST_EXECUTOR_STORAGE_ROOT } from './host-executor-journal';
+import { ENCLAVE_DEBUG_ARTIFACT_ROOT } from './public-debug';
+import { RESOLVED_CONFIG_PUBLICATION_ROOT } from '../resolved-config-artifact';
 
 interface VisiblePath {
   label: string;
@@ -19,7 +25,7 @@ interface VisiblePath {
  */
 export function resolvePathThroughExistingAncestor(candidate: string): string {
   if (!path.isAbsolute(candidate)) {
-    throw new Error(`Enclave mount policy requires an absolute path: ${candidate}`);
+    throw markHostPreflightError(new Error(`Enclave mount policy requires an absolute path: ${candidate}`), 'path-not-absolute');
   }
 
   const missing: string[] = [];
@@ -37,8 +43,10 @@ export function resolvePathThroughExistingAncestor(candidate: string): string {
 function pathsOverlap(left: string, right: string): boolean {
   const relativeLeft = path.relative(left, right);
   const relativeRight = path.relative(right, left);
-  const leftContainsRight = relativeLeft === '' || (!relativeLeft.startsWith('..') && !path.isAbsolute(relativeLeft));
-  const rightContainsLeft = relativeRight === '' || (!relativeRight.startsWith('..') && !path.isAbsolute(relativeRight));
+  const leftContainsRight = relativeLeft === '' ||
+    (relativeLeft !== '..' && !relativeLeft.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeLeft));
+  const rightContainsLeft = relativeRight === '' ||
+    (relativeRight !== '..' && !relativeRight.startsWith(`..${path.sep}`) && !path.isAbsolute(relativeRight));
   return leftContainsRight || rightContainsLeft;
 }
 
@@ -53,7 +61,7 @@ function daemonVisiblePath(source: string, prefix: string | undefined): string {
 }
 
 /**
- * Returns the first custom bind that exposes the Docker socket (or a parent
+ * Returns the first effective bind that exposes the Docker socket (or a parent
  * directory containing it) to the primary agent.
  */
 export function findDockerSocketExposingMount(config: WrapperConfig): string | undefined {
@@ -66,30 +74,67 @@ export function findDockerSocketExposingMount(config: WrapperConfig): string | u
     hostLiteral: path.resolve(socketPath),
     hostResolved: resolvePathThroughExistingAncestor(socketPath),
     daemonLiteral: path.resolve(daemonVisiblePath(socketPath, config.dockerHostPathPrefix)),
-    daemonResolved: resolvePathThroughExistingAncestor(
-      daemonVisiblePath(socketPath, config.dockerHostPathPrefix),
-    ),
+    daemonResolved: resolvePathThroughExistingAncestor(daemonVisiblePath(socketPath, config.dockerHostPathPrefix)),
   }));
-  for (const volume of config.volumeMounts ?? []) {
-    const source = mountSource(volume);
-    if (!source) continue;
+  const mounts: Array<{ label: string; source: string; target: string; result: string }> = [
+    ...collectAgentVisiblePaths(config, process.env, process.cwd())
+      .filter(({ label }) => !label.startsWith('custom volume '))
+      .map(({ label, source }) => ({
+        label,
+        source,
+        target: source,
+        result: label,
+      })),
+    ...(config.volumeMounts ?? []).flatMap((volume) => {
+      const [source, target] = volume.split(':');
+      return source && target && path.isAbsolute(source) && path.isAbsolute(target)
+        ? [{
+          label: `custom volume ${volume}`,
+          source,
+          target: target.startsWith('/host/') ? target : `/host${target}`,
+          result: volume,
+        }]
+        : [];
+    }),
+  ];
+
+  const isMaskedSocket = (source: string, target: string, socketPath: string): boolean => {
+    const relativeSocket = path.relative(source, socketPath);
+    if (
+      relativeSocket === '..'
+      || relativeSocket.startsWith(`..${path.sep}`)
+      || path.isAbsolute(relativeSocket)
+    ) return false;
+    const exposedPath = path.posix.join(
+      target.startsWith('/host/') ? target : `/host${target}`,
+      relativeSocket,
+    );
+    return exposedPath === '/host/var/run/docker.sock' || exposedPath === '/host/run/docker.sock';
+  };
+
+  for (const mount of mounts) {
+    const source = mount.source;
+    if (!path.isAbsolute(source)) continue;
     const literalSource = path.resolve(source);
     const resolvedSource = resolvePathThroughExistingAncestor(source);
-    const literalDaemonSource = path.resolve(
-      daemonVisiblePath(source, config.dockerHostPathPrefix),
-    );
-    const daemonSource = resolvePathThroughExistingAncestor(
-      daemonVisiblePath(source, config.dockerHostPathPrefix),
-    );
-    if (sockets.some(
-      (socket) => pathsOverlap(literalSource, socket.hostLiteral)
-        || pathsOverlap(resolvedSource, socket.hostResolved)
-        || pathsOverlap(literalDaemonSource, socket.daemonLiteral)
-        || pathsOverlap(daemonSource, socket.daemonResolved),
-    )) {
-      return volume;
+    const literalDaemonSource = path.resolve(daemonVisiblePath(source, config.dockerHostPathPrefix));
+    const daemonSource = resolvePathThroughExistingAncestor(daemonVisiblePath(source, config.dockerHostPathPrefix));
+    for (const socket of sockets) {
+      const candidates = [
+        { source: literalSource, socket: socket.hostLiteral },
+        { source: resolvedSource, socket: socket.hostResolved },
+        { source: literalDaemonSource, socket: socket.daemonLiteral },
+        { source: daemonSource, socket: socket.daemonResolved },
+      ];
+      if (candidates.some(({ source: candidateSource, socket: candidateSocket }) =>
+        pathsOverlap(candidateSource, candidateSocket) &&
+        !isMaskedSocket(candidateSource, mount.target, candidateSocket)
+      )) {
+        return mount.result;
+      }
     }
   }
+
   return undefined;
 }
 
@@ -112,6 +157,9 @@ function collectAgentVisiblePaths(
     { label: 'sbx system tools', source: '/usr/local/bin' },
     { label: 'Compose chroot home', source: `${config.workDir}-chroot-home` },
     { label: 'AWF work directory', source: config.workDir },
+    ...(config.containerWorkDir && path.isAbsolute(config.containerWorkDir)
+      ? [{ label: 'container working directory', source: config.containerWorkDir }]
+      : []),
     ...[...systemDirectories(false), ...systemDirectories(true)].map((source) => ({
       label: 'Compose system mount',
       source,
@@ -143,7 +191,7 @@ function collectAgentVisiblePaths(
   for (const volume of config.volumeMounts ?? []) {
     const source = mountSource(volume);
     if (!source) {
-      throw new Error(`Enclave mount policy could not parse custom bind mount: ${volume}`);
+      throw markHostPreflightError(new Error(`Enclave mount policy could not parse custom bind mount: ${volume}`), 'mount-source-invalid');
     }
     visible.push({ label: `custom volume ${volume}`, source });
   }
@@ -160,33 +208,64 @@ function collectAgentVisiblePaths(
  */
 export function assertPrivateRootIsolated(
   config: WrapperConfig,
-  roots: Pick<EnclavePaths, 'root' | 'ingressRoot'>,
+  roots: Pick<EnclavePaths, 'root'> & Partial<Pick<EnclavePaths, 'ingressRoot'>>,
   env: NodeJS.ProcessEnv = process.env,
   cwd = process.cwd(),
   label = 'enclave',
 ): void {
   const privateRoot = resolvePathThroughExistingAncestor(roots.root);
+  const privateLiteralRoot = path.resolve(roots.root);
   const privateDaemonRoot = resolvePathThroughExistingAncestor(
     daemonVisiblePath(roots.root, config.dockerHostPathPrefix),
   );
+  const privateLiteralDaemonRoot = path.resolve(daemonVisiblePath(roots.root, config.dockerHostPathPrefix));
   const visiblePaths = [
     ...collectAgentVisiblePaths(config, env, cwd),
-    { label: `${label} ingress`, source: roots.ingressRoot },
+    ...(roots.ingressRoot ? [{ label: `${label} ingress`, source: roots.ingressRoot }] : []),
   ];
 
   for (const visible of visiblePaths) {
+    const literalVisible = path.resolve(visible.source);
     const resolvedVisible = resolvePathThroughExistingAncestor(visible.source);
+    const literalDaemonVisible = path.resolve(daemonVisiblePath(visible.source, config.dockerHostPathPrefix));
     const resolvedDaemonVisible = resolvePathThroughExistingAncestor(
       daemonVisiblePath(visible.source, config.dockerHostPathPrefix),
     );
     if (
-      pathsOverlap(privateRoot, resolvedVisible)
+      pathsOverlap(privateLiteralRoot, literalVisible)
+      || pathsOverlap(privateRoot, resolvedVisible)
+      || pathsOverlap(privateLiteralDaemonRoot, literalDaemonVisible)
       || pathsOverlap(privateDaemonRoot, resolvedDaemonVisible)
     ) {
-      throw new Error(
+      throw markHostPreflightError(new Error(
         `Unsafe ${label} private root "${roots.root}" overlaps agent-visible ${visible.label} ` +
         `"${visible.source}" after path and symlink resolution`,
+      ), 'private-root-overlap');
+    }
+  }
+}
+
+export function assertPersistentDebugArtifactsIsolated(
+  config: WrapperConfig,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd = process.cwd(),
+): void {
+  for (const root of [ENCLAVE_DEBUG_ARTIFACT_ROOT, RESOLVED_CONFIG_PUBLICATION_ROOT]) {
+    const debugRoot = resolvePathThroughExistingAncestor(root);
+    const daemonDebugRoot = resolvePathThroughExistingAncestor(
+      daemonVisiblePath(root, config.dockerHostPathPrefix),
+    );
+    for (const visible of collectAgentVisiblePaths(config, env, cwd)) {
+      const source = resolvePathThroughExistingAncestor(visible.source);
+      const daemonSource = resolvePathThroughExistingAncestor(
+        daemonVisiblePath(visible.source, config.dockerHostPathPrefix),
       );
+      if (pathsOverlap(debugRoot, source) || pathsOverlap(daemonDebugRoot, daemonSource)) {
+        throw markHostPreflightError(new Error(
+          `Unsafe persistent debug artifact root "${root}" overlaps agent-visible ` +
+          `${visible.label} "${visible.source}" after path and symlink resolution`,
+        ), 'private-root-overlap');
+      }
     }
   }
 }
@@ -202,6 +281,65 @@ export function assertEnclavePrivateRootIsolated(
   cwd = process.cwd(),
 ): void {
   assertPrivateRootIsolated(config, paths, env, cwd, 'enclave');
+}
+
+export function assertPrivateCommandOutputRootIsolated(
+  config: WrapperConfig,
+  root: string,
+  env: NodeJS.ProcessEnv = process.env,
+  cwd = process.cwd(),
+): void {
+  assertPrivateRootIsolated(config, { root }, env, cwd, 'protected command output');
+  const resolvedRoot = resolvePathThroughExistingAncestor(root);
+  const managedDirectories = [
+    { label: 'AWF debug artifacts', source: ENCLAVE_DEBUG_ARTIFACT_ROOT },
+    { label: 'resolved config publication', source: RESOLVED_CONFIG_PUBLICATION_ROOT },
+    { label: 'host executor storage', source: HOST_EXECUTOR_STORAGE_ROOT },
+    { label: 'audit directory', source: config.auditDir },
+    { label: 'proxy logs directory', source: config.proxyLogsDir },
+    { label: 'token log directory', source: config.tokenLogDir },
+  ];
+  for (const managed of managedDirectories) {
+    if (!managed.source) continue;
+    const resolvedManaged = resolvePathThroughExistingAncestor(path.resolve(managed.source));
+    if (pathsOverlap(resolvedRoot, resolvedManaged)) {
+      throw markHostPreflightError(new Error(
+        `Unsafe protected command output root "${root}" overlaps AWF-managed ${managed.label} ` +
+        `"${managed.source}"`,
+      ), 'private-root-overlap');
+    }
+  }
+}
+
+/**
+ * Check actual virtio-fs sources, including RUNNER_TEMP/AGENT_TOOLSDIRECTORY
+ * and aliases that the Compose-oriented visible-path union cannot describe.
+ * Read-only exports still disclose private state and must also be rejected.
+ */
+export function assertCloudHypervisorEnclaveExportsIsolated(
+  config: WrapperConfig,
+  directoryExports: readonly CloudHypervisorDirectoryExport[],
+): void {
+  const privateRoots = [ENCLAVE_DEBUG_ARTIFACT_ROOT, RESOLVED_CONFIG_PUBLICATION_ROOT];
+  if (config.enclaves?.enabled) {
+    const paths = resolveEnclavePaths(config.workDir);
+    privateRoots.push(
+      paths.root,
+      paths.ingressRoot,
+      paths.hostExecutorJournalDir,
+      path.join(path.dirname(paths.hostExecutorJournalDir), 'host-invocations'),
+      HOST_EXECUTOR_STORAGE_ROOT,
+    );
+  }
+  const resolvedPrivateRoots = privateRoots.map(resolvePathThroughExistingAncestor);
+  for (const entry of directoryExports) {
+    const source = resolvePathThroughExistingAncestor(entry.source);
+    if (resolvedPrivateRoots.some((root) => pathsOverlap(root, source))) {
+      throw new Error(
+        `Cloud Hypervisor export "${entry.tag}" overlaps enclave private or recovery state`,
+      );
+    }
+  }
 }
 
 /** @internal Exported for focused adversarial tests. */

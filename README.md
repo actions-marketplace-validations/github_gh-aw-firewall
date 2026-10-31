@@ -14,7 +14,7 @@ A network firewall for agentic workflows that restricts outbound HTTP/HTTPS to a
 
 - **Squid proxy** — filters outbound traffic by domain allowlist
 - **Agent** — runs your command; all HTTP/HTTPS is routed through Squid
-- **API proxy sidecar** *(optional)* — holds LLM API keys so they never reach the agent process
+- **API proxy sidecar** *(always enabled)* — holds LLM API keys so they never reach the agent process
 
 ## Requirements
 
@@ -27,9 +27,25 @@ See [Compatibility](docs/compatibility.md) for full details on supported version
 ## Get started fast
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/github/gh-aw-firewall/main/install.sh | sudo bash
 sudo awf --allow-domains github.com -- curl https://api.github.com
 ```
+
+For CI, prefer the [setup action](docs/github_actions.md) pinned to a reviewed
+commit. For local installation, first obtain and review `install.sh` through an
+independently authenticated channel. The installer requires a trusted `gh` CLI
+with GitHub authentication; because `sudo` normally changes `HOME` and drops
+tokens, pass the token explicitly:
+
+```bash
+gh auth status
+export GH_TOKEN="$(gh auth token)"
+sudo --preserve-env=GH_TOKEN bash ./install.sh
+unset GH_TOKEN
+```
+
+Do not pipe an unauthenticated download into `sudo bash`. See
+[release security](docs/releasing.md#initial-trust-is-a-prerequisite-not-something-the-installer-can-create)
+for the initial trust requirements.
 
 The `--` separator divides firewall options from the command to run.
 
@@ -41,8 +57,10 @@ use `awf --reflect`. It prints the `/reflect` JSON response to stdout.
 - **Declarative config support**: `--config <path>` with JSON/YAML + published JSON Schema
 - **Domain and URL controls**: allow/deny domain rules, SSL Bump (`--ssl-bump`), and URL patterns (`--allow-urls`, requires `--ssl-bump`)
 - **Data protection controls**: DLP scanning (`--enable-dlp`), DNS-over-HTTPS, and agent runtime limits (`--agent-timeout`)
-- **API proxy capabilities**: OpenAI, Anthropic, Copilot, and Gemini targets with rate limits, token steering, and Anthropic auto-cache
+- **API proxy capabilities**: OpenAI, Anthropic, Copilot, Gemini, and Google Vertex AI targets with rate limits, token steering, Anthropic auto-cache, and `apiProxy.hostedWeb.{claude,codex}` domain policies
+- **Unified enclaves**: isolated script and agent execution with cost control via `--max-num-tool-calls`, repository seeding, and dynamic admission
 - **Infrastructure flexibility**: upstream proxy chaining, host service access, Docker-in-Docker, custom mounts, memory limits, and TTY mode
+- **Protected output capture**: opt-in, host-only command stdout/stderr capture with attempt and completeness metadata
 - **Operational tooling**: pre-download images and inspect logs/stats/summaries/audits from live or saved runs
 
 ## CLI subcommands
@@ -83,24 +101,31 @@ See [GitHub Actions](docs/github_actions.md) for advanced setup and `awf logs su
 - [API proxy sidecar](docs/api-proxy-sidecar.md) — secure credential management for LLM APIs
 - [Authentication architecture](docs/authentication-architecture.md) — deep dive into token handling and credential isolation
 - [Authentication matrix](docs/auth-matrix.md) — supported static, BYOK, and OIDC provider combinations
+- [Protected command output capture](docs/protected-command-output.md) — isolated raw stdout/stderr capture and completion metadata
 - [SSL Bump](docs/ssl-bump.md) — HTTPS content inspection for URL path filtering
 - [GitHub Actions](docs/github_actions.md) — CI/CD integration and MCP server setup
 - [Environment variables](docs/environment.md) — passing environment variables to containers
 - [Logging quick reference](docs/logging_quickref.md) and [Squid log filtering](docs/squid_log_filtering.md) — view and filter traffic
 - [Security model](docs/security.md) — what the firewall protects and how
+- [Emergency CA distrust](docs/security-ca-trust.md) — compromised CA mitigations, rollout, and runtime trust boundaries
 - [Architecture](docs/architecture.md) — how Squid, Docker, and iptables fit together
+- [Filesystem Sharing Contract](docs/filesystem-sharing-contract.md) — component identities, host permissions, generated access inventory, and runtime verification
 - [Compatibility](docs/compatibility.md) — supported Node.js, OS, and Docker versions
 - [Troubleshooting](docs/troubleshooting.md) — common issues and fixes
 - [Diagnosing AWF failures](docs/diagnosing-awf-failures.md) — use the Self-Hosted Runner Doctor agent to triage self-hosted/ARC/GHES/GHEC failures
+- [Diagnosis registry](docs/diagnostics/README.md) — canonical, machine-readable AWF diagnosis findings and the `diagnose-awf` agent entry point
 - [Auth Doctor Updater workflow](.github/workflows/auth-doctor-updater.md) — daily/manual audit that opens bounded PRs with evidence-backed authentication and API-proxy documentation corrections
 - [Image verification](docs/image-verification.md) — cosign signature verification
-- [Cloud Hypervisor integration (preview)](docs/cloud-hypervisor-foundation.md) — Cloud Hypervisor v53.0 microVM backend: explicit opt-in, GitHub-hosted Ubuntu x86_64 KVM runners only, operator-managed artifacts with mandatory SHA-256 digests, Landlock/seccomp-confined launcher in place of a jailer, fail-closed egress, mandatory API proxy credential isolation
+- [Cloud Hypervisor integration (preview)](docs/cloud-hypervisor-foundation.md) — Cloud Hypervisor v53.0 microVM backend: explicit opt-in, GitHub-hosted Ubuntu x86_64 KVM runners only, release-pinned GitHub-attested artifact manifests, Landlock/seccomp-confined launcher in place of a jailer, fail-closed egress, mandatory API proxy credential isolation
+- [NVX integration (preview)](docs/nvx-security-design.md) — NVX/OpenVMM one-shot microVM backend: explicit `--container-runtime nvx --nvx-preview` opt-in, Linux x86_64 KVM-only, disabled by default, never falls back to another runtime, release-pinned GitHub-attested artifact manifests, deny-by-default guest networking, credential-isolated Copilot inference via the API proxy
 
 ## Development
 
 - Install dependencies: `npm install`
 - Run tests: `npm test`
 - Build: `npm run build`
+
+The [model-routing smoke workflow](.github/workflows/test-model-routing.yml) builds the router from `containers/router` and the API proxy from `containers/api-proxy`, and runs live routed inference through AWF with both. Its planning smoke also checks the router against a digest-pinned released API-proxy image.
 
 ## Contributing
 

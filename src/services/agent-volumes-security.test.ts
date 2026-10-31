@@ -1,4 +1,5 @@
-import { generateDockerCompose, mockNetworkConfig, useAgentVolumesTestConfig } from './service-test-setup.test-utils';
+import { generateDockerCompose, mockNetworkConfig, useAgentVolumesTestConfig, withEnv } from './service-test-setup.test-utils';
+import { dockerSensitiveTmpfs } from '../sensitive-paths';
 import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
@@ -11,6 +12,28 @@ jest.mock('execa', () => require('../test-helpers/mock-execa.test-utils').execaM
 const { getConfig } = useAgentVolumesTestConfig();
 
 describe('agent service', () => {
+  it('masks GitLab credentials exposed through custom binds without duplicate mount targets', () => {
+    const configDir = path.join(getConfig().workDir, 'gitlab-auth');
+    fs.mkdirSync(configDir);
+    fs.writeFileSync(path.join(configDir, 'config.yml'), 'DUMMY_GITLAB_TOKEN');
+    fs.writeFileSync(path.join(configDir, 'aliases.yml'), 'benign-alias');
+    withEnv({ GLAB_CONFIG_DIR: configDir }, () => {
+      const config = {
+        ...getConfig(),
+        volumeMounts: [
+          `${configDir}:/host/gitlab-auth:ro`,
+          `${configDir}/config.yml:/host/gitlab-token.yml:ro`,
+        ],
+      };
+      const volumes = generateDockerCompose(config, mockNetworkConfig).services.agent.volumes as string[];
+      expect(volumes).toContain('/dev/null:/host/gitlab-auth/config.yml:ro');
+      expect(volumes).toContain('/dev/null:/host/gitlab-token.yml:ro');
+      expect(volumes).toContain(`${configDir}:/host/gitlab-auth:ro`);
+      expect(volumes.filter((spec) => spec.split(':')[1] === '/host/gitlab-token.yml')).toHaveLength(1);
+      expect(volumes.some((spec) => spec.startsWith('/dev/null:') && spec.includes('aliases.yml'))).toBe(false);
+    });
+  });
+
   it('should use selective mounts when no custom mounts specified', () => {
     const result = generateDockerCompose(getConfig(), mockNetworkConfig);
     const agent = result.services.agent;
@@ -95,18 +118,13 @@ describe('agent service', () => {
       }
     });
 
-    it('should include exactly 5 tmpfs mounts (mcp-logs + workDir both normal and /host, plus /host/dev/shm)', () => {
+    it('should include registry overlays and the writable /host/dev/shm mount', () => {
       const result = generateDockerCompose(getConfig(), mockNetworkConfig);
       const agent = result.services.agent;
       const tmpfs = agent.tmpfs as string[];
 
-      expect(tmpfs).toHaveLength(5);
-      // Normal paths
-      expect(tmpfs.some((t: string) => t.includes('/tmp/gh-aw/mcp-logs:'))).toBe(true);
-      expect(tmpfs.some((t: string) => t.startsWith(`${getConfig().workDir}:`))).toBe(true);
-      // /host-prefixed paths (chroot always on)
-      expect(tmpfs.some((t: string) => t.includes('/host/tmp/gh-aw/mcp-logs:'))).toBe(true);
-      expect(tmpfs.some((t: string) => t.startsWith(`/host${getConfig().workDir}:`))).toBe(true);
+      expect(tmpfs).toHaveLength(dockerSensitiveTmpfs(getConfig().workDir).length + 1);
+      expect(tmpfs).toEqual(expect.arrayContaining(dockerSensitiveTmpfs(getConfig().workDir)));
       // Writable /dev/shm for POSIX semaphores (chroot makes /host/dev read-only)
       expect(tmpfs.some((t: string) => t.startsWith('/host/dev/shm:'))).toBe(true);
     });

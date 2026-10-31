@@ -1,5 +1,10 @@
 # Troubleshooting
 
+> **Diagnosing a specific failure?** Start at the canonical diagnosis registry in
+> [`docs/diagnostics/README.md`](diagnostics/README.md), or load the
+> [`diagnose-awf`](../.github/skills/diagnose-awf/SKILL.md) skill. This guide remains the broad
+> troubleshooting reference.
+
 ## Domain Access Issues
 
 ### Domain is Blocked
@@ -20,6 +25,97 @@
    ```bash
    sudo grep "TCP_DENIED" /tmp/squid-logs-<timestamp>/access.log
    ```
+
+### Copilot Web Tools Unavailable in API Proxy Mode
+
+**Problem:** With `engine: copilot`, `tools: web-fetch:` or `tools: web-search:`
+compiles successfully, but Copilot never exposes `web_fetch` or `web_search`.
+Squid sees no requests to the expected domains, even when they are allowlisted.
+
+**Cause:** AWF's Copilot API proxy flow sets `COPILOT_OFFLINE=true` and points
+`COPILOT_PROVIDER_BASE_URL` at the sidecar (by default, `http://172.30.0.30:10002`).
+Offline mode skips GitHub authentication, keeping real credentials exclusively in
+the sidecar, but Copilot CLI also disables its native web tools. `--allow-tool
+web_fetch` / `--allow-tool web_search` cannot enable tools absent from the catalog.
+AWF warns about this limitation when Copilot sidecar routing is active and the
+agent domain allowlist is non-empty.
+
+**Workaround:** Ask the agent to fetch content using `curl` from bash instead.
+Allow both the shell tool and the destination URL in Copilot CLI, as well as the
+domain in AWF. In a gh-aw workflow, use:
+
+```yaml
+engine:
+  id: copilot
+  args: ["--allow-url", "osv.dev"]
+network:
+  allowed: ["osv.dev"]
+tools:
+  bash: ["curl"]
+```
+
+Prompt the agent to run `curl --fail --location https://osv.dev/`. Merge these
+settings with the workflow's existing tools and network allowlist, and allow any
+redirect destinations that are needed. Under `--no-ask-user`, shell permission
+alone is insufficient: without URL permission, Copilot reports
+`Permission denied and could not request permission from user`.
+
+Alternatively, use `engine.args: ["--allow-all-urls"]` to approve URLs at the
+Copilot CLI layer. Neither `--allow-url` nor `--allow-all-urls` bypasses AWF:
+Squid still enforces `network.allowed` (or `--allow-domains` for direct AWF use).
+This workaround fetches known URLs; it does not restore native web search.
+Do not disable offline mode or expose real credentials to the agent to work
+around this limitation.
+
+Compiler-side warning or an MCP fetch fallback is tracked in
+[github/gh-aw#65043](https://github.com/github/gh-aw/issues/65043).
+AWF receives the command and domain allowlist, not gh-aw's `tools` declarations,
+so its startup warning cannot identify which native web tools were requested.
+
+### Copilot BYOK Sub-Agent Model/API Mismatch
+
+**Problem:** Copilot CLI sub-agents using a model from a different wire-API family
+than the session's main model can fail with an upstream `400` response. For
+example, GPT-5 models use the Responses API, while Claude models use Chat
+Completions. BYOK configures one wire API for the Copilot CLI session, including
+requests made by sub-agents.
+
+**Workaround:** Use sub-agent models that use the same wire API as the main model.
+With model routing, each sub-agent model must also match the wire API of every
+model that can be selected for the main session. AWF preserves an explicitly
+configured `COPILOT_PROVIDER_WIRE_API`; otherwise it selects the Responses API
+when `COPILOT_MODEL` is a GPT-5-family or o3 model.
+
+Copilot CLI does not currently expose per-model BYOK wire-API configuration
+through its provider environment variables. Compile-time warnings and guidance
+in gh-aw's sub-agent reference need to be implemented in the
+[github/gh-aw](https://github.com/github/gh-aw) repository.
+
+### Claude/Codex Inline Sub-Agent Model Resolution Fails
+
+**Problem:** A gh-aw workflow refuses to start Claude or Codex because a declared
+inline sub-agent model cannot be resolved or verified.
+
+**Cause:** The gh-aw harness resolves sub-agent aliases before starting the engine,
+within the engine's provisioned provider scope. A model advertised by another
+provider is not sufficient: it must be available through the configured AWF
+`/reflect` endpoints and support the engine's required wire API. An alias does not
+make an incompatible model portable between engines.
+
+**Solution:** Inspect the harness startup diagnostics and `model.resolution`
+records for the affected agent name, configured model, resolved model and failure
+cause. Verify the same run's `/reflect` provider inventory and endpoint metadata
+before changing model pins. Claude's `model: inherit` uses the parent model and
+does not emit a separate resolution record. For Codex, native TOML roles under
+`$CODEX_HOME/agents` are generated only after model resolution succeeds, so missing
+roles can be a consequence of the resolution failure.
+
+This startup failure is distinct from AWF's non-blocking `requestedModel`
+validation and its per-request `model_resolution` proxy logs. See the
+[resolution boundary](api-proxy-sidecar.md#gh-aw-inline-sub-agent-model-resolution)
+and gh-aw's [model/engine troubleshooting guide](https://github.com/github/gh-aw/blob/main/.github/aw/debug-model-engine-misconfiguration.md).
+Compiler and harness fixes belong in [github/gh-aw](https://github.com/github/gh-aw);
+changing AWF's proxy alias map alone cannot fix native agent registration.
 
 ## Container Issues
 
@@ -165,21 +261,25 @@ docker network rm awf-net
    ```
 4. Review [GitHub Enterprise Configuration](enterprise-configuration.md) for the expected endpoint derivation and allowlist behavior.
 
-### Codex `auto` Model Fails Under AWF
+### OpenAI Codex `auto` Model Fails Under AWF
 
 **Problem:** A Codex run inside AWF fails with messages such as:
 - `Unknown model auto is used`
 - `The requested model is not supported`
 - `chatgpt authentication required for remote plugin catalog; api key auth is not supported`
 
-**Cause:** Codex's `auto` model alias relies on ChatGPT-authenticated remote
-model/plugin metadata. AWF's API proxy uses API-key credential injection, so the
-ChatGPT catalog lookup cannot be used even if `chatgpt.com` is on the network
-allowlist.
+**Cause:** When Codex uses the OpenAI-native endpoint, its `auto` model alias
+relies on ChatGPT-authenticated remote model/plugin metadata. AWF's API proxy
+uses API-key credential injection, so the ChatGPT catalog lookup cannot be used
+even if `chatgpt.com` is on the network allowlist.
 
 **Solution:** Set an explicit Codex model instead of `auto`, for example
 `model: gpt-5.3-codex` in workflow frontmatter or `codex exec --model
 gpt-5.3-codex ...` for direct CLI usage.
+
+When using the GitHub Copilot provider, `copilot/auto` is routed on Responses
+requests using the available Copilot model inventory; Chat Completions requests
+retain Copilot's native `auto` behavior.
 
 ## Permission Issues
 
@@ -364,6 +464,39 @@ AWF uses a forward proxy (Squid) for HTTPS egress control rather than transparen
 - **Java tools**: Use `JAVA_TOOL_OPTIONS` with JVM system properties (set automatically by AWF)
 - **Maven**: Requires `~/.m2/settings.xml` (must be configured manually — see above)
 
+## Playwright / Chromium Issues
+
+### Browser fails to launch with missing shared libraries
+
+**Problem:** `playwright-cli` (or `npx playwright`) fails to start Chromium with errors such as:
+
+```
+error while loading shared libraries: libnspr4.so: cannot open shared object file
+Host system is missing dependencies to run browsers.
+```
+
+**Cause:** The agent container uses selective bind mounts rather than a full host filesystem mount, so browsers downloaded by Playwright cannot pick up native libraries installed on the host.
+
+**Solution:** The agent image preinstalls Chromium's native runtime libraries (`libnspr4`, `libnss3`, `libatk1.0-0`, `libatk-bridge2.0-0`, `libatspi2.0-0`, `libcups2`, `libdrm2`, `libgbm1`, `libpango-1.0-0`, `libxkbcommon0`, `libxcomposite1`, `libxdamage1`, `libxrandr2`, `libasound2`, `fonts-liberation`, and related packages). In chroot mode (the default), `entrypoint.sh` stages copies of these libraries under `/run/awf-lib/browser-libs` — on the container's own writable rootfs, so they are not shadowed by the host `/usr`/`/lib` bind mounts — and sets `LD_LIBRARY_PATH` so Chromium resolves them there. Use a current agent image (`--image-tag latest`, or `--build-local` when building from source) and the browser will launch.
+
+If a library under `/run/awf-lib/browser-libs` reports `GLIBC_2.43 not found`, the image contains browser libraries built for a newer libc than the runner's chroot. Use an agent image containing the Ubuntu 22.04 browser-payload fix (or `--build-local` from current source). This payload supports Ubuntu 22.04 and 24.04 runner libc without replacing libc or the loader; installing a browser alone does not fix the injected library mismatch.
+
+Verify the libraries are present inside the sandbox:
+
+```bash
+sudo awf --allow-domains '' -- bash -c 'ldd $(find ~/.cache/ms-playwright -name headless_shell | head -1) | grep "not found" || echo "all libraries resolved"'
+```
+
+If you pin an older agent image, or you use a custom base image, install the dependencies yourself before running the browser:
+
+```bash
+npx playwright install-deps chromium
+```
+
+### Browser downloads are blocked
+
+Playwright downloads browser binaries from `cdn.playwright.dev`. Either add that domain to `--allow-domains`, or download the browsers on the host before the sandbox starts and point `PLAYWRIGHT_BROWSERS_PATH` at the staged directory.
+
 ## Harness Binary Resolution Issues
 
 ### `spawn /usr/local/bin/<tool> ENOENT` (hardcoded absolute paths)
@@ -483,6 +616,33 @@ sudo dmesg | grep FW_BLOCKED
    sudo awf --allow-domains example.com \
      'cat /etc/resolv.conf'
    ```
+
+### awf-net Subnet Collides With the Host or Cluster Network
+
+**Problem:** Every request fails with `503` and the Squid access log shows
+`TCP_MISS/503 ... HIER_NONE`, or AWF aborts at startup with
+"The awf-net subnet 172.30.0.0/24 contains the DNS resolver(s) ...".
+
+**Cause:** The default `awf-net` subnet (`172.30.0.0/24`) overlaps the host or
+cluster network. On OpenShift/ARO it is inside the default service CIDR
+(`172.30.0.0/16`) and the CoreDNS ClusterIP is exactly `172.30.0.10` — the
+address AWF assigns to Squid, so Squid sends its DNS queries to itself.
+
+**Solution:** Relocate the network to a free RFC1918 block:
+
+```bash
+sudo awf --network-subnet 10.88.0.0/24 --allow-domains github.com -- curl https://github.com
+```
+
+Or in an AWF config file:
+
+```json
+{ "network": { "subnet": "10.88.0.0/24" } }
+```
+
+The fixed host offsets are preserved inside the new block (`.1` gateway, `.10`
+Squid, `.20` agent, `.30` api-proxy, `.40` DoH proxy, `.50` CLI proxy).
+Accepted prefix lengths are `/16` through `/26`.
 
 ### Connection Timeouts
 
