@@ -25,7 +25,7 @@
 
 # Match the reviewed CLI build in containers/agent/Dockerfile rather than
 # inheriting Ubuntu's gh binary built with a vulnerable Go runtime.
-FROM golang:1.27.3-alpine@sha256:f2c872bcee949b7be9c490efd02b48a8a2fbf947cdf533f1c58525ec9d8170fd AS gh-build
+FROM golang:1.27.3-alpine@sha256:d200d2dd76b03a99b52651fd1325aff7dcd35422c35c01bac56571b0507f3deb AS gh-build
 
 ENV GOTOOLCHAIN=go1.27.3
 
