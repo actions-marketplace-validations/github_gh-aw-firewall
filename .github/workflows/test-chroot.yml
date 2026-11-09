@@ -72,7 +72,7 @@ jobs:
           cache: 'npm'
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -82,13 +82,13 @@ jobs:
           go-version: '1.22'
 
       - name: Setup Java
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v4
         with:
           distribution: 'temurin'
           java-version: '21'
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '8.0.427'
 
@@ -190,7 +190,7 @@ jobs:
           cache: 'npm'
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
@@ -200,7 +200,7 @@ jobs:
           go-version: '1.22'
 
       - name: Setup Ruby
-        uses: ruby/setup-ruby@651ff0d62c5c79bed6d53ec518387aae20e72c1a # v1
+        uses: ruby/setup-ruby@b3aaceaef7e0ee231b499e7b5f49c03fc1d32199 # v1
         with:
           ruby-version: '3.2'
 
@@ -210,13 +210,13 @@ jobs:
           toolchain: stable
 
       - name: Setup Java
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v4
         with:
           distribution: 'temurin'
           java-version: '21'
 
       - name: Setup .NET
-        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        uses: actions/setup-dotnet@0f4a354dd5547a28c70b7853dbd95d5b67886e73 # v6.1.0
         with:
           dotnet-version: '8.0.427'
 
@@ -336,12 +336,12 @@ jobs:
           cache: 'npm'
 
       - name: Setup Python
-        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
           python-version: '3.12'
 
       - name: Setup Java
-        uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v4
+        uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78 # v4
         with:
           distribution: 'temurin'
           java-version: '21'
