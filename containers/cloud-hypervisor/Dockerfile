@@ -4,7 +4,7 @@ ARG GUEST_BASE_IMAGE=awf-cloud-hypervisor-guest-base:build
 ARG BUILD_TOOLS_IMAGE=awf-build-tools
 ARG ENCLAVE_AGENT_IMAGE=awf-enclave-agent
 
-FROM node:26.11.1-trixie-slim@sha256:193fe51b64e77981119c98c2002c9e32a70e2f006fb4d25068ce0558998917f0 AS node-runtime
+FROM node:26.13.1-trixie-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS node-runtime
 FROM ${BUILD_TOOLS_IMAGE} AS build-tools
 FROM ${ENCLAVE_AGENT_IMAGE} AS copilot-runtime
 
